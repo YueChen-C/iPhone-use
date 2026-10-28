@@ -101,6 +101,86 @@ final class DeviceInputTrackingTests: XCTestCase {
             "retargeting must resume from the partial movement, not its abandoned destination")
     }
 
+    func testContinuousHoverTargetsShareOneInterruptibleHomingPath() throws {
+        let (input, pointer) = freshInput()
+        let retargeted = expectation(description: "new targets submitted throughout homing")
+        let homing = pointer.calibration.homingReports
+        pointer.onReport = { _ in
+            input.positionPointer(x: 0.5, y: 0.5)
+            if pointer.reports.count == homing.count {
+                pointer.onReport = nil
+                retargeted.fulfill()
+            }
+        }
+
+        input.positionPointer(x: 0.5, y: 0.5)
+        wait(for: [retargeted], timeout: 3)
+        try input.nudge(dx: 0, dy: 0, click: false)
+
+        XCTAssertEqual(pointer.reports.prefix(homing.count).map(\.dx), homing.map(\.dx))
+        XCTAssertEqual(pointer.reports.prefix(homing.count).map(\.dy), homing.map(\.dy))
+        XCTAssertEqual(pointer.position, CGPoint(x: 50, y: 100))
+        XCTAssertTrue(pointer.reports.dropFirst(homing.count).allSatisfy { $0.dx >= 0 && $0.dy >= 0 })
+    }
+
+    func testHoverCancellationStopsHomingAndNextInteractionRecoversUnknownOrigin() throws {
+        let (input, pointer) = freshInput()
+        let cancelled = expectation(description: "hover exit submitted during homing")
+        pointer.onReport = { _ in
+            pointer.onReport = nil
+            input.cancelPointer()
+            cancelled.fulfill()
+        }
+
+        input.positionPointer(x: 0.5, y: 0.5)
+        wait(for: [cancelled], timeout: 2)
+        try input.nudge(dx: 0, dy: 0, click: false)
+
+        XCTAssertEqual(pointer.reports.count, 1, "leaving the view must stop before the next homing report")
+        pointer.reports.removeAll()
+        pointer.position = CGPoint(x: 93, y: 170)
+        input.positionPointer(x: 0.5, y: 0.5)
+        try input.nudge(dx: 0, dy: 0, click: false)
+
+        let homing = pointer.calibration.homingReports
+        XCTAssertEqual(pointer.reports.prefix(homing.count).map(\.dx), homing.map(\.dx))
+        XCTAssertEqual(pointer.reports.prefix(homing.count).map(\.dy), homing.map(\.dy))
+        XCTAssertEqual(pointer.position, CGPoint(x: 50, y: 100))
+    }
+
+    func testBackgroundCancellationPreservesKnownPointerPosition() throws {
+        let (input, pointer) = try preparedInput()
+        let before = input.inputActivitySequence
+        input.cancelBackgroundMotion()
+        XCTAssertNotEqual(input.inputActivitySequence, before)
+        try input.move(x: 0.3, y: 0.3)
+
+        XCTAssertEqual(pointer.position, CGPoint(x: 30, y: 60))
+        XCTAssertTrue(pointer.reports.allSatisfy { $0.dx >= 0 && $0.dy >= 0 })
+    }
+
+    func testRegistryCancellationStopsCalibratedProbeDuringHomingOrTracking() throws {
+        let homingCount = freshInput().1.calibration.homingReports.count
+        for stopAfter in [1, homingCount + 1] {
+            let (input, pointer) = freshInput()
+            let sequence = input.inputActivitySequence
+
+            XCTAssertThrowsError(
+                try input.pairingProbe(
+                    calibration: pointer.calibration,
+                    firstPoint: CGPoint(x: 0.8, y: 0.8), secondPoint: CGPoint(x: 0.2, y: 0.2),
+                    wait: 0, isReady: { pointer.reports.count < stopAfter },
+                    capture: {
+                        XCTFail("cancelled discovery must stop before capture")
+                        return [0]
+                    }))
+
+            XCTAssertEqual(input.inputActivitySequence, sequence, "temporary probe inputs need no direct cancellation")
+            XCTAssertEqual(pointer.reports.count, stopAfter, "registry cancellation must stop before the next report")
+            XCTAssertTrue(pointer.reports.allSatisfy { $0.buttons == 0 })
+        }
+    }
+
     func testContinuousDiagonalTargetsAdvanceBothAxesWithoutStarvation() throws {
         let (input, pointer) = try preparedInput(x: 0.1, y: 0.1)
         let retargeted = expectation(description: "all moving targets submitted")

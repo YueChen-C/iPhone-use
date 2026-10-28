@@ -41,6 +41,18 @@ enum ControlAPI {
                 return match(body)
             case ("POST", "/pair"):
                 return try pair(body, deviceQuery: deviceQuery)
+            case ("POST", "/calibration/reload"):
+                try DeviceRegistry.shared.reloadCalibration(for: DeviceRegistry.shared.find(deviceQuery))
+                return status()
+            case ("POST", "/calibration/auto"):
+                let devices =
+                    try deviceQuery.map { [try DeviceRegistry.shared.find($0)] }
+                    ?? DeviceRegistry.shared.all()
+                for device in devices {
+                    DeviceRegistry.shared.automaticallyCalibrate(
+                        device, retry: true, verifyOnly: (body["verifyOnly"] as? Bool) ?? false)
+                }
+                return status()
             case ("GET", "/screenshot"):
                 return try screenshot(request.query, deviceQuery: deviceQuery)
             default:
@@ -83,19 +95,38 @@ enum ControlAPI {
         return .json([
             "bluetooth": HIDPeripheral.shared.state,
             "bluetoothHosts": hosts,
+            "capture": captureStatus(),
             "devices": DeviceRegistry.shared.status(),
             "unmatchedHosts": DeviceRegistry.shared.unmatchedHosts().map(\.uuidString),
         ])
     }
 
     private static func deviceList() -> HTTPResponse {
-        .json(["devices": DeviceRegistry.shared.all().map(\.json)])
+        .json(["capture": captureStatus(), "devices": DeviceRegistry.shared.all().map(\.json)])
+    }
+
+    /// Nominal acquisition UIDs can differ from independently verified physical
+    /// USB identities. Expose both while identity checks are pending or fail too.
+    private static func captureStatus() -> [String: Any] {
+        let manager = ScreenCaptureManager.shared
+        return [
+            "identityState": manager.identityState.rawValue,
+            "permitsPointerAssociation": manager.permitsPointerAssociation,
+            "screens": manager.all.map { screen -> [String: Any] in
+                [
+                    "physicalID": screen.id,
+                    "sourceID": screen.sourceID,
+                    "identityVerified": screen.identityVerified,
+                ]
+            },
+        ]
     }
 
     private static func match(_ body: [String: Any]) -> HTTPResponse {
         let found = DeviceRegistry.shared.match(
             force: (body["force"] as? Bool) ?? false, probe: (body["probe"] as? Bool) ?? false)
         return .json([
+            "capture": captureStatus(),
             "matched": found.mapValues(\.uuidString),
             "devices": DeviceRegistry.shared.all().map(\.json),
             "unmatchedHosts": DeviceRegistry.shared.unmatchedHosts().map(\.uuidString),
@@ -133,6 +164,10 @@ enum ControlAPI {
         _ action: Action, body: [String: Any], deviceQuery: String?
     ) throws -> HTTPResponse {
         let device = try DeviceRegistry.shared.find(deviceQuery)
+        // Real input takes priority over background probes and measurement.
+        // Cancel before resolving/queuing input, so it cannot wait behind the
+        // very measurement that the user is trying to interrupt.
+        DeviceRegistry.shared.cancelBackgroundMotion(for: device.id)
         let input = try DeviceRegistry.shared.input(for: device)
         if action.requiresPointer, !input.isPointerReady {
             // Keep readiness ahead of parameter parsing. API callers may have no window

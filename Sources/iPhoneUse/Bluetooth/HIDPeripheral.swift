@@ -85,7 +85,11 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
         }
     }
 
-    func send(_ id: ReportID, _ bytes: [UInt8], to host: UUID, session: UUID?) {
+    /// `isAllowed` runs on the Bluetooth queue at enqueue and notification;
+    /// it must not call this object's queue-synchronized readers.
+    func send(
+        _ id: ReportID, _ bytes: [UInt8], to host: UUID, session: UUID?, isAllowed: (() -> Bool)? = nil
+    ) {
         queue.async {
             if self.tracePointer, id == .absolutePointer || id == .relativeMouse,
                 Date().timeIntervalSince(self.lastPointerTrace) > 0.5
@@ -96,7 +100,8 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
                 )
             }
             guard self.manager?.state == .poweredOn, self.published else { return }
-            self.connections.enqueue(.report(id), data: Data(bytes), host: host, session: session)
+            self.connections.enqueue(
+                .report(id), data: Data(bytes), host: host, session: session, isAllowed: isAllowed)
             self.drain()
         }
     }
@@ -345,7 +350,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     /// through peripheralManagerIsReady; removing it early would lose input.
     private func drain() {
         guard manager?.state == .poweredOn, published else { return }
-        while let report = connections.pending.first {
+        while let report = connections.nextPendingReport() {
             guard let characteristic = characteristic(for: report.channel), let central = centrals[report.host] else {
                 connections.removeFirst()
                 continue

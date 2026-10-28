@@ -9,6 +9,174 @@ private func curveStep(_ byte: UInt8) -> Double {
 }
 
 final class DeviceInputPointerTests: XCTestCase {
+    func testUnverifiedCaptureRejectsCoordinatesAndRawMovement() throws {
+        var reports: [(ReportID, [UInt8])] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), inputIsAllowed: { false }, sleep: { _ in },
+            reportSender: { reports.append(($0, $1)) })
+
+        XCTAssertThrowsError(try input.tap(x: 0.5, y: 0.5))
+        try input.nudge(dx: 32, dy: 0, click: true)
+        input.positionPointer(x: 0.8, y: 0.3)
+        try input.nudge(dx: 0, dy: 0, click: false)
+
+        XCTAssertFalse(input.isPointerReady)
+        // A harmless neutral release may pass; no movement or press may pass.
+        XCTAssertTrue(reports.allSatisfy { $0.0 == .relativeMouse && $0.1 == [0, 0, 0, 0] })
+    }
+
+    func testCaptureInvalidatedDuringPressStillReleasesWithoutReplayingAbsolutePosition() throws {
+        var allowed = true
+        var reports: [(ReportID, [UInt8])] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), inputIsAllowed: { allowed }, sleep: { _ in },
+            reportSender: { id, bytes in
+                reports.append((id, bytes))
+                if id == .relativeMouse && bytes[0] == 1 { allowed = false }
+            })
+
+        input.press(x: 0.5, y: 0.5)
+        input.cancelPointer()
+        try input.nudge(dx: 0, dy: 0, click: false)
+
+        XCTAssertEqual(reports.map { $0.0 }, [.absolutePointer, .relativeMouse, .relativeMouse])
+        XCTAssertEqual(reports[1].1, [1, 0, 0, 0])
+        XCTAssertEqual(reports[2].1, [0, 0, 0, 0])
+    }
+
+    func testCaptureInvalidationDiscardsPartialHomingProgressBeforeControlResumes() throws {
+        let calibration = RelativePointerCalibration(
+            host: UUID(), screenWidth: 100, screenHeight: 200,
+            reportInterval: 0.01, distances: [0, 1, 3, 8, 20])
+        var allowed = true
+        var invalidateAfterFirstReport = true
+        var reports: [[UInt8]] = []
+        let input = DeviceInput(
+            host: calibration.host, session: UUID(), calibration: calibration,
+            inputIsAllowed: { allowed },
+            sleep: { _ in
+                if invalidateAfterFirstReport { allowed = false }
+            }, reportSender: { _, bytes in reports.append(bytes) })
+
+        try input.move(x: 0, y: 0)
+        XCTAssertEqual(reports.count, 1)
+        allowed = true
+        invalidateAfterFirstReport = false
+        try input.move(x: 0, y: 0)
+
+        let expected = calibration.homingReports.map {
+            HIDReportPayload.relativeMouse(buttons: 0, dx: $0.dx, dy: $0.dy)
+        }
+        XCTAssertEqual(Array(reports.dropFirst()), expected)
+    }
+
+    func testAutomaticMeasurementStopsOnLostReadinessAndNeverClicks() {
+        var reports: [(ReportID, [UInt8])] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), calibrationRequired: true, sleep: { _ in },
+            reportSender: { reports.append(($0, $1)) })
+        XCTAssertThrowsError(
+            try input.measureRelativePointer(
+                screenID: "phone", size: CGSize(width: 750, height: 1334),
+                isReady: { reports.count < 4 },
+                capture: {
+                    XCTFail("must stop before capture")
+                    return nil
+                }))
+        XCTAssertEqual(reports.count, 4)
+        XCTAssertTrue(reports.allSatisfy { $0.0 == .relativeMouse && $0.1[0] == 0 })
+    }
+
+    func testKeyboardInputPreemptsAutomaticMeasurementBeforeItsNextReport() throws {
+        var reports: [(ReportID, [UInt8])] = []
+        var input: DeviceInput!
+        input = DeviceInput(
+            host: UUID(), session: UUID(), calibrationRequired: true, sleep: { _ in },
+            reportSender: { id, bytes in
+                reports.append((id, bytes))
+                if id == .relativeMouse { XCTAssertTrue(input.keyFromKeyboard("a")) }
+            })
+        XCTAssertThrowsError(
+            try input.measureRelativePointer(
+                screenID: "phone", size: CGSize(width: 750, height: 1334), isReady: { true },
+                capture: {
+                    XCTFail("user activity must stop measurement before capture")
+                    return nil
+                }))
+        try input.nudge(dx: 0, dy: 0, click: false)
+
+        XCTAssertEqual(reports.filter { $0.0 == .relativeMouse }.count, 1)
+        XCTAssertEqual(reports.filter { $0.0 == .keyboard }.count, 2)
+    }
+
+    func testRelativeProbeSendsNoButtonsOrAbsoluteReportsAndStopsOnLostReadiness() throws {
+        var reports: [(ReportID, [UInt8])] = []
+        var count = 0
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), sleep: { _ in },
+            reportSender: { reports.append(($0, $1)) })
+        let frames = try input.relativePairingProbe(
+            isReady: { true },
+            capture: {
+                count += 1
+                return [[UInt8(count)]]
+            })
+        XCTAssertEqual(frames, [[[1]], [[2]], [[3]], [[4]], [[5]]])
+        XCTAssertEqual(reports.count, 48)
+        XCTAssertTrue(reports.allSatisfy { $0.0 == .relativeMouse && $0.1[0] == 0 })
+        XCTAssertEqual(Array(reports.suffix(4)).map { $0.1 }, Array(repeating: [0, 0, 248, 0], count: 4))
+        reports = []
+        XCTAssertThrowsError(try input.relativePairingProbe(isReady: { reports.count < 3 }, capture: { [[0]] }))
+        XCTAssertEqual(reports.count, 3)
+    }
+
+    func testRelativeProbeKeepsTheRectangleInsideScreenEdges() throws {
+        for start in [CGPoint.zero, CGPoint(x: 749, y: 1333)] {
+            var position = start
+            var positions: [CGPoint] = []
+            let input = DeviceInput(
+                host: UUID(), session: UUID(), sleep: { _ in },
+                reportSender: { _, bytes in
+                    position.x = min(749, max(0, position.x + Double(Int8(bitPattern: bytes[1])) * 3))
+                    position.y = min(1333, max(0, position.y + Double(Int8(bitPattern: bytes[2])) * 3))
+                })
+            _ = try input.relativePairingProbe(
+                isReady: { true },
+                capture: {
+                    positions.append(position)
+                    return [[0]]
+                })
+            XCTAssertEqual(positions.count, 5)
+            XCTAssertTrue(positions.allSatisfy { (20...729).contains($0.x) && (20...1313).contains($0.y) })
+            XCTAssertEqual(positions.first, positions.last)
+            XCTAssertEqual(positions[1].x - positions[0].x, 96)
+            XCTAssertEqual(positions[2].y - positions[1].y, 96)
+        }
+    }
+
+    func testRetiredInputRejectsCoordinatesAndCannotSendQueuedReports() throws {
+        var reports: [(ReportID, [UInt8])] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), sleep: { _ in },
+            reportSender: { reports.append(($0, $1)) })
+        try input.retireForCalibrationReload()
+        XCTAssertTrue(input.isRetired)
+        XCTAssertFalse(input.isCurrentSession)
+        XCTAssertFalse(input.isPointerReady)
+        XCTAssertThrowsError(try input.move(x: 0.5, y: 0.5))
+        try input.nudge(dx: 8, dy: 0, click: false)
+        XCTAssertTrue(reports.isEmpty)
+    }
+
+    func testRequiredButMissingCalibrationKeepsBluetoothTransportReady() {
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), calibrationRequired: true,
+            reportReadiness: { report, _, _ in report != .absolutePointer })
+        XCTAssertTrue(input.isBluetoothReady)
+        XCTAssertTrue(input.needsCalibration)
+        XCTAssertFalse(input.isPointerReady)
+    }
+
     private enum GestureEvent: Equatable {
         case report(ReportID, [UInt8])
         case pause(TimeInterval)
@@ -88,6 +256,44 @@ final class DeviceInputPointerTests: XCTestCase {
 
         XCTAssertTrue(reports.isEmpty)
         XCTAssertEqual(captureCount, 0)
+    }
+
+    func testAbsoluteCapabilityProbeReturnsWithExactlyThreeReportsAndCaptures() throws {
+        var reports: [(ReportID, [UInt8])] = []
+        var captureCount = 0
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), sleep: { _ in },
+            reportSender: { reports.append(($0, $1)) })
+        let captures = try input.pairingProbe(
+            calibration: nil, firstPoint: CGPoint(x: 0.3, y: 0.35), secondPoint: CGPoint(x: 0.7, y: 0.65),
+            returnToStart: true, wait: 0, isReady: { true },
+            capture: {
+                captureCount += 1
+                return [UInt8(captureCount)]
+            })
+        XCTAssertEqual(captures.returned, [3])
+        XCTAssertEqual(captureCount, 3)
+        XCTAssertEqual(reports.map(\.0), [.absolutePointer, .absolutePointer, .absolutePointer])
+        XCTAssertEqual(reports.first?.1, reports.last?.1)
+    }
+
+    func testCancellationAfterOutboundCaptureSuppressesTheReturnReport() {
+        var reportCount = 0
+        var captureCount = 0
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), sleep: { _ in },
+            reportSender: { _, _ in reportCount += 1 })
+        XCTAssertThrowsError(
+            try input.pairingProbe(
+                calibration: nil, firstPoint: CGPoint(x: 0.3, y: 0.35), secondPoint: CGPoint(x: 0.7, y: 0.65),
+                returnToStart: true, wait: 0, isReady: { true },
+                capture: {
+                    captureCount += 1
+                    if captureCount == 2 { input.cancelBackgroundMotion() }
+                    return [UInt8(captureCount)]
+                }))
+        XCTAssertEqual(reportCount, 2)
+        XCTAssertEqual(captureCount, 2)
     }
 
     func testAbsolutePointerReadinessRequiresMovementAndClickSubscriptions() {
@@ -299,8 +505,10 @@ final class DeviceInputPointerTests: XCTestCase {
         let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
 
         input.positionPointer(x: 1, y: 1)
+        try input.nudge(dx: 0, dy: 0, click: false)
         try input.tap(x: 500.0 / 750, y: 500.0 / 1334)
         input.positionPointer(x: 0, y: 0)
+        try input.nudge(dx: 0, dy: 0, click: false)
         try input.tap(x: 0.5, y: 0.5)
 
         XCTAssertEqual(

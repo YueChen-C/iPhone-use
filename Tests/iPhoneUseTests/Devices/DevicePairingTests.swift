@@ -42,6 +42,58 @@ final class DevicePairingTests: XCTestCase {
         XCTAssertNil(store.load())
     }
 
+    func testFailedDiscoveryCannotRearmAnEndlessProbeTimer() throws {
+        let capture = NSObject()
+        let topology = DevicePairingProbeSchedule.Topology(
+            screens: ["phone": ObjectIdentifier(capture)], sessions: [UUID(): UUID()])
+        var schedule = DevicePairingProbeSchedule()
+        XCTAssertTrue(schedule.update(topology))
+        let token = try XCTUnwrap(schedule.scheduleRetry())
+        XCTAssertNil(schedule.scheduleRetry())
+        XCTAssertFalse(schedule.update(topology))
+        XCTAssertTrue(schedule.beginRetry(token))
+        XCTAssertNil(schedule.scheduleRetry())
+        // A redundant subscription notification must not restart discovery.
+        XCTAssertFalse(schedule.update(topology))
+        XCTAssertNil(schedule.scheduleRetry())
+        XCTAssertFalse(schedule.beginRetry(token))
+    }
+
+    func testReconnectInvalidatesOldProbeTimerAndAllowsOneFreshRetry() throws {
+        let oldCapture = NSObject()
+        let newCapture = NSObject()
+        let host = UUID()
+        let session = UUID()
+        var schedule = DevicePairingProbeSchedule()
+        schedule.update(
+            .init(screens: ["phone": ObjectIdentifier(oldCapture)], sessions: [host: session]))
+        let oldToken = try XCTUnwrap(schedule.scheduleRetry())
+        XCTAssertTrue(
+            schedule.update(.init(screens: ["phone": ObjectIdentifier(newCapture)], sessions: [host: session])))
+        let usbToken = try XCTUnwrap(schedule.scheduleRetry())
+        XCTAssertFalse(schedule.beginRetry(oldToken))
+        XCTAssertTrue(schedule.beginRetry(usbToken))
+        XCTAssertNil(schedule.scheduleRetry())
+        XCTAssertTrue(
+            schedule.update(.init(screens: ["phone": ObjectIdentifier(newCapture)], sessions: [host: UUID()])))
+        XCTAssertNotNil(schedule.scheduleRetry())
+    }
+
+    func testUserInputCancelsPendingRetryUntilReconnectOrExplicitMatch() throws {
+        let capture = NSObject()
+        let topology = DevicePairingProbeSchedule.Topology(
+            screens: ["phone": ObjectIdentifier(capture)], sessions: [UUID(): UUID()])
+        var schedule = DevicePairingProbeSchedule()
+        schedule.update(topology)
+        let token = try XCTUnwrap(schedule.scheduleRetry())
+        schedule.cancel()
+        XCTAssertFalse(schedule.beginRetry(token))
+        XCTAssertFalse(schedule.update(topology))
+        XCTAssertNil(schedule.scheduleRetry())
+        XCTAssertTrue(schedule.update(topology, restart: true))
+        XCTAssertNotNil(schedule.scheduleRetry())
+    }
+
     func testProbeRequiresChangesAtBothPointerPositions() {
         let before = blankThumbnail()
         var after = before
@@ -69,23 +121,87 @@ final class DevicePairingTests: XCTestCase {
         XCTAssertEqual(PointerScreenMatcher.score(before: before, after: after), 0)
     }
 
-    func testRecoveryTreatsOnlyAnUnchangedCaptureAsAConfirmedMiss() {
+    func testWeakBackgroundChangesOnlyRankCandidatesAndCannotVerifyIdentity() {
+        let before = blankThumbnail()
+        var after = before
+        for (x, y) in [(27, 68), (62, 126)] {
+            for i in 0..<23 { mark(&after, x: x - 3 + i % 7, y: y - 2 + i / 7, value: 40) }
+        }
+        let score = PointerScreenMatcher.score(before: before, after: after)
+        XCTAssertEqual(score, 23, "the old direct-hit shortcut accepted this background change")
+        XCTAssertEqual(PointerScreenMatcher.candidateOrder(scores: [0, score]), [1, 0])
+        XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([before, after, before]))
+        let animated = (0..<5).map { [UInt8](repeating: UInt8($0 * 40), count: 180 * 320) }
+        XCTAssertEqual(DevicePairingRecovery.probeResult(for: animated), .unavailable)
+    }
+
+    func testAbsoluteAbilityRequiresCompactCursorMovementAndACompleteReturn() {
+        for inverted in [false, true] {
+            let a = absolutePointerFrame(27, 68, inverted: inverted)
+            let b = absolutePointerFrame(63, 127, inverted: inverted)
+            XCTAssertTrue(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, b, a]))
+            XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, b, b]))
+            XCTAssertFalse(
+                PointerScreenMatcher.matchesAbsoluteRoundTrip([a, absolutePointerFrame(45, 100), a]))
+            var noisyB = b
+            noisyB[0] = inverted ? 240 : 0
+            XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, noisyB, a]))
+        }
+        XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([]))
+        XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([[0], [1], [0]]))
+    }
+
+    func testRecoveryRequiresTheFullRectangleAndTreatsAStableTailAsMiss() {
+        let points = [(30, 80), (50, 80), (50, 100), (30, 100), (30, 80)]
+        let frames = points.map { relativePointerFrame($0.0, $0.1) }
+        XCTAssertEqual(DevicePairingRecovery.probeResult(for: frames), .hit)
+        let unchanged = frames[0]
+        XCTAssertEqual(DevicePairingRecovery.probeResult(for: Array(repeating: unchanged, count: 5)), .miss)
         XCTAssertEqual(
-            DevicePairingRecovery.probeResult(
-                for: PointerScreenMatcher.ChangeMetrics(signal: 0, noise: 0)),
-            .miss)
+            DevicePairingRecovery.probeResult(for: [frames[1], frames[2], unchanged, unchanged, unchanged]), .miss)
+        var wrongPath = frames
+        wrongPath[4] = frames[1]
+        XCTAssertEqual(DevicePairingRecovery.probeResult(for: wrongPath), .unavailable)
+        XCTAssertEqual(DevicePairingRecovery.probeResult(for: [[0], [1], [0], [1], [0]]), .unavailable)
+    }
+
+    func testIdentityVerificationNeverRequiresReplacingAnExistingCurve() {
+        XCTAssertFalse(DevicePairingRecovery.shouldRequireCalibration(hasProfile: true, absoluteVerified: false))
+        XCTAssertFalse(DevicePairingRecovery.shouldRequireCalibration(hasProfile: true, absoluteVerified: true))
+        XCTAssertFalse(DevicePairingRecovery.shouldRequireCalibration(hasProfile: false, absoluteVerified: true))
+        XCTAssertTrue(DevicePairingRecovery.shouldRequireCalibration(hasProfile: false, absoluteVerified: false))
+    }
+
+    func testBlockedRecoveryStillDiscoversANewUSBPhone() {
+        let oldHost = UUID()
         XCTAssertEqual(
-            DevicePairingRecovery.probeResult(
-                for: PointerScreenMatcher.ChangeMetrics(signal: 4, noise: 4)),
-            .unavailable)
+            DevicePairingRecovery.matchingScreenIDs(
+                screenIDs: ["new-phone"], pairings: ["absent-phone": oldHost],
+                connectedHosts: [oldHost, UUID()], recoveryBlocked: true),
+            ["new-phone"])
+    }
+
+    func testNewPhoneCannotBypassBlockedRecoveryForAnotherSavedScreen() {
         XCTAssertEqual(
-            DevicePairingRecovery.probeResult(
-                for: PointerScreenMatcher.ChangeMetrics(signal: 0, noise: 2)),
-            .unavailable)
+            DevicePairingRecovery.matchingScreenIDs(
+                screenIDs: ["saved-phone", "new-phone"], pairings: ["saved-phone": UUID()],
+                connectedHosts: [UUID()], recoveryBlocked: true),
+            ["new-phone"])
+        XCTAssertTrue(
+            DevicePairingRecovery.matchingScreenIDs(
+                screenIDs: ["saved-phone"], pairings: ["saved-phone": UUID()],
+                connectedHosts: [UUID()], recoveryBlocked: true
+            ).isEmpty)
+    }
+
+    func testOrdinaryReconnectMayProbeSavedScreensWhoseHostIsAbsent() {
+        let liveHost = UUID()
         XCTAssertEqual(
-            DevicePairingRecovery.probeResult(
-                for: PointerScreenMatcher.ChangeMetrics(signal: 4, noise: 0)),
-            .hit)
+            DevicePairingRecovery.matchingScreenIDs(
+                screenIDs: ["repaired-phone", "connected-phone", "new-phone"],
+                pairings: ["repaired-phone": UUID(), "connected-phone": liveHost],
+                connectedHosts: [liveHost], recoveryBlocked: false),
+            ["repaired-phone", "new-phone"])
     }
 
     func testRecoveryCandidateRequiresVerifiedScreenMismatch() {
@@ -293,6 +409,24 @@ final class DevicePairingTests: XCTestCase {
             DevicePairingRecovery.verifiedOwnerClaim(
                 screenIDs: [screen, "usb-b"], pairings: [screen: wrongHost],
                 connectedHosts: [wrongHost, trueOwner], isVerifiedOwner: isVerifiedOwner))
+    }
+
+    private func absolutePointerFrame(_ x: Int, _ y: Int, inverted: Bool = false) -> [UInt8] {
+        pointerFrame(x, y, width: PointerScreenMatcher.width, height: PointerScreenMatcher.height, inverted: inverted)
+    }
+
+    private func relativePointerFrame(_ x: Int, _ y: Int) -> [UInt8] {
+        pointerFrame(x, y, width: 180, height: 320, inverted: false)
+    }
+
+    private func pointerFrame(_ x: Int, _ y: Int, width: Int, height: Int, inverted: Bool) -> [UInt8] {
+        var pixels = [UInt8](repeating: inverted ? 20 : 240, count: width * height)
+        for dy in -3...3 {
+            for dx in -3...3 where dx * dx + dy * dy <= 9 {
+                pixels[(y + dy) * width + x + dx] = inverted ? 230 : 100
+            }
+        }
+        return pixels
     }
 
     private func blankThumbnail() -> [UInt8] {

@@ -33,8 +33,54 @@ struct DevicePairingStore {
     }
 }
 
-/// Scores the two thumbnails captured during a Bluetooth pairing probe. The
-/// pointer should change both visited regions, without changing the control regions.
+/// Pointer discovery is intrusive: a failed observation must not turn into an
+/// endless timer that keeps moving a phone the user is trying to use.
+struct DevicePairingProbeSchedule {
+    struct Topology: Equatable {
+        let screens: [String: ObjectIdentifier]
+        let sessions: [UUID: UUID]
+    }
+
+    private var topology: Topology?
+    private var generation: UInt64 = 0
+    private var retriesRemaining = 0
+    private var pending = false
+
+    /// Each USB capture / Bluetooth session topology gets its initial attempt
+    /// and one delayed retry. Explicit matching can start a fresh attempt.
+    @discardableResult
+    mutating func update(_ topology: Topology, restart: Bool = false) -> Bool {
+        guard restart || self.topology != topology else { return false }
+        self.topology = topology
+        generation &+= 1
+        retriesRemaining = 1
+        pending = false
+        return true
+    }
+
+    mutating func scheduleRetry() -> UInt64? {
+        guard !pending, retriesRemaining > 0 else { return nil }
+        retriesRemaining -= 1
+        pending = true
+        return generation
+    }
+
+    mutating func beginRetry(_ token: UInt64) -> Bool {
+        guard pending, token == generation else { return false }
+        pending = false
+        return true
+    }
+
+    /// User input wins over both the active probe and a queued retry.
+    mutating func cancel() {
+        generation &+= 1
+        retriesRemaining = 0
+        pending = false
+    }
+}
+
+/// Two-frame differences rank candidates only. Identity requires the separate
+/// reversible trajectory proof; background animation can score at both targets.
 enum PointerScreenMatcher {
     static let width = 90
     static let height = 195
@@ -63,6 +109,52 @@ enum PointerScreenMatcher {
         return ChangeMetrics(signal: signal, noise: noise)
     }
 
+    static func candidateOrder(scores: [Int]) -> [Int] {
+        scores.indices.sorted { scores[$0] == scores[$1] ? $0 < $1 : scores[$0] > scores[$1] }
+    }
+
+    /// Confirms absolute positioning independently of identity discovery. Both
+    /// cursor lobes must be compact and near the requested targets, reverse on
+    /// the return movement, and restore the starting image. Two changing UI
+    /// regions alone cannot opt a relative-only phone into absolute control.
+    static func matchesAbsoluteRoundTrip(_ frames: [[UInt8]]) -> Bool {
+        guard frames.count == 3, frames.allSatisfy({ $0.count == width * height }) else { return false }
+        let a = CGPoint(x: firstPoint.x * Double(width), y: firstPoint.y * Double(height))
+        let b = CGPoint(x: secondPoint.x * Double(width), y: secondPoint.y * Double(height))
+        func distance(_ a: CGPoint, _ b: CGPoint) -> Double { hypot(a.x - b.x, a.y - b.y) }
+        func centers(_ before: [UInt8], _ after: [UInt8]) -> (bright: CGPoint, dark: CGPoint)? {
+            var bright: [CGPoint] = []
+            var dark: [CGPoint] = []
+            for i in before.indices {
+                let delta = Int(after[i]) - Int(before[i])
+                guard abs(delta) > 12 else { continue }
+                let point = CGPoint(x: i % width, y: i / width)
+                if delta > 0 { bright.append(point) } else { dark.append(point) }
+            }
+            guard (3...250).contains(bright.count), (3...250).contains(dark.count),
+                Double(min(bright.count, dark.count)) / Double(max(bright.count, dark.count)) >= 0.5
+            else { return nil }
+            func center(_ points: [CGPoint]) -> CGPoint {
+                CGPoint(
+                    x: points.reduce(0) { $0 + $1.x } / Double(points.count),
+                    y: points.reduce(0) { $0 + $1.y } / Double(points.count))
+            }
+            let brightCenter = center(bright)
+            let darkCenter = center(dark)
+            guard bright.allSatisfy({ distance($0, brightCenter) <= 12 }),
+                dark.allSatisfy({ distance($0, darkCenter) <= 12 })
+            else { return nil }
+            return (brightCenter, darkCenter)
+        }
+        guard let forward = centers(frames[0], frames[1]), let reverse = centers(frames[1], frames[2]),
+            (distance(forward.bright, a) <= 7 && distance(forward.dark, b) <= 7)
+                || (distance(forward.dark, a) <= 7 && distance(forward.bright, b) <= 7),
+            distance(forward.bright, reverse.dark) <= 2,
+            distance(forward.dark, reverse.bright) <= 2
+        else { return false }
+        return zip(frames[0], frames[2]).filter { abs(Int($0) - Int($1)) > 12 }.count <= 2
+    }
+
     /// Count pixels above the original noise threshold in a 15-by-15 region.
     private static func changed(_ before: [UInt8], _ after: [UInt8], around point: (Double, Double)) -> Int {
         let radius = 7
@@ -83,18 +175,36 @@ enum PointerScreenMatcher {
 /// calibration proves that the current USB screen belongs to another phone.
 /// The probe result is deliberately required before replacing any saved match.
 enum DevicePairingRecovery {
+    /// A blocked recovery must protect existing identities, while absent
+    /// phones' historical records must not prevent discovering a new screen.
+    static func matchingScreenIDs(
+        screenIDs: [String], pairings: [String: UUID], connectedHosts: [UUID], recoveryBlocked: Bool
+    ) -> [String] {
+        screenIDs.filter { id in
+            guard let host = pairings[id] else { return true }
+            return !recoveryBlocked && !connectedHosts.contains(host)
+        }
+    }
+
     enum ProbeResult: Equatable {
         case hit
         case miss
         case unavailable
     }
 
-    static func probeResult(for metrics: PointerScreenMatcher.ChangeMetrics) -> ProbeResult {
-        let score = metrics.signal - metrics.noise
-        if score >= 3 { return .hit }
-        // Only a completely unchanged capture is a reliable miss. A zero score
-        // with either signal or noise may be a cancelled or partial observation.
-        return metrics.signal == 0 && metrics.noise == 0 ? .miss : .unavailable
+    static func probeResult(for frames: [[UInt8]]) -> ProbeResult {
+        guard frames.count == 5,
+            frames.allSatisfy({ $0.count == RelativePointerScreenMatcher.width * RelativePointerScreenMatcher.height })
+        else { return .unavailable }
+        if RelativePointerScreenMatcher.matches(frames) { return .hit }
+        // A previous candidate's pointer can fade during the first capture.
+        // The stable tail still covers two distinct requested directions.
+        let tail = frames.suffix(3)
+        return tail.allSatisfy({ $0 == tail.first! }) ? .miss : .unavailable
+    }
+
+    static func shouldRequireCalibration(hasProfile: Bool, absoluteVerified: Bool) -> Bool {
+        !hasProfile && !absoluteVerified
     }
 
     struct Candidate: Equatable {

@@ -18,6 +18,19 @@ struct HIDConnectionState {
         let host: UUID
         let channel: Channel
         let data: Data
+        let session: UUID?
+        let isAllowed: (() -> Bool)?
+
+        var permissionIsCurrent: Bool {
+            // Releases cannot move a pointer and must survive invalidation so
+            // a key or mouse button pressed earlier does not remain held.
+            switch channel {
+            case .report(.relativeMouse), .report(.keyboard), .report(.consumer):
+                if !data.isEmpty, data.allSatisfy({ $0 == 0 }) { return true }
+            default: break
+            }
+            return isAllowed?() ?? true
+        }
     }
 
     private(set) var subscriptions: [UUID: Set<Channel>] = [:]
@@ -48,12 +61,15 @@ struct HIDConnectionState {
 
     /// An old DeviceInput may still have work queued when the same phone reconnects.
     /// Its token must match the current session, as well as the subscription.
-    mutating func enqueue(_ channel: Channel, data: Data, host: UUID, session: UUID? = nil) {
+    mutating func enqueue(
+        _ channel: Channel, data: Data, host: UUID, session: UUID? = nil, isAllowed: (() -> Bool)? = nil
+    ) {
         guard subscriptions[host]?.contains(channel) == true else { return }
         if channel.isInput {
             guard let session, sessions[host] == session else { return }
         }
-        let report = PendingReport(host: host, channel: channel, data: data)
+        let report = PendingReport(host: host, channel: channel, data: data, session: session, isAllowed: isAllowed)
+        guard report.permissionIsCurrent else { return }
         // Under backpressure only replace consecutive absolute positions with the
         // same button state. Never merge a key, click or relative displacement.
         if channel == .report(.absolutePointer), let last = pending.last,
@@ -63,6 +79,19 @@ struct HIDConnectionState {
         } else {
             pending.append(report)
         }
+    }
+
+    /// Backpressure can leave a report queued across identity or connection
+    /// changes. Revalidate at the notification boundary, not only at enqueue.
+    mutating func nextPendingReport() -> PendingReport? {
+        while let report = pending.first {
+            let subscribed = subscriptions[report.host]?.contains(report.channel) == true
+            let currentSession =
+                !report.channel.isInput || (report.session != nil && sessions[report.host] == report.session)
+            if subscribed, currentSession, report.permissionIsCurrent { return report }
+            pending.removeFirst()
+        }
+        return nil
     }
 
     mutating func removeFirst() { pending.removeFirst() }

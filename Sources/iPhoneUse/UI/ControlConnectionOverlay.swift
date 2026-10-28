@@ -2,7 +2,17 @@ import AppKit
 import IOBluetooth
 
 enum ControlConnectionStatus {
-    case waitingForDevice, disconnected, connecting, connected
+    case waitingForDevice, disconnected, unmatched, connecting, connected
+
+    static func resolve(
+        hasScreen: Bool, hasMatchedHost: Bool, hasConnectedHosts: Bool,
+        inputIsCurrent: Bool, inputIsReady: Bool
+    ) -> Self {
+        guard hasScreen else { return .waitingForDevice }
+        if !hasMatchedHost && hasConnectedHosts { return .unmatched }
+        if inputIsCurrent { return inputIsReady ? .connected : .connecting }
+        return hasMatchedHost ? .connecting : .disconnected
+    }
 }
 
 /// Covers the complete content area, including shortcuts, while keeping the
@@ -122,6 +132,8 @@ final class ControlConnectionOverlay: NSView {
         if status == .connected { hasConnected = true }
         isHidden = status == .connected
         let table = StringsUI.current
+        instructionsField?.isHidden = status == .unmatched
+        helpField?.isHidden = status == .unmatched
         switch status {
         case .waitingForDevice:
             title.stringValue = table.overlayWaitingTitle
@@ -133,6 +145,9 @@ final class ControlConnectionOverlay: NSView {
         case .connecting:
             title.stringValue = table.overlayConnectingTitle
             message.stringValue = table.overlayConnectingMessage
+        case .unmatched:
+            title.stringValue = table.overlayUnmatchedTitle
+            message.stringValue = table.overlayUnmatchedMessage
         case .connected:
             break
         }

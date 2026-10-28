@@ -121,12 +121,14 @@ final class PhoneControlView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         if !dragging {
-            flushMousePosition()
+            preemptBackgroundPointerMotion()
             mousePosition.reset()
+            input?.cancelPointer()
         }
     }
 
     override func mouseDown(with event: NSEvent) {
+        preemptBackgroundPointerMotion()
         // A subscription can become ready between timer ticks. Complete that
         // transition before starting a gesture so the next tick cannot cancel it.
         updatePointerReadiness()
@@ -165,6 +167,7 @@ final class PhoneControlView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        preemptBackgroundPointerMotion()
         guard canSendWindowInput, let input else { return }
         switch ControlKeyboardEvent(event).command {
         case .key(let key, let modifiers):
@@ -182,6 +185,7 @@ final class PhoneControlView: NSView {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard window?.isKeyWindow == true else { return super.performKeyEquivalent(with: event) }
         if ControlKeyboardEvent.isPasteShortcut(event) {
+            preemptBackgroundPointerMotion()
             guard canSendWindowInput, let input else { return true }
             _ = input.keyFromKeyboard("v", modifiers: ["cmd"])
             return true
@@ -199,6 +203,7 @@ final class PhoneControlView: NSView {
 
     func performShortcut(_ shortcut: ControlShortcut) {
         refreshDevice()
+        preemptBackgroundPointerMotion()
         guard canSendWindowInput, activeShortcut == nil, let input, shortcut.isAvailable(on: input) else { return }
         window?.makeFirstResponder(self)
         // Release any window drag before entering the same input queue used by
@@ -241,17 +246,26 @@ final class PhoneControlView: NSView {
         var available: Set<ControlShortcut> = []
         let status: String
         if connectionStatus != .connected {
-            status = device == nil ? table.statusWaitingDevice : table.statusWaitingBluetooth
+            status =
+                connectionStatus == .unmatched
+                ? table.overlayUnmatchedTitle
+                : (device == nil ? table.statusWaitingDevice : table.statusWaitingBluetooth)
         } else if let activeShortcut {
             status = table.sendingShortcut(activeShortcut.title)
         } else if let input, input.isCurrentSession {
             available = Set(ControlShortcut.allCases.filter { $0.isAvailable(on: input) })
-            if available.isEmpty {
+            if let device, DeviceRegistry.shared.isAutomaticallyCalibrating(screenID: device.id) {
+                available = []
+                status = table.statusAutomaticallyCalibrating
+            } else if available.isEmpty {
                 status = table.statusWaitingBluetooth
             } else if let shortcutFeedback, shortcutFeedback.expires > Date() {
                 status = shortcutFeedback.text
             } else {
-                status = input.isPointerReady ? table.statusConnected : table.statusPointerNotReady
+                status =
+                    input.needsCalibration
+                    ? table.statusCalibrationRequired
+                    : (input.isPointerReady ? table.statusConnected : table.statusPointerNotReady)
             }
         } else {
             status = device == nil ? table.statusWaitingDevice : table.statusWaitingBluetooth
@@ -287,6 +301,10 @@ final class PhoneControlView: NSView {
             input = nil
             activeShortcut = nil
             shortcutFeedback = nil
+        }
+        if input?.isRetired == true {
+            cancelInteraction()
+            input = nil
         }
         device = current
         // Matching an unknown Bluetooth host can probe several screens. Resolve
@@ -331,14 +349,10 @@ final class PhoneControlView: NSView {
     }
 
     private func updateConnectionState() {
-        let status: ControlConnectionStatus
-        if device == nil {
-            status = .waitingForDevice
-        } else if let input, input.isCurrentSession {
-            status = input.isBluetoothReady ? .connected : .connecting
-        } else {
-            status = .disconnected
-        }
+        let status = ControlConnectionStatus.resolve(
+            hasScreen: device != nil, hasMatchedHost: device?.host != nil,
+            hasConnectedHosts: !HIDPeripheral.shared.connectedHosts.isEmpty,
+            inputIsCurrent: input?.isCurrentSession == true, inputIsReady: input?.isBluetoothReady == true)
         guard connectionStatus != status else { return }
         cancelInteraction()
         if status != .connected { input?.invalidatePointerEstimate() }
@@ -399,6 +413,7 @@ final class PhoneControlView: NSView {
             mousePosition.reset()
             return
         }
+        preemptBackgroundPointerMotion()
         updatePointerReadiness()
         guard canSendPointerInput, activeShortcut == nil, pointerReady, let device,
             let point = normalizedPoint(event.locationInWindow, device: device, clamp: clampToImage)
@@ -412,6 +427,13 @@ final class PhoneControlView: NSView {
         // Forward events immediately; native absolute reports retain the timer
         // throttle so high-frequency mice cannot flood that unpaced path.
         if input?.calibration != nil { flushMousePosition() }
+    }
+
+    private func preemptBackgroundPointerMotion() {
+        guard let device else { return }
+        // A new phone may still be undergoing discovery and have no input
+        // cached for its screen. Cancel the registry's whole discovery round.
+        DeviceRegistry.shared.cancelBackgroundMotion(for: device.id)
     }
 
     private func flushMousePosition() {

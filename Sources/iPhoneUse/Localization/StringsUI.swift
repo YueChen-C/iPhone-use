@@ -39,6 +39,8 @@ struct StringsUI: LocalizedTable {
     let statusWaitingBluetooth: String
     let statusConnected: String
     let statusPointerNotReady: String
+    let statusCalibrationRequired: String
+    let statusAutomaticallyCalibrating: String
     let sendingShortcut: (String) -> String
     let sentShortcut: (String) -> String
     let shortcutDisconnected: String
@@ -54,6 +56,8 @@ struct StringsUI: LocalizedTable {
     let overlayBluetoothMessage: String
     let overlayConnectingTitle: String
     let overlayConnectingMessage: String
+    let overlayUnmatchedTitle: String
+    let overlayUnmatchedMessage: String
     /// Full pairing card. Arguments: advertised Bluetooth name, and the Mac's
     /// controller name when iOS may show it instead of the advertised name.
     let pairingInstructions: (String, String?) -> String
@@ -92,6 +96,8 @@ struct StringsUI: LocalizedTable {
         statusWaitingBluetooth: "等待蓝牙连接",
         statusConnected: "已连接",
         statusPointerNotReady: "指针尚未就绪",
+        statusCalibrationRequired: "蓝牙已连接，需要指针校准",
+        statusAutomaticallyCalibrating: "正在自动适配指针，请保持手机画面静止",
         sendingShortcut: { "正在发送\($0)…" },
         sentShortcut: { "已发送\($0)" },
         shortcutDisconnected: "连接已断开，请重试",
@@ -105,6 +111,8 @@ struct StringsUI: LocalizedTable {
         overlayBluetoothMessage: "当前无法操作 iPhone，请先连接蓝牙。",
         overlayConnectingTitle: "蓝牙连接尚未就绪",
         overlayConnectingMessage: "当前无法操作 iPhone，正在等待连接完成。",
+        overlayUnmatchedTitle: "正在匹配蓝牙连接",
+        overlayUnmatchedMessage: "已检测到蓝牙连接，尚未确认哪条连接对应这台 iPhone。请保持手机解锁并开启辅助触控，程序会自动重试。",
         pairingInstructions: { advertisedName, controllerName in
             let deviceNames =
                 if let controllerName, !controllerName.isEmpty, controllerName != advertisedName {
@@ -154,6 +162,8 @@ struct StringsUI: LocalizedTable {
         statusWaitingBluetooth: "Waiting for Bluetooth",
         statusConnected: "Connected",
         statusPointerNotReady: "Pointer not ready yet",
+        statusCalibrationRequired: "Bluetooth connected; pointer calibration required",
+        statusAutomaticallyCalibrating: "Adapting pointer automatically; keep the phone screen still",
         sendingShortcut: { "Sending \($0)…" },
         sentShortcut: { "Sent \($0)" },
         shortcutDisconnected: "Connection lost, please retry",
@@ -169,6 +179,9 @@ struct StringsUI: LocalizedTable {
         overlayConnectingTitle: "Bluetooth connection not ready",
         overlayConnectingMessage:
             "The iPhone cannot be controlled yet; waiting for the connection to finish.",
+        overlayUnmatchedTitle: "Matching Bluetooth connection",
+        overlayUnmatchedMessage:
+            "Bluetooth connections are present but have not been matched to this iPhone. Keep it unlocked with AssistiveTouch enabled; matching retries automatically.",
         pairingInstructions: { advertisedName, controllerName in
             let deviceNames =
                 if let controllerName, !controllerName.isEmpty, controllerName != advertisedName {

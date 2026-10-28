@@ -5,9 +5,12 @@ import Foundation
 final class DeviceInput {
     let host: UUID
     let session: UUID?
+    private let lifecycleLock = NSLock()
+    private var retired = false
+    var isRetired: Bool { lifecycleLock.withLock { retired } }
 
     var isCurrentSession: Bool {
-        guard let session else { return false }
+        guard !isRetired, let session else { return false }
         return hid.connectionSession(for: host) == session
     }
 
@@ -22,12 +25,18 @@ final class DeviceInput {
         coordinateMappingAvailable && pointerReports.allSatisfy { reportReadiness($0, host, session) }
     }
 
+    var needsCalibration: Bool {
+        if calibrationRequired && calibration == nil { return true }
+        if let calibration, let size = screenSize?() { return !calibration.matches(size) }
+        return false
+    }
+
     /// Absolute hosts position through the absolute collection, but iOS only
     /// synthesizes a touch from relative button reports, so every press and
     /// all drag movement run on the relative collection. Calibrated hosts
     /// use the relative collection for everything.
     private var pointerReports: [ReportID] {
-        calibration == nil ? [.absolutePointer, .relativeMouse] : [.relativeMouse]
+        calibration != nil || calibrationRequired ? [.relativeMouse] : [.absolutePointer, .relativeMouse]
     }
 
     // Gesture state is confined to this queue. Only motion supersession is
@@ -35,6 +44,7 @@ final class DeviceInput {
     private let queue: DispatchQueue
     private let hid = HIDPeripheral.shared
     private let reportReadiness: (ReportID, UUID, UUID?) -> Bool
+    private let inputIsAllowed: () -> Bool
     private var buttons: UInt8 = 0
     private let reportSender: (ReportID, [UInt8]) -> Void
     private let sleep: (TimeInterval) -> Void
@@ -42,18 +52,24 @@ final class DeviceInput {
     let calibration: RelativePointerCalibration?
     private var absolutePointerPosition: (x: UInt16, y: UInt16)?
     private var estimatedPosition: CGPoint?
+    /// Queue-confined progress lets fresh hover targets share one homing path.
+    /// Cancelling the interaction or invalidating its mapping starts a new path.
+    private var relativeHomingReportIndex = 0
     private var lastTrackingMovement: RelativePointerCalibration.Movement?
     /// Predicted pointer position in physical pixels while an uncalibrated
     /// drag runs on the relative collection. Nil outside a drag.
     private var dragPosition: CGPoint?
     private var lastEstimatedMovement: RelativePointerCalibration.Movement?
     private let motionSequence = PointerMotionSequence()
+    /// Matching rounds capture this once and abandon all remaining probes as
+    /// soon as normal input supersedes them, including between probe attempts.
+    var inputActivitySequence: UInt64 { motionSequence.current }
     private let calibrationRequired: Bool
     private let calibrationFilePresent: Bool
     private let screenSize: (() -> CGSize?)?
 
-    /// A compact snapshot for `/status`; this is deliberately read-only and does
-    /// not expose the calibration curve itself.
+    /// A read-only snapshot for `/status`, including the curve actually loaded
+    /// in memory so diagnostics do not infer it from potentially stale files.
     var pointerStatus: [String: Any] {
         let currentSize = screenSize?()
         let mode: String
@@ -78,11 +94,16 @@ final class DeviceInput {
             calibrationInfo["calibratedHeight"] = calibration.screenHeight
             calibrationInfo["screenMatches"] = currentSize.map(calibration.matches) ?? false
             calibrationInfo["vectorModel"] = calibration.vectorModel?.rawValue ?? "single-axis"
+            calibrationInfo["host"] = calibration.host.uuidString
+            calibrationInfo["screenID"] = calibration.screenID
+            calibrationInfo["reportInterval"] = calibration.reportInterval
+            calibrationInfo["distances"] = calibration.distances
         } else {
             calibrationInfo["screenMatches"] = false
         }
         return [
             "ready": isPointerReady,
+            "needsCalibration": needsCalibration,
             "sessionCurrent": isCurrentSession,
             "coordinateMappingAvailable": coordinateMappingAvailable,
             "calibration": calibrationInfo,
@@ -90,6 +111,7 @@ final class DeviceInput {
     }
 
     private var coordinateMappingAvailable: Bool {
+        if isRetired || !inputIsAllowed() { return false }
         if calibrationRequired && calibration == nil { return false }
         if let calibration, let screenSize {
             guard let size = screenSize(), calibration.matches(size) else { return false }
@@ -104,6 +126,7 @@ final class DeviceInput {
         calibrationRequired: Bool = false,
         calibrationFilePresent: Bool? = nil,
         screenSize: (() -> CGSize?)? = nil,
+        inputIsAllowed: @escaping () -> Bool = { true },
         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
         reportSender: ((ReportID, [UInt8]) -> Void)? = nil,
         reportReadiness: ((ReportID, UUID, UUID?) -> Bool)? = nil
@@ -114,6 +137,7 @@ final class DeviceInput {
         self.calibrationRequired = calibrationRequired
         self.calibrationFilePresent = calibrationFilePresent ?? calibrationRequired
         self.screenSize = screenSize
+        self.inputIsAllowed = inputIsAllowed
         self.sleep = sleep
         self.reportReadiness =
             reportReadiness ?? {
@@ -121,7 +145,7 @@ final class DeviceInput {
             }
         self.reportSender =
             reportSender ?? { id, bytes in
-                HIDPeripheral.shared.send(id, bytes, to: host, session: session)
+                HIDPeripheral.shared.send(id, bytes, to: host, session: session, isAllowed: inputIsAllowed)
             }
         queue = DispatchQueue(label: "iphone-use.input.\(host)")
     }
@@ -219,6 +243,102 @@ extension DeviceInput {
         }
     }
 
+    /// Reload only an idle input; queued work from the old configuration must
+    /// not send reports after the registry publishes its replacement.
+    func retireForCalibrationReload() throws {
+        try queue.sync {
+            try requireIdlePointer()
+            motionSequence.advance()
+            clearPointerEstimate()
+            lifecycleLock.withLock { retired = true }
+        }
+    }
+
+    /// Gain-independent fallback for hosts whose absolute coordinates do not
+    /// reach the two matching targets. Capture an entire rectangle on one input
+    /// queue, and never press a button or use a speculative calibration.
+    func relativePairingProbe(isReady: () -> Bool, capture: () -> [[UInt8]?]) throws -> [[[UInt8]]] {
+        let sequence = motionSequence.current
+        return try queue.sync {
+            try requireIdlePointer()
+            guard session != nil, !isRetired, isReady() else { throw InputError.pairingProbeUnavailable }
+            clearPointerEstimate()
+            defer { clearPointerEstimate() }
+            func move(_ dx: Int, _ dy: Int, times: Int) throws {
+                for _ in 0..<times {
+                    guard isReady(), motionSequence.isCurrent(sequence) else {
+                        throw InputError.pairingProbeUnavailable
+                    }
+                    relative(dx, dy)
+                    pause(step)
+                }
+            }
+            // First make room, then leave the top/left edges before capturing.
+            // A clipped pointer cannot provide a complete return trajectory.
+            try move(-8, 0, times: 12)
+            try move(0, -8, times: 12)
+            try move(8, 0, times: 4)
+            try move(0, 8, times: 4)
+            var frames: [[[UInt8]]] = []
+            for (dx, dy) in [(0, 0), (8, 0), (0, 8), (-8, 0), (0, -8)] {
+                try move(dx, dy, times: dx == 0 && dy == 0 ? 0 : 4)
+                pause(0.6)
+                guard isReady(), motionSequence.isCurrent(sequence) else {
+                    throw InputError.pairingProbeUnavailable
+                }
+                let images = capture()
+                guard !images.isEmpty, images.allSatisfy({ $0 != nil }) else {
+                    throw InputError.pairingProbeUnavailable
+                }
+                frames.append(images.map { $0! })
+            }
+            return frames
+        }
+    }
+
+    /// Keep native first-use measurement on this phone's normal input queue.
+    /// Every report and capture rechecks ownership; disconnects and window
+    /// cancellation invalidate the entire result before it can be saved.
+    func measureRelativePointer(
+        screenID: String, size: CGSize,
+        isReady: @escaping () -> Bool,
+        capture: @escaping () -> [UInt8]?,
+        progress: @escaping (Int) -> Void = { _ in }
+    ) throws -> RelativePointerCalibration {
+        let sequence = motionSequence.current
+        return try queue.sync {
+            try requireIdlePointer()
+            guard size.width.isFinite, size.height.isFinite,
+                (200...4096).contains(size.width), (300...4096).contains(size.height),
+                buttons == 0, session != nil, !isRetired, isReady()
+            else {
+                throw InputError.pairingProbeUnavailable
+            }
+            clearPointerEstimate()
+            defer { clearPointerEstimate() }
+            func requireCurrent() throws {
+                guard !self.isRetired, isReady(), self.motionSequence.isCurrent(sequence) else {
+                    throw InputError.pairingProbeUnavailable
+                }
+            }
+            let measurement = AutomaticPointerCalibration(
+                host: host, screenID: screenID, width: Int(size.width), height: Int(size.height),
+                send: { dx, dy in
+                    try requireCurrent()
+                    self.relative(dx, dy)
+                    self.pause(0.03)
+                },
+                capture: {
+                    self.pause(0.4)
+                    try requireCurrent()
+                    guard let pixels = capture() else { throw InputError.pairingProbeUnavailable }
+                    return PointerMotionObservation.Frame(
+                        width: Int(size.width), height: Int(size.height), pixels: pixels)
+                }, progress: progress)
+            return try measurement.measure()
+        }
+    }
+
     /// Serializes a two-position matching probe with normal input on this host.
     /// A supplied calibration is used only for these reports, so recovery can
     /// test a verified old host profile without binding it to the current USB ID.
@@ -226,10 +346,11 @@ extension DeviceInput {
         calibration: RelativePointerCalibration?,
         firstPoint: CGPoint,
         secondPoint: CGPoint,
+        returnToStart: Bool = false,
         wait: TimeInterval = 0.6,
         isReady: () -> Bool,
         capture: () -> [UInt8]?
-    ) throws -> (before: [UInt8], after: [UInt8]) {
+    ) throws -> (before: [UInt8], after: [UInt8], returned: [UInt8]?) {
         let sequence = motionSequence.current
         return try queue.sync {
             guard !windowDragging, buttons == 0 else { throw InputError.pointerBusy }
@@ -250,27 +371,37 @@ extension DeviceInput {
             // Do not reuse either mapping's estimate across that boundary.
             clearPointerEstimate()
             defer { clearPointerEstimate() }
-            moveForPairingProbe(firstPoint, calibration: calibration, sequence: sequence)
+            moveForPairingProbe(firstPoint, calibration: calibration, sequence: sequence, isReady: isReady)
             pause(wait)
             guard isReady(), motionSequence.isCurrent(sequence), let before = capture() else {
                 throw InputError.pairingProbeUnavailable
             }
             guard isReady(), motionSequence.isCurrent(sequence) else { throw InputError.pairingProbeUnavailable }
-            moveForPairingProbe(secondPoint, calibration: calibration, sequence: sequence)
+            moveForPairingProbe(secondPoint, calibration: calibration, sequence: sequence, isReady: isReady)
             pause(wait)
             guard isReady(), motionSequence.isCurrent(sequence), let after = capture() else {
                 throw InputError.pairingProbeUnavailable
             }
-            return (before, after)
+            var returned: [UInt8]?
+            if returnToStart {
+                guard isReady(), motionSequence.isCurrent(sequence) else { throw InputError.pairingProbeUnavailable }
+                moveForPairingProbe(firstPoint, calibration: calibration, sequence: sequence, isReady: isReady)
+                pause(wait)
+                guard isReady(), motionSequence.isCurrent(sequence), let pixels = capture() else {
+                    throw InputError.pairingProbeUnavailable
+                }
+                returned = pixels
+            }
+            return (before, after, returned)
         }
     }
 
     private func moveForPairingProbe(
-        _ point: CGPoint, calibration: RelativePointerCalibration?, sequence: UInt64
+        _ point: CGPoint, calibration: RelativePointerCalibration?, sequence: UInt64, isReady: () -> Bool
     ) {
         if let calibration {
-            moveCalibratedPointer(point.x, point.y, calibration: calibration, sequence: sequence)
-        } else {
+            moveCalibratedPointer(point.x, point.y, calibration: calibration, sequence: sequence, isReady: isReady)
+        } else if isReady() {
             moveAbsolutePointer(point.x, point.y, sequence: sequence)
         }
     }
@@ -332,6 +463,7 @@ extension DeviceInput {
         queue.async {
             self.windowDragging = false
             self.endEstimatedDrag()
+            if self.estimatedPosition == nil { self.relativeHomingReportIndex = 0 }
             guard self.buttons != 0 else { return }
             self.button(down: false)
             // The drag positioned the pointer through the absolute collection.
@@ -359,11 +491,18 @@ extension DeviceInput {
         motionSequence.advance()
     }
 
+    /// User activity must interrupt background measurement before waiting on
+    /// its queue, including when no usable coordinate mapping exists yet.
+    func cancelBackgroundMotion() {
+        discardPendingMotion()
+    }
+
     /// Relative mouse, for testing hosts that ignore the absolute pointer.
     func nudge(dx: Int, dy: Int, click: Bool) throws {
+        if dx != 0 || dy != 0 || click { discardPendingMotion() }
         try queue.sync {
             try requireIdlePointer()
-            if dx != 0 || dy != 0 { estimatedPosition = nil }
+            if dx != 0 || dy != 0 { clearPointerEstimate() }
             var remainingX = dx
             var remainingY = dy
             while remainingX != 0 || remainingY != 0 {
@@ -396,6 +535,7 @@ extension DeviceInput {
             KeyboardMap.Stroke(code: $0.code, modifiers: $0.modifiers | modifierMask)
         }
         guard strokes.count == text.count else { return false }
+        if !strokes.isEmpty { discardPendingMotion() }
         queue.async {
             for stroke in strokes { self.press(stroke) }
         }
@@ -406,6 +546,7 @@ extension DeviceInput {
         guard let code = KeyboardMap.code(for: name),
             let modifierMask = KeyboardMap.modifierMask(for: modifiers)
         else { return false }
+        discardPendingMotion()
         queue.async {
             self.press(KeyboardMap.Stroke(code: code, modifiers: modifierMask))
         }
@@ -417,6 +558,7 @@ extension DeviceInput {
             guard let stroke = KeyboardMap.stroke(for: character) else { throw InputError.untypeable(character) }
             return stroke
         }
+        if !strokes.isEmpty { discardPendingMotion() }
         queue.sync {
             for stroke in strokes {
                 press(stroke)
@@ -433,10 +575,12 @@ extension DeviceInput {
             guard let bit = KeyboardMap.modifierBit(for: modifier) else { throw InputError.unknownKey(modifier) }
             mask |= bit
         }
+        discardPendingMotion()
         queue.sync { press(KeyboardMap.Stroke(code: code, modifiers: mask)) }
     }
 
     func consumer(_ usage: UInt16) {
+        discardPendingMotion()
         queue.sync {
             send(.consumer, HIDReportPayload.consumer(usage))
             pause(0.08)
@@ -479,14 +623,19 @@ extension DeviceInput {
 
     fileprivate func moveCalibratedPointer(
         _ x: Double, _ y: Double,
-        calibration: RelativePointerCalibration, sequence: UInt64?
+        calibration: RelativePointerCalibration, sequence: UInt64?, isReady: () -> Bool = { true }
     ) {
-        if estimatedPosition == nil { homeRelativePointer(using: calibration) }
+        guard shouldContinueMotion(sequence), isReady() else { return }
+        if estimatedPosition == nil,
+            !homeRelativePointer(using: calibration, sequence: sequence, isReady: isReady)
+        {
+            return
+        }
         let target = CGPoint(x: x * Double(calibration.screenWidth), y: y * Double(calibration.screenHeight))
         // Window and API move from the same predicted landing. Only unknown
         // positions need homing. API gestures finish on this serial queue;
         // window tracking can be superseded before its next report.
-        while shouldContinueMotion(sequence) {
+        while shouldContinueMotion(sequence), isReady() {
             guard
                 let movement = calibration.trackingStep(
                     from: estimatedPosition ?? .zero, to: target, after: lastTrackingMovement)
@@ -615,22 +764,39 @@ extension DeviceInput {
     }
 
     fileprivate func shouldContinueMotion(_ sequence: UInt64?) -> Bool {
+        guard !isRetired, inputIsAllowed() else {
+            clearPointerEstimate()
+            return false
+        }
         // Synchronous API gestures have no supersession token and must finish.
         guard let sequence else { return true }
         return motionSequence.isCurrent(sequence)
     }
 
-    fileprivate func homeRelativePointer(using calibration: RelativePointerCalibration? = nil) {
-        guard let calibration = calibration ?? self.calibration else { return }
+    @discardableResult
+    fileprivate func homeRelativePointer(
+        using calibration: RelativePointerCalibration? = nil, sequence: UInt64? = nil,
+        isReady: () -> Bool = { true }
+    ) -> Bool {
+        guard let calibration = calibration ?? self.calibration else { return false }
         // Recover an unknown origin on first use or after invalidation.
         // Never home while a button is held.
-        guard buttons == 0 else { return }
-        for report in calibration.homingReports {
+        guard buttons == 0 else { return false }
+        let reports = calibration.homingReports
+        while relativeHomingReportIndex < reports.count {
+            // An interrupted homing path has no known origin. Leave the
+            // estimate unset until a later operation completes the whole path.
+            guard shouldContinueMotion(sequence), isReady() else { return false }
+            let report = reports[relativeHomingReportIndex]
             relative(report.dx, report.dy)
+            relativeHomingReportIndex += 1
             pause(calibration.reportInterval)
         }
+        guard shouldContinueMotion(sequence), isReady() else { return false }
         estimatedPosition = .zero
+        relativeHomingReportIndex = 0
         lastTrackingMovement = nil
+        return true
     }
 
     fileprivate func relative(_ dx: Int, _ dy: Int) {
@@ -647,6 +813,8 @@ extension DeviceInput {
     /// Coordinate APIs share the same validation order and queue boundary.
     /// Keep pacing inside the operation so a complete gesture stays serialized.
     fileprivate func performCoordinateGesture(_ gesture: () throws -> Void) throws {
+        // Supersede background probes before waiting on their input queue.
+        discardPendingMotion()
         try queue.sync {
             try requireIdlePointer()
             try requireCoordinateMapping()
@@ -656,6 +824,7 @@ extension DeviceInput {
 
     fileprivate func clearPointerEstimate() {
         estimatedPosition = nil
+        relativeHomingReportIndex = 0
         lastTrackingMovement = nil
         dragPosition = nil
         lastEstimatedMovement = nil
@@ -677,6 +846,10 @@ extension DeviceInput {
     }
 
     fileprivate func send(_ id: ReportID, _ bytes: [UInt8]) {
+        guard !isRetired else { return }
+        // A capture can be invalidated while an input is queued. Stop stale
+        // movement and presses, while still releasing any held button or key.
+        guard inputIsAllowed() || (id != .absolutePointer && bytes.allSatisfy { $0 == 0 }) else { return }
         reportSender(id, bytes)
     }
 
