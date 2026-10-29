@@ -1,6 +1,6 @@
 import AppKit
-import CoreImage
 import CoreVideo
+import VideoToolbox
 
 /// A lightweight scrcpy-style window. The screen is drawn directly from the latest
 /// CVPixelBuffer and mouse events are sent to the phone's HID input queue.
@@ -556,21 +556,20 @@ struct ControlDeviceBinding {
     }
 }
 
-/// Owns the shared image context; the view keeps frame acquisition and redraw timing.
+/// Draw the capture's existing BGRA pixels without a Core Image GPU round trip.
 private enum ControlScreenRenderer {
-    private static let context = CIContext()
-
     static func draw(_ buffer: CVPixelBuffer, in bounds: CGRect) {
-        let image = CIImage(cvPixelBuffer: buffer)
-        let source = image.extent
-        guard let layout = ControlImageLayout(screenSize: source.size, bounds: bounds) else { return }
-        // Rendering through the view's CGContext is more reliable than relying on
-        // CIContext's implicit current-context selection in a regular NSView.
-        guard let cgImage = context.createCGImage(image, from: source),
+        let size = CGSize(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
+        guard let layout = ControlImageLayout(screenSize: size, bounds: bounds) else { return }
+        // AVCapture already supplies BGRA. Core Image rendered and read those
+        // pixels back from the GPU on AppKit's event thread for every frame.
+        var image: CGImage?
+        guard VTCreateCGImageFromCVPixelBuffer(buffer, options: nil, imageOut: &image) == noErr,
+            let image,
             let cgContext = NSGraphicsContext.current?.cgContext
         else { return }
         cgContext.interpolationQuality = .high
-        cgContext.draw(cgImage, in: layout.imageRect)
+        cgContext.draw(image, in: layout.imageRect)
     }
 
     static func drawWaitingMessage(in bounds: CGRect) {

@@ -159,6 +159,78 @@ final class DeviceInputTrackingTests: XCTestCase {
         XCTAssertTrue(pointer.reports.allSatisfy { $0.dx >= 0 && $0.dy >= 0 })
     }
 
+    func testDuplicateMouseEventDoesNotCancelTargetAlreadySubmittedByTimer() throws {
+        let (input, pointer) = try preparedInput(vectorModel: .radialQuantized)
+        let target = CGPoint(x: 0.8, y: 0.7)
+        var mouse = ControlMousePosition()
+        mouse.update(target)
+        let submitted = try XCTUnwrap(mouse.takePosition())
+        let eventHandled = expectation(description: "mouse event follows timer submission")
+        pointer.onReport = { _ in
+            pointer.onReport = nil
+            // The 30 Hz timer can observe the cursor before AppKit delivers
+            // mouseMoved for that same coordinate. That event cancels only
+            // background work and has no new target to submit.
+            input.cancelBackgroundMotion()
+            mouse.update(target)
+            XCTAssertNil(mouse.takePosition())
+            eventHandled.fulfill()
+        }
+        input.positionPointer(x: submitted.x, y: submitted.y)
+        wait(for: [eventHandled], timeout: 2)
+        try input.nudge(dx: 0, dy: 0, click: false)
+
+        XCTAssertEqual(pointer.position.x, 80, accuracy: 0.5)
+        XCTAssertEqual(pointer.position.y, 140, accuracy: 0.5)
+    }
+
+    func testBackgroundCancellationStillStopsEveryProbeBeforeItsNextReport() throws {
+        for kind in ["relative", "absolute", "calibrated", "measurement"] {
+            let calibration = RelativePointerCalibration(
+                host: UUID(), screenWidth: 750, screenHeight: 1334,
+                reportInterval: 0.03, distances: [0, 1, 3, 8, 20])
+            var reports = 0
+            var input: DeviceInput!
+            input = DeviceInput(
+                host: calibration.host, session: UUID(), calibration: calibration,
+                sleep: { _ in },
+                reportSender: { _, _ in
+                    reports += 1
+                    input.cancelBackgroundMotion()
+                })
+            XCTAssertThrowsError(
+                try {
+                    switch kind {
+                    case "relative":
+                        _ = try input.relativePairingProbe(
+                            isReady: { true },
+                            capture: {
+                                XCTFail()
+                                return [[0]]
+                            })
+                    case "measurement":
+                        _ = try input.measureRelativePointer(
+                            screenID: "test", size: CGSize(width: 750, height: 1334),
+                            isReady: { true },
+                            capture: {
+                                XCTFail()
+                                return nil
+                            })
+                    default:
+                        _ = try input.pairingProbe(
+                            calibration: kind == "calibrated" ? calibration : nil,
+                            firstPoint: CGPoint(x: 0.8, y: 0.8), secondPoint: CGPoint(x: 0.2, y: 0.2),
+                            wait: 0, isReady: { true },
+                            capture: {
+                                XCTFail()
+                                return [0]
+                            })
+                    }
+                }(), kind)
+            XCTAssertEqual(reports, 1, kind)
+        }
+    }
+
     func testRegistryCancellationStopsCalibratedProbeDuringHomingOrTracking() throws {
         let homingCount = freshInput().1.calibration.homingReports.count
         for stopAfter in [1, homingCount + 1] {

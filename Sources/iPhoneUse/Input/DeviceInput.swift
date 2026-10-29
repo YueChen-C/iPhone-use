@@ -61,9 +61,12 @@ final class DeviceInput {
     private var dragPosition: CGPoint?
     private var lastEstimatedMovement: RelativePointerCalibration.Movement?
     private let motionSequence = PointerMotionSequence()
+    // Background cancellation must not supersede a foreground hover already
+    // submitted by the timer for the same AppKit mouse event.
+    private let backgroundSequence = PointerMotionSequence()
     /// Matching rounds capture this once and abandon all remaining probes as
     /// soon as normal input supersedes them, including between probe attempts.
-    var inputActivitySequence: UInt64 { motionSequence.current }
+    var inputActivitySequence: UInt64 { backgroundSequence.current }
     private let calibrationRequired: Bool
     private let calibrationFilePresent: Bool
     private let screenSize: (() -> CGSize?)?
@@ -248,7 +251,7 @@ extension DeviceInput {
     func retireForCalibrationReload() throws {
         try queue.sync {
             try requireIdlePointer()
-            motionSequence.advance()
+            advanceMotionSequence()
             clearPointerEstimate()
             lifecycleLock.withLock { retired = true }
         }
@@ -258,15 +261,17 @@ extension DeviceInput {
     /// reach the two matching targets. Capture an entire rectangle on one input
     /// queue, and never press a button or use a speculative calibration.
     func relativePairingProbe(isReady: () -> Bool, capture: () -> [[UInt8]?]) throws -> [[[UInt8]]] {
-        let sequence = motionSequence.current
+        let sequence = backgroundSequence.current
         return try queue.sync {
             try requireIdlePointer()
-            guard session != nil, !isRetired, isReady() else { throw InputError.pairingProbeUnavailable }
+            guard session != nil, !isRetired, isReady(), backgroundSequence.isCurrent(sequence) else {
+                throw InputError.pairingProbeUnavailable
+            }
             clearPointerEstimate()
             defer { clearPointerEstimate() }
             func move(_ dx: Int, _ dy: Int, times: Int) throws {
                 for _ in 0..<times {
-                    guard isReady(), motionSequence.isCurrent(sequence) else {
+                    guard isReady(), backgroundSequence.isCurrent(sequence) else {
                         throw InputError.pairingProbeUnavailable
                     }
                     relative(dx, dy)
@@ -283,7 +288,7 @@ extension DeviceInput {
             for (dx, dy) in [(0, 0), (8, 0), (0, 8), (-8, 0), (0, -8)] {
                 try move(dx, dy, times: dx == 0 && dy == 0 ? 0 : 4)
                 pause(0.6)
-                guard isReady(), motionSequence.isCurrent(sequence) else {
+                guard isReady(), backgroundSequence.isCurrent(sequence) else {
                     throw InputError.pairingProbeUnavailable
                 }
                 let images = capture()
@@ -305,7 +310,7 @@ extension DeviceInput {
         capture: @escaping () -> [UInt8]?,
         progress: @escaping (Int) -> Void = { _ in }
     ) throws -> RelativePointerCalibration {
-        let sequence = motionSequence.current
+        let sequence = backgroundSequence.current
         return try queue.sync {
             try requireIdlePointer()
             guard size.width.isFinite, size.height.isFinite,
@@ -317,7 +322,7 @@ extension DeviceInput {
             clearPointerEstimate()
             defer { clearPointerEstimate() }
             func requireCurrent() throws {
-                guard !self.isRetired, isReady(), self.motionSequence.isCurrent(sequence) else {
+                guard !self.isRetired, isReady(), self.backgroundSequence.isCurrent(sequence) else {
                     throw InputError.pairingProbeUnavailable
                 }
             }
@@ -352,9 +357,11 @@ extension DeviceInput {
         capture: () -> [UInt8]?
     ) throws -> (before: [UInt8], after: [UInt8], returned: [UInt8]?) {
         let sequence = motionSequence.current
+        let activity = backgroundSequence.current
+        func probeIsReady() -> Bool { isReady() && backgroundSequence.isCurrent(activity) }
         return try queue.sync {
             guard !windowDragging, buttons == 0 else { throw InputError.pointerBusy }
-            guard session != nil, isReady(), motionSequence.isCurrent(sequence),
+            guard session != nil, probeIsReady(), motionSequence.isCurrent(sequence),
                 wait.isFinite, wait >= 0,
                 [firstPoint.x, firstPoint.y, secondPoint.x, secondPoint.y].allSatisfy({
                     $0.isFinite && (0...1).contains($0)
@@ -371,23 +378,25 @@ extension DeviceInput {
             // Do not reuse either mapping's estimate across that boundary.
             clearPointerEstimate()
             defer { clearPointerEstimate() }
-            moveForPairingProbe(firstPoint, calibration: calibration, sequence: sequence, isReady: isReady)
+            moveForPairingProbe(firstPoint, calibration: calibration, sequence: sequence, isReady: probeIsReady)
             pause(wait)
-            guard isReady(), motionSequence.isCurrent(sequence), let before = capture() else {
+            guard probeIsReady(), motionSequence.isCurrent(sequence), let before = capture() else {
                 throw InputError.pairingProbeUnavailable
             }
-            guard isReady(), motionSequence.isCurrent(sequence) else { throw InputError.pairingProbeUnavailable }
-            moveForPairingProbe(secondPoint, calibration: calibration, sequence: sequence, isReady: isReady)
+            guard probeIsReady(), motionSequence.isCurrent(sequence) else { throw InputError.pairingProbeUnavailable }
+            moveForPairingProbe(secondPoint, calibration: calibration, sequence: sequence, isReady: probeIsReady)
             pause(wait)
-            guard isReady(), motionSequence.isCurrent(sequence), let after = capture() else {
+            guard probeIsReady(), motionSequence.isCurrent(sequence), let after = capture() else {
                 throw InputError.pairingProbeUnavailable
             }
             var returned: [UInt8]?
             if returnToStart {
-                guard isReady(), motionSequence.isCurrent(sequence) else { throw InputError.pairingProbeUnavailable }
-                moveForPairingProbe(firstPoint, calibration: calibration, sequence: sequence, isReady: isReady)
+                guard probeIsReady(), motionSequence.isCurrent(sequence) else {
+                    throw InputError.pairingProbeUnavailable
+                }
+                moveForPairingProbe(firstPoint, calibration: calibration, sequence: sequence, isReady: probeIsReady)
                 pause(wait)
-                guard isReady(), motionSequence.isCurrent(sequence), let pixels = capture() else {
+                guard probeIsReady(), motionSequence.isCurrent(sequence), let pixels = capture() else {
                     throw InputError.pairingProbeUnavailable
                 }
                 returned = pixels
@@ -407,7 +416,7 @@ extension DeviceInput {
     }
 
     func positionPointer(x: Double, y: Double) {
-        let sequence = motionSequence.advance()
+        let sequence = advanceMotionSequence()
         queue.async {
             guard self.coordinateMappingAvailable else { return }
             // Calibrated movement may take several connection intervals. Drop
@@ -436,7 +445,7 @@ extension DeviceInput {
     }
 
     func drag(x: Double, y: Double) {
-        let sequence = motionSequence.advance()
+        let sequence = advanceMotionSequence()
         queue.async {
             guard self.windowDragging,
                 self.motionSequence.isCurrent(sequence)
@@ -487,14 +496,20 @@ extension DeviceInput {
         }
     }
 
+    @discardableResult
+    private func advanceMotionSequence() -> UInt64 {
+        backgroundSequence.advance()
+        return motionSequence.advance()
+    }
+
     private func discardPendingMotion() {
-        motionSequence.advance()
+        advanceMotionSequence()
     }
 
     /// User activity must interrupt background measurement before waiting on
     /// its queue, including when no usable coordinate mapping exists yet.
     func cancelBackgroundMotion() {
-        discardPendingMotion()
+        backgroundSequence.advance()
     }
 
     /// Relative mouse, for testing hosts that ignore the absolute pointer.
