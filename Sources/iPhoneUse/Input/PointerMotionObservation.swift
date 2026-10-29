@@ -74,14 +74,17 @@ enum PointerMotionObservation {
                     stack.append(next)
                 }
             }
-            // USB video can fluctuate along a few text edges. These sparse
-            // fragments are much smaller than even the smallest allowed disk.
-            if area < 20 {
+            // USB video can fluctuate along text edges. A narrow fragment
+            // cannot be a supported disk, even when its length makes its area
+            // exceed the small-fragment cutoff. Share one bounded noise budget.
+            let blobWidth = maxX - minX + 1
+            let blobHeight = maxY - minY + 1
+            if area < 20 || min(blobWidth, blobHeight) < 8 {
                 noise += area
                 guard noise <= 256 else { return nil }
                 continue
             }
-            let bounds = CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+            let bounds = CGRect(x: minX, y: minY, width: blobWidth, height: blobHeight)
             guard minX > 1, minY > 1, maxX < width - 2, maxY < height - 2 else { return nil }
             blobs.append(Blob(area: area, bounds: bounds))
             guard blobs.count <= 2 else { return nil }
