@@ -121,7 +121,7 @@ final class PhoneControlView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         if !dragging {
-            preemptBackgroundPointerMotion()
+            if canSendPointerInput { preemptBackgroundPointerMotion() }
             mousePosition.reset()
             input?.cancelPointer()
         }
@@ -245,7 +245,9 @@ final class PhoneControlView: NSView {
         let table = StringsUI.current
         var available: Set<ControlShortcut> = []
         let status: String
-        if connectionStatus != .connected {
+        if connectionStatus == .verifyingScreen {
+            status = table.statusVerifyingScreen
+        } else if connectionStatus != .connected {
             status =
                 connectionStatus == .unmatched
                 ? table.overlayUnmatchedTitle
@@ -351,8 +353,10 @@ final class PhoneControlView: NSView {
     private func updateConnectionState() {
         let status = ControlConnectionStatus.resolve(
             hasScreen: device != nil, hasMatchedHost: device?.host != nil,
-            hasConnectedHosts: !HIDPeripheral.shared.connectedHosts.isEmpty,
-            inputIsCurrent: input?.isCurrentSession == true, inputIsReady: input?.isBluetoothReady == true)
+            bluetoothState: device?.bluetoothState ?? .disconnected,
+            inputIsCurrent: input?.isCurrentSession == true, inputIsReady: input?.isBluetoothReady == true,
+            screenPermitsInput: device.map { ScreenCaptureManager.shared.permitsPointerAssociation(for: $0.screen) }
+                ?? false)
         guard connectionStatus != status else { return }
         cancelInteraction()
         if status != .connected { input?.invalidatePointerEstimate() }
@@ -413,7 +417,9 @@ final class PhoneControlView: NSView {
             mousePosition.reset()
             return
         }
-        preemptBackgroundPointerMotion()
+        // Hovering a disabled connection overlay cannot steer this phone.
+        // Do not let tracking-area events cancel the discovery that enables it.
+        if canSendPointerInput { preemptBackgroundPointerMotion() }
         updatePointerReadiness()
         guard canSendPointerInput, activeShortcut == nil, pointerReady, let device,
             let point = normalizedPoint(event.locationInWindow, device: device, clamp: clampToImage)
@@ -433,7 +439,7 @@ final class PhoneControlView: NSView {
         guard let device else { return }
         // A new phone may still be undergoing discovery and have no input
         // cached for its screen. Cancel the registry's whole discovery round.
-        DeviceRegistry.shared.cancelBackgroundMotion(for: device.id)
+        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
     }
 
     private func flushMousePosition() {

@@ -95,4 +95,77 @@ final class CaptureIdentityMatcherTests: XCTestCase {
         XCTAssertTrue(physical.isInformative)
         XCTAssertEqual(try XCTUnwrap(physical.distance(to: capture)), 0, accuracy: 0.0001)
     }
+
+    func testMissingScreenshotServiceCanBeResolvedByOneRemainingSource() {
+        XCTAssertEqual(
+            CaptureIdentityMatcher.verifiedMappings(
+                physicalIDs: ["se", "new"], physical: ["se": signature()],
+                sources: ["se": signature(inverted: true), "new": signature()], unavailable: ["new"]),
+            ["se": "new", "new": "se"])
+    }
+
+    func testSparseSettingsScreenCanOnlyBeInferredAfterTheOtherPhoneIsProven() {
+        var pixels = [UInt8](repeating: 245, count: CaptureIdentityImage.width * CaptureIdentityImage.height * 3)
+        for i in 0..<(40 * 3) { pixels[i] = 180 }
+        let settings = CaptureIdentityImage(aspectRatio: 1170.0 / 2532, pixels: pixels)
+        XCTAssertFalse(settings.isInformative, "sparse text cannot independently identify the phone")
+        XCTAssertTrue(settings.hasVisibleContent)
+        XCTAssertNil(CaptureIdentityMatcher.match(physical: ["new": settings], sources: ["new": settings]))
+        XCTAssertEqual(
+            CaptureIdentityMatcher.verifiedMappings(
+                physicalIDs: ["se", "new"], physical: ["se": signature()],
+                sources: ["se": settings, "new": signature()], unavailable: ["new"]),
+            ["se": "new", "new": "se"])
+        XCTAssertEqual(
+            CaptureIdentityMatcher.verifiedMappings(
+                physicalIDs: ["se", "new"], physical: [:],
+                sources: ["se": settings, "new": signature()], unavailable: ["se", "new"]), [:])
+    }
+
+    func testEliminationStillRejectsBlankFramesAndIsolatedCaptureNoise() {
+        for value: UInt8 in [0, 110, 245, 255] {
+            var pixels = [UInt8](repeating: value, count: CaptureIdentityImage.width * CaptureIdentityImage.height * 3)
+            for i in 0..<18 { pixels[i] = value > 128 ? 0 : 255 }
+            let blank = CaptureIdentityImage(aspectRatio: 1170.0 / 2532, pixels: pixels)
+            XCTAssertFalse(blank.hasVisibleContent)
+            XCTAssertEqual(
+                CaptureIdentityMatcher.verifiedMappings(
+                    physicalIDs: ["se", "new"], physical: ["se": signature()],
+                    sources: ["se": signature(), "new": blank], unavailable: ["new"]), ["se": "se"])
+        }
+    }
+
+    func testFailedOrContradictoryScreenshotCannotBeInferredByElimination() {
+        for physical in [["se": signature()], ["se": signature(), "new": signature()]] {
+            let mapping = CaptureIdentityMatcher.verifiedMappings(
+                physicalIDs: ["se", "new"], physical: physical,
+                sources: ["se": signature(), "new": signature(inverted: true)], unavailable: [])
+            XCTAssertNil(mapping["new"])
+        }
+    }
+
+    func testAmbiguousSourcesCannotBeResolvedUsingMissingScreenshotService() {
+        XCTAssertEqual(
+            CaptureIdentityMatcher.verifiedMappings(
+                physicalIDs: ["se", "new"], physical: ["se": signature()],
+                sources: ["se": signature(), "new": signature()], unavailable: ["new"]), [:])
+    }
+
+    func testSeveralUnavailablePhonesDoNotBlockTheIndependentlyVerifiedPhone() {
+        let other = CaptureIdentityImage(aspectRatio: 1.1, pixels: signature().pixels)
+        XCTAssertEqual(
+            CaptureIdentityMatcher.verifiedMappings(
+                physicalIDs: ["se", "new1", "new2"], physical: ["se": signature()],
+                sources: ["se": signature(), "new1": signature(inverted: true), "new2": other],
+                unavailable: ["new1", "new2"]), ["se": "se"])
+    }
+
+    func testPartialIdentityStateOnlyPermitsVerifiedScreens() {
+        XCTAssertTrue(ScreenCaptureIdentityState.partiallyVerified.permitsAssociation(identityVerified: true))
+        XCTAssertFalse(ScreenCaptureIdentityState.partiallyVerified.permitsAssociation(identityVerified: false))
+        for state in [ScreenCaptureIdentityState.pending, .failed] {
+            XCTAssertFalse(state.permitsAssociation(identityVerified: true))
+            XCTAssertFalse(state.permitsAssociation(identityVerified: false))
+        }
+    }
 }

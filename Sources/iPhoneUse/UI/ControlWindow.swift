@@ -254,7 +254,7 @@ private final class ControlWindowContent: NSView {
 
     func updateConnectionState(_ status: ControlConnectionStatus) {
         connectionOverlay.update(status)
-        window?.makeFirstResponder(status == .connected ? phoneView : connectionOverlay)
+        window?.makeFirstResponder(status.showsOverlay ? connectionOverlay : phoneView)
     }
 
     func refreshLocalization() {

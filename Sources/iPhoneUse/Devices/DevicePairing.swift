@@ -1,5 +1,20 @@
 import Foundation
 
+/// A connection owned by another saved phone says nothing about this phone's
+/// transport. Unknown hosts can still be candidates after a fresh pairing.
+enum DeviceBluetoothState: String {
+    case connected, unmatched, disconnected
+
+    static func resolve(
+        screenID: String, matchedHost: UUID?, pairings: [String: UUID], connectedHosts: Set<UUID>
+    ) -> Self {
+        if let matchedHost, connectedHosts.contains(matchedHost) { return .connected }
+        if let savedHost = pairings[screenID], connectedHosts.contains(savedHost) { return .unmatched }
+        let knownHosts = Set(pairings.values)
+        return connectedHosts.subtracting(knownHosts).isEmpty ? .disconnected : .unmatched
+    }
+}
+
 /// The existing USB-device-ID to Bluetooth-host JSON format. Synchronization and
 /// calibration migration belong to DeviceRegistry; this type only reads/writes the file.
 struct DevicePairingStore {

@@ -37,6 +37,7 @@ struct StringsUI: LocalizedTable {
     // Sidebar status line (PhoneControlView.swift)
     let statusWaitingDevice: String
     let statusWaitingBluetooth: String
+    let statusVerifyingScreen: String
     let statusConnected: String
     let statusPointerNotReady: String
     let statusCalibrationRequired: String
@@ -94,6 +95,7 @@ struct StringsUI: LocalizedTable {
         helpVolumeDown: "降低 iPhone 音量",
         statusWaitingDevice: "等待 iPhone 连接",
         statusWaitingBluetooth: "等待蓝牙连接",
+        statusVerifyingScreen: "蓝牙已连接，画面身份待确认",
         statusConnected: "已连接",
         statusPointerNotReady: "指针尚未就绪",
         statusCalibrationRequired: "蓝牙已连接，需要指针校准",
@@ -111,8 +113,8 @@ struct StringsUI: LocalizedTable {
         overlayBluetoothMessage: "当前无法操作 iPhone，请先连接蓝牙。",
         overlayConnectingTitle: "蓝牙连接尚未就绪",
         overlayConnectingMessage: "当前无法操作 iPhone，正在等待连接完成。",
-        overlayUnmatchedTitle: "正在匹配蓝牙连接",
-        overlayUnmatchedMessage: "已检测到蓝牙连接，尚未确认哪条连接对应这台 iPhone。请保持手机解锁并开启辅助触控，程序会自动重试。",
+        overlayUnmatchedTitle: "蓝牙连接尚未匹配",
+        overlayUnmatchedMessage: "已检测到候选蓝牙连接，尚未确认与这台 iPhone 的画面对应。请保持手机解锁并开启辅助触控。",
         pairingInstructions: { advertisedName, controllerName in
             let deviceNames =
                 if let controllerName, !controllerName.isEmpty, controllerName != advertisedName {
@@ -160,6 +162,7 @@ struct StringsUI: LocalizedTable {
         helpVolumeDown: "Turn the iPhone volume down",
         statusWaitingDevice: "Waiting for iPhone",
         statusWaitingBluetooth: "Waiting for Bluetooth",
+        statusVerifyingScreen: "Bluetooth connected; verifying screen identity",
         statusConnected: "Connected",
         statusPointerNotReady: "Pointer not ready yet",
         statusCalibrationRequired: "Bluetooth connected; pointer calibration required",
@@ -179,9 +182,9 @@ struct StringsUI: LocalizedTable {
         overlayConnectingTitle: "Bluetooth connection not ready",
         overlayConnectingMessage:
             "The iPhone cannot be controlled yet; waiting for the connection to finish.",
-        overlayUnmatchedTitle: "Matching Bluetooth connection",
+        overlayUnmatchedTitle: "Bluetooth connection not matched",
         overlayUnmatchedMessage:
-            "Bluetooth connections are present but have not been matched to this iPhone. Keep it unlocked with AssistiveTouch enabled; matching retries automatically.",
+            "A candidate Bluetooth connection has not been matched to this iPhone's screen. Keep it unlocked with AssistiveTouch enabled.",
         pairingInstructions: { advertisedName, controllerName in
             let deviceNames =
                 if let controllerName, !controllerName.isEmpty, controllerName != advertisedName {

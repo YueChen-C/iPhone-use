@@ -54,6 +54,20 @@ struct CaptureIdentityImage {
         return luminances.reduce(0) { $0 + abs($1 - mean) } / Double(luminances.count) >= 6
     }
 
+    /// The final source in a proven bijection need not identify a phone on its
+    /// own. Sparse Settings text is usable for elimination, while a blank,
+    /// black, or nearly uniform frame must still wait for visible content.
+    var hasVisibleContent: Bool {
+        guard pixels.count == Self.width * Self.height * 3,
+            aspectRatio.isFinite, aspectRatio > 0
+        else { return false }
+        let luminances = stride(from: 0, to: pixels.count, by: 3).map { offset in
+            (Int(pixels[offset]) + Int(pixels[offset + 1]) + Int(pixels[offset + 2])) / 3
+        }.sorted()
+        let inset = luminances.count / 50
+        return luminances[luminances.count - 1 - inset] - luminances[inset] >= 12
+    }
+
     func distance(to other: Self) -> Double? {
         guard pixels.count == other.pixels.count, !pixels.isEmpty,
             abs(aspectRatio - other.aspectRatio) <= 0.03
@@ -64,6 +78,42 @@ struct CaptureIdentityImage {
 }
 
 enum CaptureIdentityMatcher {
+    /// Keep independently proven screens usable when another phone cannot
+    /// provide screenshots. Only a single explicitly unavailable phone can be
+    /// identified by elimination; failed or ambiguous images are never inferred.
+    static func verifiedMappings(
+        physicalIDs: Set<String>, physical: [String: CaptureIdentityImage],
+        sources: [String: CaptureIdentityImage], unavailable: Set<String>
+    ) -> [String: String] {
+        guard !sources.isEmpty, Set(sources.keys).isSubset(of: physicalIDs),
+            Set(physical.keys).isSubset(of: physicalIDs), unavailable.isSubset(of: physicalIDs),
+            Set(physical.keys).isDisjoint(with: unavailable)
+        else { return [:] }
+        var candidates: [String: String] = [:]
+        for (id, image) in physical where image.isInformative {
+            let scores = sources.compactMap { sourceID, candidate -> (String, Double)? in
+                guard candidate.isInformative else { return nil }
+                return image.distance(to: candidate).map { (sourceID, $0) }
+            }.sorted { $0.1 < $1.1 }
+            guard let best = scores.first, best.1 <= 0.10,
+                scores.count == 1 || scores[1].1 - best.1 >= 0.04
+            else { continue }
+            candidates[id] = best.0
+        }
+        var mapping = candidates.filter { entry in
+            candidates.values.filter { $0 == entry.value }.count == 1
+        }
+        let remainingPhysical = physicalIDs.subtracting(mapping.keys)
+        let remainingSources = Set(sources.keys).subtracting(mapping.values)
+        if !mapping.isEmpty, remainingPhysical.count == 1, remainingSources.count == 1,
+            let id = remainingPhysical.first, unavailable.contains(id),
+            let source = remainingSources.first, sources[source]?.hasVisibleContent == true
+        {
+            mapping[id] = source
+        }
+        return mapping
+    }
+
     /// Return physical USB UID -> capture source UID only if every phone has a
     /// close, clearly distinct match and all winners form a bijection.
     static func match(

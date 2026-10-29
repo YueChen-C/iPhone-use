@@ -126,15 +126,15 @@ final class RelativePointerScreenMatcherTests: XCTestCase {
     func testUnmatchedConnectionIsNeverPresentedAsBluetoothDisconnected() {
         XCTAssertEqual(
             ControlConnectionStatus.resolve(
-                hasScreen: true, hasMatchedHost: false, hasConnectedHosts: true,
-                inputIsCurrent: false, inputIsReady: false), .unmatched)
+                hasScreen: true, hasMatchedHost: false, bluetoothState: .unmatched,
+                inputIsCurrent: false, inputIsReady: false, screenPermitsInput: true), .unmatched)
         XCTAssertEqual(
             ControlConnectionStatus.resolve(
-                hasScreen: true, hasMatchedHost: true, hasConnectedHosts: true,
-                inputIsCurrent: false, inputIsReady: false), .connecting)
+                hasScreen: true, hasMatchedHost: true, bluetoothState: .connected,
+                inputIsCurrent: false, inputIsReady: false, screenPermitsInput: true), .connecting)
         XCTAssertEqual(
             ControlConnectionStatus.resolve(
-                hasScreen: true, hasMatchedHost: false, hasConnectedHosts: false,
-                inputIsCurrent: false, inputIsReady: false), .disconnected)
+                hasScreen: true, hasMatchedHost: false, bluetoothState: .disconnected,
+                inputIsCurrent: false, inputIsReady: false, screenPermitsInput: true), .disconnected)
     }
 }

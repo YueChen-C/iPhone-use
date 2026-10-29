@@ -9,6 +9,25 @@ private func curveStep(_ byte: UInt8) -> Double {
 }
 
 final class DeviceInputPointerTests: XCTestCase {
+    func testCaptureRecheckRetainsBluetoothReadinessButBlocksInputUntilConfirmed() throws {
+        var allowed = true
+        var reports: [(ReportID, [UInt8])] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), inputIsAllowed: { allowed }, sleep: { _ in },
+            reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+        XCTAssertTrue(input.isPointerReady)
+        allowed = false
+        XCTAssertTrue(input.isBluetoothReady)
+        XCTAssertFalse(input.isPointerReady)
+        XCTAssertThrowsError(try input.move(x: 0.5, y: 0.5))
+        try input.key("enter", modifiers: [])
+        XCTAssertTrue(reports.allSatisfy { $0.1.allSatisfy { $0 == 0 } })
+        allowed = true
+        try input.move(x: 0.5, y: 0.5)
+        XCTAssertTrue(input.isPointerReady)
+        XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.count, 1)
+    }
+
     func testUnverifiedCaptureRejectsCoordinatesAndRawMovement() throws {
         var reports: [(ReportID, [UInt8])] = []
         let input = DeviceInput(

@@ -116,7 +116,8 @@ enum ControlAPI {
                 [
                     "physicalID": screen.id,
                     "sourceID": screen.sourceID,
-                    "identityVerified": screen.identityVerified,
+                    "identityVerified": manager.identityVerified(for: screen),
+                    "permitsPointerAssociation": manager.permitsPointerAssociation(for: screen),
                 ]
             },
         ]
@@ -167,7 +168,7 @@ enum ControlAPI {
         // Real input takes priority over background probes and measurement.
         // Cancel before resolving/queuing input, so it cannot wait behind the
         // very measurement that the user is trying to interrupt.
-        DeviceRegistry.shared.cancelBackgroundMotion(for: device.id)
+        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
         let input = try DeviceRegistry.shared.input(for: device)
         if action.requiresPointer, !input.isPointerReady {
             // Keep readiness ahead of parameter parsing. API callers may have no window

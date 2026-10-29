@@ -2,14 +2,17 @@ import AppKit
 import IOBluetooth
 
 enum ControlConnectionStatus {
-    case waitingForDevice, disconnected, unmatched, connecting, connected
+    case waitingForDevice, disconnected, unmatched, connecting, verifyingScreen, connected
+
+    var showsOverlay: Bool { self != .connected && self != .verifyingScreen }
 
     static func resolve(
-        hasScreen: Bool, hasMatchedHost: Bool, hasConnectedHosts: Bool,
-        inputIsCurrent: Bool, inputIsReady: Bool
+        hasScreen: Bool, hasMatchedHost: Bool, bluetoothState: DeviceBluetoothState,
+        inputIsCurrent: Bool, inputIsReady: Bool, screenPermitsInput: Bool
     ) -> Self {
         guard hasScreen else { return .waitingForDevice }
-        if !hasMatchedHost && hasConnectedHosts { return .unmatched }
+        if !hasMatchedHost { return bluetoothState == .unmatched ? .unmatched : .disconnected }
+        if !screenPermitsInput { return .verifyingScreen }
         if inputIsCurrent { return inputIsReady ? .connected : .connecting }
         return hasMatchedHost ? .connecting : .disconnected
     }
@@ -130,7 +133,7 @@ final class ControlConnectionOverlay: NSView {
     func update(_ status: ControlConnectionStatus) {
         lastStatus = status
         if status == .connected { hasConnected = true }
-        isHidden = status == .connected
+        isHidden = !status.showsOverlay
         let table = StringsUI.current
         instructionsField?.isHidden = status == .unmatched
         helpField?.isHidden = status == .unmatched
@@ -148,7 +151,7 @@ final class ControlConnectionOverlay: NSView {
         case .unmatched:
             title.stringValue = table.overlayUnmatchedTitle
             message.stringValue = table.overlayUnmatchedMessage
-        case .connected:
+        case .verifyingScreen, .connected:
             break
         }
     }

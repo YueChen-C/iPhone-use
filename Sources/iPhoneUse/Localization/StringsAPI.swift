@@ -28,6 +28,7 @@ struct StringsAPI: LocalizedTable {
     let multiplePhones: (Int, String) -> String
     let noBluetoothConnection: (String, String) -> String
     let ambiguousBluetooth: (String) -> String
+    let screenIdentityUnverified: (String) -> String
     let describeEmpty: String
     let describePrefix: String
 
@@ -69,6 +70,7 @@ struct StringsAPI: LocalizedTable {
             "\(name) 没有蓝牙连接：请开启辅助触控，然后在「设置 > 辅助功能 > 触控 > 辅助触控 > 设备 > 蓝牙设备」中配对 \"\(peripheral)\""
         },
         ambiguousBluetooth: { "无法确定哪条蓝牙连接对应 \($0)：请解锁手机、确认辅助触控已开启，然后 POST /match" },
+        screenIdentityUnverified: { "\($0) 的蓝牙已连接，画面身份尚未确认：请等待画面校验完成后重试" },
         describeEmpty: "当前没有连接手机。",
         describePrefix: "手机：",
         untypeable: { "美式键盘无法输入字符 \($0)" },
@@ -105,6 +107,9 @@ struct StringsAPI: LocalizedTable {
         },
         ambiguousBluetooth: {
             "could not tell which Bluetooth connection is \($0): unlock it, check AssistiveTouch is on, then POST /match"
+        },
+        screenIdentityUnverified: {
+            "Bluetooth is connected for \($0), but its screen identity is unconfirmed; retry after verification"
         },
         describeEmpty: "No phones are plugged in.",
         describePrefix: "Phones: ",

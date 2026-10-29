@@ -17,11 +17,14 @@ final class ScreenCaptureManager {
     /// source UID separately from the verified physical screen identity.
     private var sources: [String: ScreenCaptureSource] = [:]
     private var screens: [String: ScreenCaptureSession] = [:]
+    private var verifiedScreenIDs: Set<String> = []
     private var refreshTimer: Timer?
     private var loggedNoScreens = false
     private let identityQueue = DispatchQueue(label: "iphone-use.capture-identity", qos: .utility)
     private var identityGeneration: UInt64 = 0
     private var verificationState: ScreenCaptureIdentityState = .singleDevice
+    private var associationIdentities = CaptureAssociationIdentity()
+    private var sourceRecovery = CaptureSourceRecovery()
 
     /// Called when a phone's screen appears or goes away.
     var onScreensChanged: (() -> Void)?
@@ -69,9 +72,30 @@ final class ScreenCaptureManager {
     var identityState: ScreenCaptureIdentityState { lock.withLock { verificationState } }
 
     var permitsPointerAssociation: Bool {
+        lock.withLock { verificationState.permitsAssociation(identityVerified: true) }
+    }
+
+    func permitsPointerAssociation(for screen: ScreenCaptureSession) -> Bool {
         lock.withLock {
-            verificationState == .singleDevice || verificationState == .verified
-                || verificationState == .unavailable
+            screens[screen.id] === screen
+                && verificationState.permitsAssociation(identityVerified: verifiedScreenIDs.contains(screen.id))
+        }
+    }
+
+    func isCurrent(_ screen: ScreenCaptureSession) -> Bool {
+        lock.withLock { screens[screen.id] === screen }
+    }
+
+    func identityVerified(for screen: ScreenCaptureSession) -> Bool {
+        lock.withLock { screens[screen.id] === screen && verifiedScreenIDs.contains(screen.id) }
+    }
+
+    var associationScreens: [ScreenCaptureSession] {
+        lock.withLock {
+            screens.values.filter {
+                verificationState.permitsAssociation(identityVerified: verifiedScreenIDs.contains($0.id))
+            }
+            .sorted { $0.name < $1.name }
         }
     }
 
@@ -81,6 +105,7 @@ final class ScreenCaptureManager {
         let job: (UInt64, [String: ScreenCaptureSource])? = lock.withLock {
             guard sources.count > 1,
                 verificationState == .failed || verificationState == .unavailable
+                    || verificationState == .partiallyVerified
             else { return nil }
             identityGeneration &+= 1
             verificationState = .pending
@@ -115,6 +140,8 @@ final class ScreenCaptureManager {
                 }
             }
             if changed {
+                associationIdentities.retain(physicalIDs: Set(sources.keys))
+                sourceRecovery.retain(sources: Set(sources.values.map(\.instanceID)))
                 identityGeneration &+= 1
                 if present.count > 1 {
                     // A failed capture must not turn two discovered phones into
@@ -123,7 +150,7 @@ final class ScreenCaptureManager {
                 } else {
                     verificationState = .singleDevice
                 }
-                rebuildScreens(mapping: sources.mapValues(\.id), verified: false)
+                rebuildScreens(mapping: [:], verified: false)
                 if verificationState == .pending { job = (identityGeneration, sources) }
             }
             if sources.isEmpty {
@@ -140,19 +167,37 @@ final class ScreenCaptureManager {
         if let job { scheduleIdentityVerification(generation: job.0, sources: job.1) }
     }
 
-    /// Called under lock. New wrappers also invalidate Registry associations that
-    /// were proved against an earlier capture-to-physical mapping.
+    /// Called under lock. Retain surviving preview objects and Bluetooth proofs
+    /// while input remains blocked by the separate capture verification state.
     private func rebuildScreens(mapping: [String: String], verified: Bool) {
-        screens = mapping.reduce(into: [:]) { result, entry in
+        let displayMapping = CaptureScreenMapping.previews(
+            confirmed: mapping,
+            previous: screens.mapValues { .init(id: $0.sourceID, instance: $0.sourceInstanceID) },
+            sources: sources.mapValues(\.instanceID))
+        verifiedScreenIDs = verified ? Set(mapping.keys) : []
+        screens = displayMapping.reduce(into: [:]) { result, entry in
             guard let physical = sources[entry.key], let source = sources[entry.value] else { return }
+            let identity = associationIdentities.identity(
+                physicalID: entry.key,
+                isConfirmed: (verified && mapping[entry.key] != nil) || verificationState == .singleDevice)
+            if let previous = screens[entry.key], previous.sourceInstanceID == source.instanceID,
+                previous.associationIdentity == identity
+            {
+                result[entry.key] = previous
+                return
+            }
             result[entry.key] = ScreenCaptureSession(
-                id: entry.key, name: physical.name, source: source, identityVerified: verified)
+                id: entry.key, name: physical.name, source: source,
+                associationIdentity: identity)
         }
     }
 
-    private func scheduleIdentityVerification(generation: UInt64, sources: [String: ScreenCaptureSource]) {
+    private func scheduleIdentityVerification(
+        generation: UInt64, sources: [String: ScreenCaptureSource], retryOnFailure: Bool = true,
+        delay: TimeInterval = 0.5
+    ) {
         // Wait for newly started streams to deliver their first complete frames.
-        identityQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+        identityQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             let isCurrent = { self.lock.withLock { self.identityGeneration == generation } }
             guard isCurrent() else { return }
@@ -160,6 +205,8 @@ final class ScreenCaptureManager {
                 physicalIDs: sources.keys.sorted(),
                 sourceImages: { sources.compactMapValues { $0.identityImage() } },
                 isCurrent: isCurrent)
+            var shouldRetry = false
+            var shouldRecover = false
             let applied = self.lock.withLock { () -> Bool in
                 guard self.identityGeneration == generation else { return false }
                 switch result {
@@ -167,17 +214,52 @@ final class ScreenCaptureManager {
                     self.rebuildScreens(mapping: mapping, verified: true)
                     self.verificationState = .verified
                     log("capture identity verified: \(mapping)")
+                case .partiallyVerified(let mapping):
+                    self.rebuildScreens(mapping: mapping, verified: true)
+                    self.verificationState = .partiallyVerified
+                    log("capture identity partially verified: \(mapping)")
+                    shouldRecover = true
                 case .unavailable:
-                    self.rebuildScreens(mapping: sources.mapValues(\.id), verified: false)
+                    // Without an independent check, pointer discovery must
+                    // prove this mapping again before reusing Bluetooth input.
+                    self.associationIdentities = CaptureAssociationIdentity()
+                    self.rebuildScreens(mapping: [:], verified: false)
                     self.verificationState = .unavailable
                     log("capture identity unverified: independent USB screenshot tool unavailable")
                 case .failed:
                     self.verificationState = .failed
+                    shouldRetry = retryOnFailure
+                    shouldRecover = !retryOnFailure
                     log("capture identity verification failed: no unique complete USB-to-video mapping")
+                }
+                if shouldRecover {
+                    let empty = sources.values.filter { $0.frame() == nil }
+                    let selected = self.sourceRecovery.take(empty: Set(empty.map(\.instanceID)))
+                    shouldRecover = !selected.isEmpty
+                    if shouldRecover {
+                        // Starting/stopping one muxed stream can reroute another
+                        // stream's pixels. Keep Bluetooth proofs, but recheck
+                        // the complete video mapping before accepting input.
+                        self.verificationState = .pending
+                        for source in empty where selected.contains(source.instanceID) {
+                            log("restarting empty capture source: \(source.name) (\(source.id))")
+                            source.restart()
+                        }
+                    }
                 }
                 return true
             }
             if applied { self.onScreensChanged?() }
+            if applied, shouldRecover {
+                self.scheduleIdentityVerification(
+                    generation: generation, sources: sources, retryOnFailure: false, delay: 1.5)
+            } else if applied, shouldRetry {
+                // Capture and screenshotr can race during USB/service startup.
+                // One delayed retry gives them time to settle without polling
+                // indefinitely or ever moving a pointer for identity checks.
+                self.scheduleIdentityVerification(
+                    generation: generation, sources: sources, retryOnFailure: false, delay: 3)
+            }
         }
     }
 }
@@ -187,17 +269,20 @@ final class ScreenCaptureManager {
 final class ScreenCaptureSession {
     let id: String
     let name: String
-    let identityVerified: Bool
+    let associationIdentity: UUID
     private let source: ScreenCaptureSource
 
     var sourceID: String { source.id }
+    var sourceInstanceID: UUID { source.instanceID }
     var size: CGSize? { source.size }
 
-    fileprivate init(id: String, name: String, source: ScreenCaptureSource, identityVerified: Bool) {
+    fileprivate init(
+        id: String, name: String, source: ScreenCaptureSource, associationIdentity: UUID
+    ) {
         self.id = id
         self.name = name
         self.source = source
-        self.identityVerified = identityVerified
+        self.associationIdentity = associationIdentity
     }
 
     func frame() -> CVPixelBuffer? { source.frame() }
@@ -217,6 +302,7 @@ private final class ScreenCaptureSource: NSObject, AVCaptureVideoDataOutputSampl
     /// The nominal capture device UID, independent of the pixels' physical phone.
     let id: String
     let name: String
+    let instanceID = UUID()
     let device: AVCaptureDevice
 
     private let session = AVCaptureSession()
@@ -249,6 +335,11 @@ private final class ScreenCaptureSource: NSObject, AVCaptureVideoDataOutputSampl
 
     func stop() {
         session.stopRunning()
+    }
+
+    func restart() {
+        session.stopRunning()
+        session.startRunning()
     }
 
     var size: CGSize? {
