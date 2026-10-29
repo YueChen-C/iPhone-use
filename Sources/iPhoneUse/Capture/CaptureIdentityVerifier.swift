@@ -1,15 +1,13 @@
-import Darwin
 import Foundation
-import ImageIO
 
 enum ScreenCaptureIdentityState: String {
     case singleDevice
     case pending
     case verified
     case partiallyVerified
-    /// The optional independent USB screenshot utility is not installed.
+    /// The system device framework or the phones' screenshot services are unavailable.
     case unavailable
-    /// A utility was available, but the images did not prove a complete mapping.
+    /// Independent screenshots did not prove a reliable mapping.
     case failed
 
     func permitsAssociation(identityVerified: Bool) -> Bool {
@@ -103,87 +101,9 @@ enum CaptureIdentityVerifier {
         physicalIDs: [String], sourceImages: () -> [String: CaptureIdentityImage],
         isCurrent: () -> Bool
     ) -> Result {
-        guard let tool = screenshotTool() else { return .unavailable }
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("iphone-use-capture-identity-\(UUID().uuidString)")
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-        } catch { return .failed }
-        defer { try? FileManager.default.removeItem(at: directory) }
-
         return verify(
             physicalIDs: physicalIDs, sourceImages: sourceImages, isCurrent: isCurrent,
             waitForRetry: { Thread.sleep(forTimeInterval: 0.5) },
-            screenshot: { id in
-                let path = directory.appendingPathComponent("\(UUID().uuidString).png")
-                let diagnostic = directory.appendingPathComponent("\(UUID().uuidString).txt")
-                let success = run(tool, arguments: ["-u", id, path.path], timeout: 8, diagnostic: diagnostic)
-                if !success {
-                    let message = (try? String(contentsOf: diagnostic, encoding: .utf8)) ?? ""
-                    if message.contains("Could not start screenshotr service: Invalid service") {
-                        log("capture identity screenshot unavailable for \(id): screenshotr service unavailable")
-                        return .unavailable
-                    }
-                    log("capture identity screenshot failed for \(id)")
-                    return .failed
-                }
-                guard let source = CGImageSourceCreateWithURL(path as CFURL, nil),
-                    let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
-                    let signature = CaptureIdentityImage(image: image)
-                else { return .failed }
-                return .image(signature)
-            })
-    }
-
-    private static func screenshotTool() -> String? {
-        var paths = [
-            "/opt/homebrew/bin/idevicescreenshot",
-            "/opt/homebrew/opt/libimobiledevice/bin/idevicescreenshot",
-            "/usr/local/bin/idevicescreenshot",
-            "/usr/local/opt/libimobiledevice/bin/idevicescreenshot",
-        ]
-        // A stale /usr/local symlink can coexist with a working Homebrew Cellar
-        // installation. Check executable health before selecting a candidate.
-        for root in ["/opt/homebrew/Cellar/libimobiledevice", "/usr/local/Cellar/libimobiledevice"] {
-            if let versions = try? FileManager.default.contentsOfDirectory(atPath: root) {
-                paths += versions.sorted().reversed().map { "\(root)/\($0)/bin/idevicescreenshot" }
-            }
-        }
-        var tried: Set<String> = []
-        return paths.first {
-            tried.insert($0).inserted && FileManager.default.isExecutableFile(atPath: $0)
-                && run($0, arguments: ["--version"], timeout: 2)
-        }
-    }
-
-    private static func run(
-        _ path: String, arguments: [String], timeout: TimeInterval, diagnostic: URL? = nil
-    ) -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = arguments
-        process.standardInput = FileHandle.nullDevice
-        var output: FileHandle?
-        if let diagnostic {
-            guard FileManager.default.createFile(atPath: diagnostic.path, contents: nil) else { return false }
-            output = try? FileHandle(forWritingTo: diagnostic)
-        }
-        defer { try? output?.close() }
-        process.standardOutput = output ?? FileHandle.nullDevice
-        process.standardError = output ?? FileHandle.nullDevice
-        let finished = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in finished.signal() }
-        do { try process.run() } catch { return false }
-        guard finished.wait(timeout: .now() + timeout) == .success else {
-            // Only this invocation's child is terminated. Never reset the USB,
-            // camera assistant, or another application's capture process.
-            if process.isRunning { process.terminate() }
-            if finished.wait(timeout: .now() + 1) == .timedOut {
-                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-                _ = finished.wait(timeout: .now() + 1)
-            }
-            return false
-        }
-        return process.terminationStatus == 0
+            screenshot: { USBIdentityScreenshot.capture(physicalID: $0) })
     }
 }

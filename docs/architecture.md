@@ -9,7 +9,7 @@
 | 根目录、`App/` | `main.swift` 选择启动模式；`Application.swift` 持有应用级对象，协调启动顺序、设备窗口与应用菜单 |
 | `UI/` | `ControlWindow.swift` 管理多设备窗口生命周期与单窗布局；`PhoneControlView.swift` 按固定设备 ID 协调画面、设备与交互；`ControlInput.swift` 集中坐标/鼠标/键盘转换；侧栏和连接蒙层分别维护 |
 | `Devices/` | `DeviceRegistry.swift` 管理设备模型、配对与会话输入缓存；`DevicePairing.swift` 集中配对文件和探测评分 |
-| `Capture/` | `ScreenCapture.swift` 包含 `ScreenCaptureManager`（设备发现）与 `ScreenCaptureSession`（单设备帧采集） |
+| `Capture/` | `ScreenCapture.swift` 管理设备发现和帧采集；`CaptureIdentityVerifier.swift` 比较物理 USB 身份与视频源；`USBIdentityScreenshot.swift` 在隔离工作进程中调用系统 MobileDevice 服务，无外部截图命令依赖 |
 | `Bluetooth/` | `HIDPeripheral.swift` 管理 GATT；`HIDConnectionState.swift` 管理连接和背压；`HIDReports.swift` 定义描述符与报告字节 |
 | `Input/` | `DeviceInput.swift` 管理每台手机的输入队列；`KeyboardMap.swift` 定义键盘映射；`RelativePointerCalibration.swift` 定义模型和位移算法，`+Storage.swift` 处理文件兼容与迁移 |
 | `API/` | `HTTPServer.swift` 包含传输及请求/响应编解码；`ControlAPI.swift` 包含路由与坐标换算；`WebPreview.swift` 提供 `/viewer` 只读实时预览页，供 Codex 右侧浏览器显示 |

@@ -225,7 +225,7 @@ final class ScreenCaptureManager {
                     self.associationIdentities = CaptureAssociationIdentity()
                     self.rebuildScreens(mapping: [:], verified: false)
                     self.verificationState = .unavailable
-                    log("capture identity unverified: independent USB screenshot tool unavailable")
+                    log("capture identity unverified: native USB screenshot service unavailable")
                 case .failed:
                     self.verificationState = .failed
                     shouldRetry = retryOnFailure

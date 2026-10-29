@@ -75,7 +75,9 @@ python3 scripts/calibrate-pointer.py --auto --device '<完整设备ID>'
 
 ## 捕获画面身份
 
-多台手机的 AVFoundation 名义 UID 不保证始终对应其实际像素来源。主程序在本机有可用的可选工具 `idevicescreenshot` 时，按 USB ID 独立截图，再与捕获画面匹配；最多比较三轮，要求两轮得到一致且唯一的对应关系后才应用已经确认的映射。该过程不发送手机输入，也不改曲线，在捕获拓扑变化或显式 `/match` 重试时运行；部分校验、校验失败或截图服务不可用时，新增 BLE 会话也触发一次重试。同一会话的多个订阅回调合并处理，不在视频帧处理或状态轮询中重复执行。
+多台手机的 AVFoundation 名义 UID 不保证始终对应其实际像素来源。主程序通过 macOS 自带的 `MobileDevice.framework` 枚举 USB 设备，严格按 USB UDID 选择目标，在已信任的连接上访问 `com.apple.mobile.screenshotr` 服务，独立截图并与捕获画面匹配。无需安装 `libimobiledevice`、`idevicescreenshot` 或 Homebrew，应用也不打包这些依赖。最多比较三轮，要求两轮得到一致且唯一的对应关系后才应用已经确认的映射。该过程不发送手机输入，也不改曲线，在捕获拓扑变化或显式 `/match` 重试时运行；部分校验、校验失败或截图服务不可用时，新增 BLE 会话也触发一次重试。同一会话的多个订阅回调合并处理，不在视频帧处理或状态轮询中重复执行。
+
+系统设备接口不是公开稳定的 API，通过运行时加载框架和所需符号检测能力；框架或符号缺失时报告 `unavailable`。调用在同一可执行文件的隔离工作进程中完成，不启动窗口、蓝牙或 HTTP 服务，截图超时设为 8 秒，随后仅结束自己的工作进程并删除临时截图。设备缺失、未信任、锁屏或传输失败属于校验失败，不等同于缺少截图服务；程序不会自动配对、挂载开发镜像或改用其他手机。部分 iOS 版本不提供该服务，仍按以下能力限制处理。
 
 `GET /status`、`GET /devices` 和 `POST /match` 返回的 `capture` 包含 `identityState`、`permitsPointerAssociation` 和 `screens`。每个 `screens` 项的 `physicalID` 是对外使用的 USB 身份，`sourceID` 是提供像素的 AVFoundation 名义 UID，`identityVerified` 表示当前映射是否已确认；两者可以不同。
 
@@ -87,8 +89,8 @@ python3 scripts/calibrate-pointer.py --auto --device '<完整设备ID>'
 | `pending` | 多源身份验证进行中，暂停匹配与输入。 |
 | `verified` | 两轮独立截图确认唯一完整映射，可继续指针关联。 |
 | `partiallyVerified` | 仅部分手机的画面已确认，只放行这些手机的关联与输入。 |
-| `failed` | 工具可用，但无法证明任何可靠映射；阻断匹配与输入，保留已有曲线。画面稳定、可区分后可显式调用 `/match` 重试。 |
-| `unavailable` | 本机没有可用的可选截图工具，或所有手机均缺少截图服务。名义映射仍未独立验证；允许按受限回退流程继续运动匹配，不代表物理 USB 身份已确认。 |
+| `failed` | 独立截图或图像比较失败，无法证明任何可靠映射；阻断匹配与输入，保留已有曲线。画面稳定、可区分后可显式调用 `/match` 重试。 |
+| `unavailable` | 系统设备框架或所需符号不可用，或所有手机均缺少截图服务。名义映射仍未独立验证；允许按受限回退流程继续运动匹配，不代表物理 USB 身份已确认。 |
 
 运动匹配只能证明哪个蓝牙 host 驱动当前画面；`unavailable` 时不能把它当作 USB 像素来源的独立证明。已有曲线应保留，不能靠重测或交换参数掩盖身份疑点。
 
