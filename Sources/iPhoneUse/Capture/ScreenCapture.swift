@@ -292,6 +292,80 @@ final class ScreenCaptureSession {
     }
 
     func thumbnail(width: Int, height: Int) -> [UInt8]? { source.thumbnail(width: width, height: height) }
+
+    /// Wait for an atomically identified USB frame received after the input
+    /// deadline. Call from the phone's input queue, never the capture callback.
+    func pointerFrame(
+        after sequence: UInt64?, notBefore: TimeInterval, timeout: TimeInterval = 2
+    ) throws -> VisualPointerFrame {
+        try source.pointerFrame(after: sequence, notBefore: notBefore, timeout: timeout)
+    }
+}
+
+/// Keeps frame pixels and their freshness metadata under the same lock. Waiting
+/// releases this lock so the capture callback can publish and wake consumers.
+final class ScreenCaptureFrameStore {
+    struct Snapshot {
+        let buffer: CVPixelBuffer
+        let sequence: UInt64
+        let receivedAt: TimeInterval
+    }
+
+    private let condition = NSCondition()
+    private var latest: Snapshot?
+    private var sequence: UInt64 = 0
+    private var stopped = false
+
+    func publish(_ buffer: CVPixelBuffer, receivedAt: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !stopped, receivedAt.isFinite, receivedAt >= 0, sequence < .max else { return }
+        sequence += 1
+        latest = Snapshot(buffer: buffer, sequence: sequence, receivedAt: receivedAt)
+        condition.broadcast()
+    }
+
+    func snapshot() -> Snapshot? {
+        condition.lock()
+        defer { condition.unlock() }
+        return latest
+    }
+
+    func wait(after sequence: UInt64?, notBefore: TimeInterval, timeout: TimeInterval) throws -> Snapshot {
+        guard notBefore.isFinite, notBefore >= 0, timeout.isFinite, timeout >= 0 else {
+            throw DeviceError("invalid fresh pointer frame deadline")
+        }
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        guard deadline.isFinite else { throw DeviceError("invalid fresh pointer frame timeout") }
+        condition.lock()
+        defer { condition.unlock() }
+        while true {
+            guard !stopped else { throw DeviceError("USB capture stopped while waiting for a pointer frame") }
+            if let latest, sequence.map({ latest.sequence > $0 }) ?? true, latest.receivedAt >= notBefore {
+                return latest
+            }
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else { throw DeviceError("timed out waiting for a fresh USB pointer frame") }
+            // A notification may be spurious or contain an older frame. Recheck
+            // both predicates against the original monotonic deadline.
+            guard condition.wait(until: Date(timeIntervalSinceNow: remaining)) else {
+                throw DeviceError("timed out waiting for a fresh USB pointer frame")
+            }
+        }
+    }
+
+    func stop() {
+        condition.lock()
+        stopped = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func resume() {
+        condition.lock()
+        stopped = false
+        condition.unlock()
+    }
 }
 
 /// A nominal AVFoundation acquisition source. Its UID is never rewritten by
@@ -307,8 +381,8 @@ private final class ScreenCaptureSource: NSObject, AVCaptureVideoDataOutputSampl
 
     private let session = AVCaptureSession()
     private let queue: DispatchQueue
-    /// Read and written only on queue; callers retain a snapshot before rendering.
-    private var latest: CVPixelBuffer?
+    private let queueKey = DispatchSpecificKey<Bool>()
+    private let frames = ScreenCaptureFrameStore()
 
     init(device: AVCaptureDevice) throws {
         self.device = device
@@ -316,6 +390,7 @@ private final class ScreenCaptureSource: NSObject, AVCaptureVideoDataOutputSampl
         name = device.localizedName
         queue = DispatchQueue(label: "iphone-use.capture.\(device.uniqueID)")
         super.init()
+        queue.setSpecific(key: queueKey, value: true)
 
         try configureSession()
         session.startRunning()
@@ -334,11 +409,14 @@ private final class ScreenCaptureSource: NSObject, AVCaptureVideoDataOutputSampl
     }
 
     func stop() {
+        frames.stop()
         session.stopRunning()
     }
 
     func restart() {
+        frames.stop()
         session.stopRunning()
+        frames.resume()
         session.startRunning()
     }
 
@@ -347,7 +425,24 @@ private final class ScreenCaptureSource: NSObject, AVCaptureVideoDataOutputSampl
     }
 
     func frame() -> CVPixelBuffer? {
-        queue.sync { latest }
+        frames.snapshot()?.buffer
+    }
+
+    func pointerFrame(
+        after sequence: UInt64?, notBefore: TimeInterval, timeout: TimeInterval
+    ) throws -> VisualPointerFrame {
+        guard DispatchQueue.getSpecific(key: queueKey) != true else {
+            throw DeviceError("cannot wait for a pointer frame on the USB capture queue")
+        }
+        let snapshot = try frames.wait(after: sequence, notBefore: notBefore, timeout: timeout)
+        let width = CVPixelBufferGetWidth(snapshot.buffer)
+        let height = CVPixelBufferGetHeight(snapshot.buffer)
+        guard (1...4096).contains(width), (1...4096).contains(height),
+            let pixels = Self.grayscale(snapshot.buffer, width: width, height: height)
+        else { throw DeviceError("cannot convert a full-size USB pointer frame") }
+        return VisualPointerFrame(
+            frame: PointerMotionObservation.Frame(width: width, height: height, pixels: pixels),
+            sequence: snapshot.sequence, receivedAt: snapshot.receivedAt)
     }
 
     func identityImage() -> CaptureIdentityImage? {
@@ -378,6 +473,13 @@ private final class ScreenCaptureSource: NSObject, AVCaptureVideoDataOutputSampl
     /// Grayscale pixels of the latest frame at a small size, first row at the top.
     func thumbnail(width: Int, height: Int) -> [UInt8]? {
         guard let buffer = frame() else { return nil }
+        return Self.grayscale(buffer, width: width, height: height)
+    }
+
+    /// Render outside the frame-state lock. Retaining the snapshot keeps this
+    /// buffer alive even when capture publishes the next one during conversion.
+    private static func grayscale(_ buffer: CVPixelBuffer, width: Int, height: Int) -> [UInt8]? {
+        guard width > 0, height > 0, !width.multipliedReportingOverflow(by: height).overflow else { return nil }
         let image = CIImage(cvPixelBuffer: buffer)
         let small = image.transformed(
             by: CGAffineTransform(
@@ -399,7 +501,8 @@ private final class ScreenCaptureSource: NSObject, AVCaptureVideoDataOutputSampl
     func captureOutput(
         _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection
     ) {
-        latest = CMSampleBufferGetImageBuffer(sampleBuffer)
+        guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        frames.publish(buffer)
     }
 
     struct CaptureError: Error, CustomStringConvertible {
