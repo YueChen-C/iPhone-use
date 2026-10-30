@@ -43,6 +43,7 @@ else
   lipo -create "${binary_paths[@]}" -output "$APP/Contents/MacOS/iphone-use"
 fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+cp Sources/iPhoneUse/Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 if [[ -n "${APP_VERSION:-}" ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APP/Contents/Info.plist"

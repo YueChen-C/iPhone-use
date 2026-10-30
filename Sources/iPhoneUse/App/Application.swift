@@ -129,6 +129,13 @@ enum Application {
 
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
+        // A packaged app uses its bundle icon; SwiftPM runs use the copied resource.
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns")
+            ?? Bundle.module.url(forResource: "AppIcon", withExtension: "icns"),
+            let icon = NSImage(contentsOf: iconURL)
+        {
+            app.applicationIconImage = icon
+        }
         let appDelegate = AppDelegate()
         app.delegate = appDelegate
 
