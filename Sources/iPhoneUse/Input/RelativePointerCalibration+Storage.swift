@@ -90,6 +90,14 @@ extension RelativePointerCalibration {
         try data.write(to: url, options: .atomic)
     }
 
+    /// Only a new absolute landing proof may undo an earlier failed probe.
+    /// Measured or damaged profile files remain intact and keep their own gate.
+    static func clearRequirementAfterAbsoluteProof(screenID: String, directory: URL? = nil) throws {
+        guard !screenID.isEmpty else { throw DeviceError("missing calibration screen identity") }
+        let url = requirementURL(screenID: screenID, directory: directory ?? directoryURL)
+        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+    }
+
     static func load(host: UUID, screenSize: CGSize?, screenID: String? = nil) -> Self? {
         load(host: host, screenSize: screenSize, screenID: screenID, directory: directoryURL)
     }

@@ -7,9 +7,12 @@ struct Device {
     let bluetoothState: DeviceBluetoothState
 
     var id: String { screen.id }
+    var lockState: DeviceLockState { DeviceLockMonitor.shared.state(for: screen) }
 
     var json: [String: Any] {
-        var info: [String: Any] = ["id": id, "name": screen.name, "bluetooth": host != nil]
+        var info: [String: Any] = [
+            "id": id, "name": screen.name, "bluetooth": host != nil, "lockState": lockState.rawValue,
+        ]
         info["bluetoothState"] = bluetoothState.rawValue
         if let size = screen.size {
             info["width"] = Int(size.width)
@@ -84,6 +87,7 @@ final class DeviceRegistry {
         load()
         ScreenCaptureManager.shared.onScreensChanged = { [weak self] in self?.scheduleMatch() }
         HIDPeripheral.shared.onHostsChanged = { [weak self] in self?.scheduleMatch() }
+        DeviceLockMonitor.shared.start()
     }
 
     func all() -> [Device] {
@@ -808,7 +812,7 @@ final class DeviceRegistry {
                     return ScreenCaptureManager.shared.permitsPointerAssociation(for: screen)
                 })
         guard input.host == host, input.session == expectedSession else { return .unavailable }
-        let evidence = motionEvidence(input, verifyAbsolute: !required)
+        let evidence = motionEvidence(input, verifyAbsolute: selectedCalibration == nil)
         let result = evidence.results[ObjectIdentifier(screen)] ?? .unavailable
         guard result == .hit else { return result }
         return finishProbe(input, on: screen, evidence: evidence) ? .hit : .unavailable
@@ -836,7 +840,7 @@ final class DeviceRegistry {
                         && captureSnapshot.allSatisfy { manager.permitsPointerAssociation(for: $0) }
                 })
         }
-        let evidence = motionEvidence(input, verifyAbsolute: input.calibration == nil && !input.needsCalibration)
+        let evidence = motionEvidence(input, verifyAbsolute: input.calibration == nil)
         let hits = screens.filter { evidence.results[ObjectIdentifier($0)] == .hit }
         guard hits.count == 1, let screen = hits.first,
             finishProbe(input, on: screen, evidence: evidence)
@@ -874,7 +878,9 @@ final class DeviceRegistry {
                     calibration: nil,
                     firstPoint: CGPoint(x: PointerScreenMatcher.firstPoint.x, y: PointerScreenMatcher.firstPoint.y),
                     secondPoint: CGPoint(x: PointerScreenMatcher.secondPoint.x, y: PointerScreenMatcher.secondPoint.y),
-                    returnToStart: true, isReady: { isReady(.absolutePointer) },
+                    returnToStart: true,
+                    thirdPoint: CGPoint(x: PointerScreenMatcher.thirdPoint.x, y: PointerScreenMatcher.thirdPoint.y),
+                    isReady: { isReady(.absolutePointer) },
                     capture: {
                         let frames = screens.map {
                             $0.thumbnail(width: PointerScreenMatcher.width, height: PointerScreenMatcher.height)
@@ -883,14 +889,15 @@ final class DeviceRegistry {
                         return frames.flatMap { $0! }
                     })
                 let pixels = PointerScreenMatcher.width * PointerScreenMatcher.height
-                if let returned = captures.returned {
+                if let intermediate = captures.intermediate, let returned = captures.returned {
                     for (i, screen) in screens.enumerated() {
                         let range = (i * pixels)..<((i + 1) * pixels)
-                        let frames = [captures.before, captures.after, returned].map { Array($0[range]) }
+                        let frames = [captures.before, captures.after, intermediate, returned].map { Array($0[range]) }
                         let key = ObjectIdentifier(screen)
                         evidence.scores[key] = PointerScreenMatcher.score(before: frames[0], after: frames[1])
                         if PointerScreenMatcher.matchesAbsoluteRoundTrip(frames) {
                             evidence.absoluteScreens.insert(key)
+                            log("absolute pointer targets verified on \(screen.name) for \(host)")
                         }
                     }
                 }
@@ -951,9 +958,26 @@ final class DeviceRegistry {
             || RelativePointerCalibration.load(host: input.host, screenSize: nil) != nil
             || RelativePointerCalibration.loadMatchingScreen(host: input.host, screenSize: nil, screenID: screen.id)
                 != nil
+        let absoluteVerified = evidence.absoluteScreens.contains(key)
+        if !hasProfile, absoluteVerified {
+            do {
+                try RelativePointerCalibration.clearRequirementAfterAbsoluteProof(screenID: screen.id)
+                if input.needsCalibration {
+                    let beforeRetirement = input.inputActivitySequence
+                    try input.retireForCalibrationReload()
+                    guard input.inputActivitySequence == beforeRetirement &+ 1 else { return false }
+                    probeActivities?[ObjectIdentifier(input)] = (input, input.inputActivitySequence)
+                }
+                probeEvidence[input.host]?.preparedScreens.insert(key)
+                return true
+            } catch {
+                log("absolute pointer mode recovery unavailable: \(error)")
+                return false
+            }
+        }
         guard
             DevicePairingRecovery.shouldRequireCalibration(
-                hasProfile: hasProfile, absoluteVerified: evidence.absoluteScreens.contains(key))
+                hasProfile: hasProfile, absoluteVerified: absoluteVerified)
         else {
             probeEvidence[input.host]?.preparedScreens.insert(key)
             return true

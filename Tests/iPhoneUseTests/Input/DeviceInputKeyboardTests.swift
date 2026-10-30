@@ -110,4 +110,24 @@ final class DeviceInputKeyboardTests: XCTestCase {
         XCTAssertEqual(reports.map { $0.0 }, [.consumer, .consumer])
         XCTAssertEqual(reports.map { $0.1 }, [[0x23, 0x02], [0, 0]])
     }
+
+    func testPowerKeyIsAShortPressAndReleasesAfterInputBecomesUnavailable() {
+        var reports: [(ReportID, [UInt8])] = []
+        var allowed = true
+        var delays: [TimeInterval] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), inputIsAllowed: { allowed },
+            sleep: { delays.append($0) },
+            reportSender: { id, bytes in
+                reports.append((id, bytes))
+                if bytes == [0x30, 0] { allowed = false }
+            })
+        input.step = 0
+
+        input.consumer(0x0030)
+
+        XCTAssertEqual(reports.map { $0.0 }, [.consumer, .consumer])
+        XCTAssertEqual(reports.map { $0.1 }, [[0x30, 0], [0, 0]])
+        XCTAssertEqual(delays, [0.08, 0])
+    }
 }

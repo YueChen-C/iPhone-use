@@ -14,11 +14,12 @@ enum ControlAPI {
         case type = "/type"
         case key = "/key"
         case home = "/home"
+        case power = "/power"
 
         var requiresPointer: Bool {
             switch self {
             case .tap, .swipe, .move: true
-            case .nudge, .type, .key, .home: false
+            case .nudge, .type, .key, .home, .power: false
             }
         }
     }
@@ -193,6 +194,10 @@ enum ControlAPI {
             try input.key(key, modifiers: (body["modifiers"] as? [String]) ?? [])
         case .home:
             input.consumer(0x0223)
+        case .power:
+            // Consumer Power is a short, state-dependent key press. Never
+            // retry it automatically or claim that an accepted report locked iOS.
+            input.consumer(0x0030)
         }
         return .json(["ok": true, "device": device.id])
     }

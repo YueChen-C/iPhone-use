@@ -27,12 +27,14 @@ struct StringsUI: LocalizedTable {
     let shortcutEnter: String
     let shortcutVolumeUp: String
     let shortcutVolumeDown: String
+    let shortcutPower: String
     let helpHome: String
     let helpSearch: String
     let helpPaste: String
     let helpEnter: String
     let helpVolumeUp: String
     let helpVolumeDown: String
+    let helpPower: String
 
     // Sidebar status line (PhoneControlView.swift)
     let statusWaitingDevice: String
@@ -52,6 +54,10 @@ struct StringsUI: LocalizedTable {
     let overlayAccessibility: String
     let overlayWaitingTitle: String
     let overlayWaitingMessage: String
+    let overlayLockedTitle: String
+    let overlayLockedMessage: String
+    let screenPausedTitle: String
+    let screenPausedMessage: String
     let overlayNotConnectedTitle: String
     let overlayDisconnectedTitle: String
     let overlayBluetoothMessage: String
@@ -87,12 +93,14 @@ struct StringsUI: LocalizedTable {
         shortcutEnter: "回车",
         shortcutVolumeUp: "音量 +",
         shortcutVolumeDown: "音量 −",
+        shortcutPower: "电源",
         helpHome: "返回 iPhone 主屏幕",
         helpSearch: "打开 iPhone 搜索（⌘ Space）",
         helpPaste: "在手机上粘贴（⌘ V）；粘贴 Mac 内容需启用通用剪贴板",
         helpEnter: "发送回车键",
         helpVolumeUp: "提高 iPhone 音量",
         helpVolumeDown: "降低 iPhone 音量",
+        helpPower: "短按 iPhone 电源键，可锁屏；使用 Home 唤醒后仍需解锁",
         statusWaitingDevice: "等待 iPhone 连接",
         statusWaitingBluetooth: "等待蓝牙连接",
         statusVerifyingScreen: "蓝牙已连接，画面身份待确认",
@@ -108,6 +116,10 @@ struct StringsUI: LocalizedTable {
         overlayAccessibility: "连接提示",
         overlayWaitingTitle: "等待 iPhone 画面",
         overlayWaitingMessage: "当前无法操作。请通过 USB 连接并解锁一台 iPhone，确认信任此 Mac。",
+        overlayLockedTitle: "画面可能处于锁屏",
+        overlayLockedMessage: "请唤醒并解锁这台 iPhone，提示会自动收起。可使用 Home 唤醒，无需重新配对或校准。",
+        screenPausedTitle: "iPhone 画面已暂停",
+        screenPausedMessage: "已超过 5 秒没有收到新画面。请先唤醒并解锁这台 iPhone；若已解锁，请检查 USB 连接。",
         overlayNotConnectedTitle: "蓝牙未连接",
         overlayDisconnectedTitle: "蓝牙已断开",
         overlayBluetoothMessage: "当前无法操作 iPhone，请先连接蓝牙。",
@@ -154,12 +166,14 @@ struct StringsUI: LocalizedTable {
         shortcutEnter: "Return",
         shortcutVolumeUp: "Vol +",
         shortcutVolumeDown: "Vol −",
+        shortcutPower: "Power",
         helpHome: "Go to the iPhone Home Screen",
         helpSearch: "Open iPhone Search (⌘ Space)",
         helpPaste: "Paste on the phone (⌘ V); pasting Mac content requires Universal Clipboard",
         helpEnter: "Send the Return key",
         helpVolumeUp: "Turn the iPhone volume up",
         helpVolumeDown: "Turn the iPhone volume down",
+        helpPower: "Briefly press the iPhone power key to lock; Home can wake it, but unlocking is still required",
         statusWaitingDevice: "Waiting for iPhone",
         statusWaitingBluetooth: "Waiting for Bluetooth",
         statusVerifyingScreen: "Bluetooth connected; verifying screen identity",
@@ -176,6 +190,12 @@ struct StringsUI: LocalizedTable {
         overlayWaitingTitle: "Waiting for iPhone Screen",
         overlayWaitingMessage:
             "Control is unavailable. Connect an iPhone over USB, unlock it, and tap Trust on the Mac prompt.",
+        overlayLockedTitle: "Screen may be locked",
+        overlayLockedMessage:
+            "Wake and unlock this iPhone to dismiss this notice. Home is still available; pairing and calibration are kept.",
+        screenPausedTitle: "iPhone screen is paused",
+        screenPausedMessage:
+            "No new frame for over 5 seconds. Wake and unlock this iPhone; if already unlocked, check the USB connection.",
         overlayNotConnectedTitle: "Bluetooth not connected",
         overlayDisconnectedTitle: "Bluetooth disconnected",
         overlayBluetoothMessage: "The iPhone cannot be controlled yet; connect Bluetooth first.",

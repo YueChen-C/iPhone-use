@@ -8,7 +8,7 @@ final class ControlSidebar: NSView {
     /// existing labels without rebuilding the stack's constraint wiring.
     private static let shortcutGroups: [(title: KeyPath<StringsUI, String>, shortcuts: [ControlShortcut])] =
         [
-            (\.groupNavigation, [.home, .search]),
+            (\.groupNavigation, [.home, .search, .power]),
             (\.groupInput, [.paste, .enter]),
             (\.groupVolume, [.volumeUp, .volumeDown]),
         ]
@@ -142,7 +142,7 @@ final class ControlSidebar: NSView {
 }
 
 enum ControlShortcut: Int, CaseIterable {
-    case home, search, paste, enter, volumeUp, volumeDown
+    case home, search, paste, enter, volumeUp, volumeDown, power
 
     var title: String {
         let table = StringsUI.current
@@ -153,6 +153,7 @@ enum ControlShortcut: Int, CaseIterable {
         case .enter: table.shortcutEnter
         case .volumeUp: table.shortcutVolumeUp
         case .volumeDown: table.shortcutVolumeDown
+        case .power: table.shortcutPower
         }
     }
 
@@ -164,6 +165,7 @@ enum ControlShortcut: Int, CaseIterable {
         case .enter: "return"
         case .volumeUp: "speaker.plus"
         case .volumeDown: "speaker.minus"
+        case .power: "power"
         }
     }
 
@@ -176,12 +178,13 @@ enum ControlShortcut: Int, CaseIterable {
         case .enter: table.helpEnter
         case .volumeUp: table.helpVolumeUp
         case .volumeDown: table.helpVolumeDown
+        case .power: table.helpPower
         }
     }
 
     var report: ReportID {
         switch self {
-        case .home, .volumeUp, .volumeDown: .consumer
+        case .home, .volumeUp, .volumeDown, .power: .consumer
         case .search, .paste, .enter: .keyboard
         }
     }
@@ -199,6 +202,7 @@ enum ControlShortcut: Int, CaseIterable {
         case .enter: try input.key("enter", modifiers: [])
         case .volumeUp: input.consumer(0x00E9)
         case .volumeDown: input.consumer(0x00EA)
+        case .power: input.consumer(0x0030)
         }
     }
 }

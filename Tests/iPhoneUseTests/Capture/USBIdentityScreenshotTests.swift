@@ -75,6 +75,17 @@ final class USBIdentityScreenshotTests: XCTestCase {
         XCTAssertEqual(reads, 1, "do not await another message after a failed send")
     }
 
+    func testMissingScreenshotServiceIsUnavailableButEOFRemainsAFailure() {
+        // Captured from the connected iPhone; MobileDevice's AMDErrorString
+        // identifies -402653150 as kAMDInvalidServiceError.
+        XCTAssertTrue(USBIdentityScreenshot.screenshotServiceIsUnavailable(-402_653_150))
+        for code: Int32 in [0, -402_653_170, -1] {
+            XCTAssertFalse(
+                USBIdentityScreenshot.screenshotServiceIsUnavailable(code),
+                "success, EOF and other failures are not missing screenshot capability")
+        }
+    }
+
     func testWorkerPreservesUnavailableAndFailureExitCodes() {
         for code in [0, USBIdentityScreenshot.unavailableExitCode, USBIdentityScreenshot.failedExitCode] {
             XCTAssertEqual(

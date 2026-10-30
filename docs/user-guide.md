@@ -122,6 +122,7 @@ curl -s http://127.0.0.1:7390/devices
 | `devices[].bluetooth` | 手机已匹配到当前连接的蓝牙 host；不代表所有控制报告都已就绪 |
 | `capture.identityState` | 画面身份校验状态；`partiallyVerified` 表示只有部分手机已确认，可逐台查看 `capture.screens[].permitsPointerAssociation` |
 | `devices[].bluetoothState` | `connected` 已匹配；`unmatched` 该手机的已保存连接在线或有未知候选连接，尚未确认画面；`disconnected` 没有该手机的在线连接或未知候选。其他已知手机在线不影响此状态 |
+| `devices[].lockState` | `suspected` 画面疑似锁屏；`paused` 超过 5 秒无新画面；`notDetected` 未识别到锁屏特征；`unknown` 尚无可靠观察。此字段不能证明手机已解锁 |
 | `devices[].width` / `height` | USB 画面的原始像素尺寸 |
 | `devices[].pointer.ready` | 当前是否具备坐标定位条件，不代表已验证实际落点精度 |
 | `devices[].pointer.needsCalibration` | 蓝牙可以已连接，但当前缺少有效的指针校准；键盘输入仍可使用 |
@@ -143,11 +144,15 @@ USB 拔插后若某条采集流一直没有首帧，程序会对该空流自动�
 
 鼠标在手机画面内移动、点击或拖动时，会转发为手机输入；窗口黑边和右侧按钮区域不参与坐标换算。窗口获得焦点后，可以输入 ASCII 字符和常用功能键。
 
-右侧提供 **Home、搜索、粘贴、回车、音量 +、音量 −**。`Command+V` 和“粘贴”按钮发送的是手机端原生粘贴快捷键；如需粘贴 Mac 剪贴板里的内容，需要配置两端的 Handoff 与通用剪贴板。项目本身不传输剪贴板内容。
+右侧提供 **Home、搜索、电源、粘贴、回车、音量 +、音量 −**。“电源”位于导航分组，发送一次短按电源键，可用于锁屏；Home 可唤醒手机，解锁仍需在手机上完成。`Command+V` 和“粘贴”按钮发送的是手机端原生粘贴快捷键；如需粘贴 Mac 剪贴板里的内容，需要配置两端的 Handoff 与通用剪贴板。项目本身不传输剪贴板内容。
 
 同一手机的窗口与 API 共用输入队列和指针位置状态。该窗口拖拽尚未结束时，针对该手机的 API 坐标操作返回 HTTP `409`；释放后即可继续，其他手机不受影响。鼠标离开手机画面时会取消待执行的悬停目标；窗口失焦、关闭或取消交互时会释放按钮。
 
 每个窗口固定对应一台手机。拔掉 USB 后，窗口保留并等待原设备；重新连接同一手机后恢复画面，不会自动切换到其他设备。
+
+识别到锁屏特征时，该手机窗口会显示“画面可能处于锁屏”，解锁后的新画面会自动清除提示。若超过 5 秒没有新画面，则显示“iPhone 画面已暂停”，提示先唤醒、解锁，或检查 USB。提示不拦截鼠标、键盘和 Home，也不触发重新配对或指针校准。
+
+锁屏识别使用 macOS 原生 Vision，在本机每约 2 秒检查已确认身份的 USB 画面，连续两次匹配才提示；目前支持中英文常见锁屏布局。不同 iOS、语言和自定义布局可能影响识别，因此仅提供提示，不作为安全锁状态判断。USB 的 `PasswordProtected` 字段在真机锁屏时仍可能返回未锁定，不能据此判断。识别不需要安装额外工具，也不上传画面。
 
 关闭一个窗口不会中断其他窗口或该手机的 API/MCP 访问。主程序仍在运行时，可通过菜单“窗口 → 显示所有设备”或点击 Dock 中的应用图标，重新打开已关闭的已连接设备窗口。**关闭最后一个窗口会退出整个程序**；此后需重新启动，API/MCP 才能继续使用。
 
@@ -405,6 +410,7 @@ curl -s -X POST http://127.0.0.1:7390/home
 | POST | `/type` | `text`，ASCII 文字 |
 | POST | `/key` | `key`；可选 `modifiers` 数组 |
 | POST | `/home` | 返回主屏幕 |
+| POST | `/power` | 短按蓝牙 HID Consumer 电源键（`0x0030`），约 80 毫秒后释放；作用由 iOS 当前状态决定 |
 | POST | `/match` | 可选 `force`、`probe`，重新匹配屏幕与蓝牙连接 |
 | POST | `/pair` | `device`, `host`，手动指定对应关系 |
 | POST | `/calibration/auto` | 重试缺少配置的手机；省略 `device` 时处理所有连接设备；`verifyOnly:true` 只测量验证，不保存 |
@@ -421,6 +427,17 @@ curl -s -X POST http://127.0.0.1:7390/home
 截图响应头包含 `X-Device`、`X-Screen-Width`、`X-Screen-Height`、`X-Image-Width` 和 `X-Image-Height`，用于区分原始画面与返回图片的尺寸。
 
 HTTP 动作成功时返回 `{"ok":true,"device":"..."}`，**不会自动附带截图**。`/nudge` 的数值不是屏幕像素，它会使已有指针位置估计失效，主要供校准使用。
+
+`/power` 已在一台真机验证可锁屏并使 USB 画面停留在最后一帧；随后 `/home` 可以唤醒并显示锁屏界面。它不是保证锁定的幂等指令，返回 `ok` 只表示完成发送，不能证明手机已锁定，结果不确定时应先检查画面，勿自动重发。Home 不等于解锁，仍需按手机要求完成解锁。电源键不修改蓝牙配对或指针校准；桌面窗口导航区的“电源”按钮发送相同的短按指令。
+
+```sh
+# 向指定手机短按电源键
+curl -s -X POST http://127.0.0.1:7390/power \
+  -H 'Content-Type: application/json' -d '{"device":"<完整设备ID>"}'
+# 唤醒／Home
+curl -s -X POST http://127.0.0.1:7390/home \
+  -H 'Content-Type: application/json' -d '{"device":"<完整设备ID>"}'
+```
 
 ## 指针校准
 

@@ -101,6 +101,7 @@ enum PointerScreenMatcher {
     static let height = 195
     static let firstPoint = (x: 0.3, y: 0.35)
     static let secondPoint = (x: 0.7, y: 0.65)
+    static let thirdPoint = (x: 0.5, y: 0.5)
 
     struct ChangeMetrics: Equatable {
         let signal: Int
@@ -128,46 +129,47 @@ enum PointerScreenMatcher {
         scores.indices.sorted { scores[$0] == scores[$1] ? $0 < $1 : scores[$0] > scores[$1] }
     }
 
-    /// Confirms absolute positioning independently of identity discovery. Both
-    /// cursor lobes must be compact and near the requested targets, reverse on
-    /// the return movement, and restore the starting image. Two changing UI
-    /// regions alone cannot opt a relative-only phone into absolute control.
+    /// Confirms three requested landings and the return independently of identity
+    /// discovery. iOS changes pointer color with its background: arrival and
+    /// departure can have the same polarity at different targets. Require local
+    /// reversal at each target instead of opposite polarities across the screen.
     static func matchesAbsoluteRoundTrip(_ frames: [[UInt8]]) -> Bool {
-        guard frames.count == 3, frames.allSatisfy({ $0.count == width * height }) else { return false }
-        let a = CGPoint(x: firstPoint.x * Double(width), y: firstPoint.y * Double(height))
-        let b = CGPoint(x: secondPoint.x * Double(width), y: secondPoint.y * Double(height))
-        func distance(_ a: CGPoint, _ b: CGPoint) -> Double { hypot(a.x - b.x, a.y - b.y) }
-        func centers(_ before: [UInt8], _ after: [UInt8]) -> (bright: CGPoint, dark: CGPoint)? {
-            var bright: [CGPoint] = []
-            var dark: [CGPoint] = []
-            for i in before.indices {
-                let delta = Int(after[i]) - Int(before[i])
-                guard abs(delta) > 12 else { continue }
-                let point = CGPoint(x: i % width, y: i / width)
-                if delta > 0 { bright.append(point) } else { dark.append(point) }
+        guard frames.count == 4, frames.allSatisfy({ $0.count == width * height }) else { return false }
+        for (corner, point) in [firstPoint, secondPoint, thirdPoint].enumerated() {
+            let x = Int(point.x * Double(width))
+            let y = Int(point.y * Double(height))
+            // At this target only its own frame (and A's return) may contain
+            // the cursor. Both other frames must show the restored background.
+            let absent = (0..<3).filter { $0 != corner }
+            let occupied = frames[corner]
+            let before = frames[absent[0]]
+            let after = frames[absent[1]]
+            var arrival: Set<Int> = []
+            var departure: Set<Int> = []
+            var backgroundChanges = 0
+            var returnChanges = 0
+            for py in max(0, y - 7)...min(height - 1, y + 7) {
+                for px in max(0, x - 7)...min(width - 1, x + 7) {
+                    let i = py * width + px
+                    if abs(Int(occupied[i]) - Int(before[i])) > 12 { arrival.insert(i) }
+                    if abs(Int(occupied[i]) - Int(after[i])) > 12 { departure.insert(i) }
+                    if abs(Int(before[i]) - Int(after[i])) > 12 { backgroundChanges += 1 }
+                    if abs(Int(frames[0][i]) - Int(frames[3][i])) > 12 { returnChanges += 1 }
+                }
             }
-            guard (3...250).contains(bright.count), (3...250).contains(dark.count),
-                Double(min(bright.count, dark.count)) / Double(max(bright.count, dark.count)) >= 0.5
-            else { return nil }
-            func center(_ points: [CGPoint]) -> CGPoint {
-                CGPoint(
-                    x: points.reduce(0) { $0 + $1.x } / Double(points.count),
-                    y: points.reduce(0) { $0 + $1.y } / Double(points.count))
-            }
-            let brightCenter = center(bright)
-            let darkCenter = center(dark)
-            guard bright.allSatisfy({ distance($0, brightCenter) <= 12 }),
-                dark.allSatisfy({ distance($0, darkCenter) <= 12 })
-            else { return nil }
-            return (brightCenter, darkCenter)
+            let common = arrival.intersection(departure)
+            guard (3...150).contains(arrival.count), (3...150).contains(departure.count),
+                common.count * 4 >= max(arrival.count, departure.count) * 3,
+                backgroundChanges <= 2, returnChanges <= 2
+            else { return false }
+            let center = CGPoint(
+                x: Double(common.reduce(0) { $0 + $1 % width }) / Double(common.count),
+                y: Double(common.reduce(0) { $0 + $1 / width }) / Double(common.count))
+            guard hypot(center.x - point.x * Double(width), center.y - point.y * Double(height)) <= 3,
+                common.allSatisfy({ hypot(Double($0 % width) - center.x, Double($0 / width) - center.y) <= 6 })
+            else { return false }
         }
-        guard let forward = centers(frames[0], frames[1]), let reverse = centers(frames[1], frames[2]),
-            (distance(forward.bright, a) <= 7 && distance(forward.dark, b) <= 7)
-                || (distance(forward.dark, a) <= 7 && distance(forward.bright, b) <= 7),
-            distance(forward.bright, reverse.dark) <= 2,
-            distance(forward.dark, reverse.bright) <= 2
-        else { return false }
-        return zip(frames[0], frames[2]).filter { abs(Int($0) - Int($1)) > 12 }.count <= 2
+        return true
     }
 
     /// Count pixels above the original noise threshold in a 15-by-15 region.

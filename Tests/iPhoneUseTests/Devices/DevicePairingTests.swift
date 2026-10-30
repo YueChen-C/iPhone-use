@@ -130,7 +130,7 @@ final class DevicePairingTests: XCTestCase {
         let score = PointerScreenMatcher.score(before: before, after: after)
         XCTAssertEqual(score, 23, "the old direct-hit shortcut accepted this background change")
         XCTAssertEqual(PointerScreenMatcher.candidateOrder(scores: [0, score]), [1, 0])
-        XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([before, after, before]))
+        XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([before, after, before, before]))
         let animated = (0..<5).map { [UInt8](repeating: UInt8($0 * 40), count: 180 * 320) }
         XCTAssertEqual(DevicePairingRecovery.probeResult(for: animated), .unavailable)
     }
@@ -139,16 +139,46 @@ final class DevicePairingTests: XCTestCase {
         for inverted in [false, true] {
             let a = absolutePointerFrame(27, 68, inverted: inverted)
             let b = absolutePointerFrame(63, 127, inverted: inverted)
-            XCTAssertTrue(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, b, a]))
-            XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, b, b]))
+            let c = absolutePointerFrame(45, 97, inverted: inverted)
+            XCTAssertTrue(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, b, c, a]))
+            XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, b, c, b]))
             XCTAssertFalse(
-                PointerScreenMatcher.matchesAbsoluteRoundTrip([a, absolutePointerFrame(45, 100), a]))
+                PointerScreenMatcher.matchesAbsoluteRoundTrip([a, c, b, a]))
             var noisyB = b
             noisyB[0] = inverted ? 240 : 0
-            XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, noisyB, a]))
+            XCTAssertTrue(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, noisyB, c, a]))
+            for i in 0..<3 { noisyB[68 * PointerScreenMatcher.width + 27 + i] = inverted ? 230 : 100 }
+            XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, noisyB, c, a]))
         }
         XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([]))
         XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([[0], [1], [0]]))
+    }
+
+    func testAbsoluteProofAllowsAdaptivePointerColorAndClockAnimation() {
+        let width = PointerScreenMatcher.width
+        let height = PointerScreenMatcher.height
+        var background = (0..<(width * height)).map { UInt8($0 / width < 95 ? 235 : 30) }
+        func frame(_ x: Int, _ y: Int, pointer: UInt8, clock: UInt8) -> [UInt8] {
+            var result = background
+            for dy in -2...2 {
+                for dx in -2...2 where dx * dx + dy * dy <= 4 {
+                    result[(y + dy) * width + x + dx] = pointer
+                }
+            }
+            // A live clock outside the requested landing regions must not
+            // determine whether this phone supports absolute HID coordinates.
+            for i in 0..<12 { result[140 * width + 70 + i % 3 + (i / 3) * width] = clock }
+            return result
+        }
+        let a = frame(27, 68, pointer: 100, clock: 0)
+        let b = frame(63, 127, pointer: 150, clock: 255)
+        let c = frame(45, 97, pointer: 150, clock: 100)
+        let returned = frame(27, 68, pointer: 100, clock: 200)
+        XCTAssertTrue(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, b, c, returned]))
+        // Alternating content at two old targets cannot prove a third landing.
+        XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, b, a, returned]))
+        background[97 * width + 45] = 200
+        XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([a, b, background, returned]))
     }
 
     func testRecoveryRequiresTheFullRectangleAndTreatsAStableTailAsMiss() {

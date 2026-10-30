@@ -11,6 +11,12 @@ enum USBIdentityScreenshot {
     static let unavailableExitCode: Int32 = 69
     static let failedExitCode: Int32 = 70
 
+    /// Only kAMDInvalidServiceError means screenshotr is not offered by this
+    /// phone. EOF and other transport errors must keep identity checks blocked.
+    static func screenshotServiceIsUnavailable(_ code: Int32) -> Bool {
+        UInt32(bitPattern: code) == 0xe800_0022
+    }
+
     static func capture(physicalID: String) -> CaptureIdentityVerifier.Screenshot {
         guard let executable = Bundle.main.executableURL else { return .failed }
         let directory = FileManager.default.temporaryDirectory
@@ -211,7 +217,7 @@ private final class NativeUSBDeviceServices {
         let code = startService(device, "com.apple.mobile.screenshotr" as CFString, nil, &connection)
         // kAMDInvalidServiceError means this phone does not expose screenshotr.
         // Trust/lock/transport failures must not be treated as missing capability.
-        if UInt32(bitPattern: code) == 0xe800_000e { throw Failure.unavailable }
+        if USBIdentityScreenshot.screenshotServiceIsUnavailable(code) { throw Failure.unavailable }
         try check(code, "start screenshot service")
         guard let connection else { throw Failure.invalidReply }
         defer {

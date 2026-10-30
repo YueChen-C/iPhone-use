@@ -149,6 +149,26 @@ final class DeviceInputPointerTests: XCTestCase {
         XCTAssertEqual(reports.count, 3)
     }
 
+    func testAbsoluteProbeVerifiesThirdLandingBeforeReturningWithoutClicks() throws {
+        var reports: [(ReportID, [UInt8])] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), calibrationRequired: true, sleep: { _ in },
+            reportSender: { reports.append(($0, $1)) })
+        let frames = try input.pairingProbe(
+            calibration: nil, firstPoint: CGPoint(x: 0.3, y: 0.35), secondPoint: CGPoint(x: 0.7, y: 0.65),
+            returnToStart: true, thirdPoint: CGPoint(x: 0.5, y: 0.5), wait: 0, isReady: { true },
+            capture: { [UInt8(reports.count)] })
+        XCTAssertEqual(frames.before, [2])
+        XCTAssertEqual(frames.after, [3])
+        XCTAssertEqual(frames.intermediate, [4])
+        XCTAssertEqual(frames.returned, [5])
+        XCTAssertEqual(reports.count, 5)
+        XCTAssertTrue(reports.allSatisfy { $0.0 == .absolutePointer && $0.1[0] == 0 })
+        XCTAssertEqual(reports[0].1, reports[3].1, "wake-up visits a different coordinate before the first capture")
+        XCTAssertEqual(reports[1].1, reports[4].1)
+        XCTAssertFalse(input.isPointerReady, "a probe alone must not enable normal coordinate input")
+    }
+
     func testRelativeProbeKeepsTheRectangleInsideScreenEdges() throws {
         for start in [CGPoint.zero, CGPoint(x: 749, y: 1333)] {
             var position = start

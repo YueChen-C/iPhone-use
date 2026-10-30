@@ -287,6 +287,8 @@ final class ScreenCaptureSession {
 
     func frame() -> CVPixelBuffer? { source.frame() }
 
+    func observationFrame() -> ScreenCaptureFrameStore.Snapshot? { source.observationFrame() }
+
     func snapshot(png: Bool, maxWidth: Int? = nil, maxEdge: Int? = nil) -> Data? {
         source.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge)
     }
@@ -427,6 +429,8 @@ private final class ScreenCaptureSource: NSObject, AVCaptureVideoDataOutputSampl
     func frame() -> CVPixelBuffer? {
         frames.snapshot()?.buffer
     }
+
+    func observationFrame() -> ScreenCaptureFrameStore.Snapshot? { frames.snapshot() }
 
     func pointerFrame(
         after sequence: UInt64?, notBefore: TimeInterval, timeout: TimeInterval

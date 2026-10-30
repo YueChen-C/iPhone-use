@@ -585,4 +585,24 @@ final class RelativePointerCalibrationTests: XCTestCase {
         }
         XCTAssertThrowsError(try RelativePointerCalibration.markRequired(screenID: "", directory: directory))
     }
+
+    func testAbsoluteProofClearsOnlyTheTargetRequirementAndPreservesProfiles() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let host = UUID()
+        for screen in ["phone-a", "phone-b"] {
+            try RelativePointerCalibration.markRequired(screenID: screen, directory: directory)
+        }
+        try RelativePointerCalibration.clearRequirementAfterAbsoluteProof(screenID: "phone-a", directory: directory)
+        XCTAssertFalse(
+            RelativePointerCalibration.requiresCalibration(host: host, screenID: "phone-a", directory: directory))
+        XCTAssertTrue(
+            RelativePointerCalibration.requiresCalibration(host: host, screenID: "phone-b", directory: directory))
+        let brokenProfile = directory.appendingPathComponent(host.uuidString + ".json")
+        try Data("broken".utf8).write(to: brokenProfile)
+        try RelativePointerCalibration.clearRequirementAfterAbsoluteProof(screenID: "phone-a", directory: directory)
+        XCTAssertEqual(try Data(contentsOf: brokenProfile), Data("broken".utf8))
+        XCTAssertTrue(
+            RelativePointerCalibration.requiresCalibration(host: host, screenID: "phone-a", directory: directory))
+    }
 }

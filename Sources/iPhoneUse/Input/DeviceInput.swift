@@ -572,10 +572,11 @@ extension DeviceInput {
         firstPoint: CGPoint,
         secondPoint: CGPoint,
         returnToStart: Bool = false,
+        thirdPoint: CGPoint? = nil,
         wait: TimeInterval = 0.6,
         isReady: () -> Bool,
         capture: () -> [UInt8]?
-    ) throws -> (before: [UInt8], after: [UInt8], returned: [UInt8]?) {
+    ) throws -> (before: [UInt8], after: [UInt8], intermediate: [UInt8]?, returned: [UInt8]?) {
         let sequence = motionSequence.current
         let activity = backgroundSequence.current
         func probeIsReady() -> Bool { isReady() && backgroundSequence.isCurrent(activity) }
@@ -583,9 +584,10 @@ extension DeviceInput {
             guard !windowDragging, buttons == 0 else { throw InputError.pointerBusy }
             guard session != nil, probeIsReady(), motionSequence.isCurrent(sequence),
                 wait.isFinite, wait >= 0,
-                [firstPoint.x, firstPoint.y, secondPoint.x, secondPoint.y].allSatisfy({
-                    $0.isFinite && (0...1).contains($0)
-                })
+                ([firstPoint.x, firstPoint.y, secondPoint.x, secondPoint.y]
+                    + (thirdPoint.map { [$0.x, $0.y] } ?? [])).allSatisfy({
+                        $0.isFinite && (0...1).contains($0)
+                    })
             else { throw InputError.pairingProbeUnavailable }
 
             if let calibration {
@@ -598,6 +600,16 @@ extension DeviceInput {
             // Do not reuse either mapping's estimate across that boundary.
             clearPointerEstimate()
             defer { clearPointerEstimate() }
+            // A hidden cursor may ignore an unchanged absolute report. Visit
+            // another target first so the first observed landing is a move,
+            // including when reconnecting at the previous absolute position.
+            if let thirdPoint, calibration == nil {
+                moveForPairingProbe(thirdPoint, calibration: nil, sequence: sequence, isReady: probeIsReady)
+                pause(wait)
+                guard probeIsReady(), motionSequence.isCurrent(sequence) else {
+                    throw InputError.pairingProbeUnavailable
+                }
+            }
             moveForPairingProbe(firstPoint, calibration: calibration, sequence: sequence, isReady: probeIsReady)
             pause(wait)
             guard probeIsReady(), motionSequence.isCurrent(sequence), let before = capture() else {
@@ -608,6 +620,18 @@ extension DeviceInput {
             pause(wait)
             guard probeIsReady(), motionSequence.isCurrent(sequence), let after = capture() else {
                 throw InputError.pairingProbeUnavailable
+            }
+            var intermediate: [UInt8]?
+            if let thirdPoint {
+                guard probeIsReady(), motionSequence.isCurrent(sequence) else {
+                    throw InputError.pairingProbeUnavailable
+                }
+                moveForPairingProbe(thirdPoint, calibration: calibration, sequence: sequence, isReady: probeIsReady)
+                pause(wait)
+                guard probeIsReady(), motionSequence.isCurrent(sequence), let pixels = capture() else {
+                    throw InputError.pairingProbeUnavailable
+                }
+                intermediate = pixels
             }
             var returned: [UInt8]?
             if returnToStart {
@@ -621,7 +645,7 @@ extension DeviceInput {
                 }
                 returned = pixels
             }
-            return (before, after, returned)
+            return (before, after, intermediate, returned)
         }
     }
 

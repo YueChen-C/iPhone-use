@@ -21,6 +21,8 @@ final class PhoneControlView: NSView {
     var onShortcutStateChanged: ((Set<ControlShortcut>, String) -> Void)?
     private var connectionStatus: ControlConnectionStatus?
     var onConnectionStateChanged: ((ControlConnectionStatus) -> Void)?
+    private var lockState: DeviceLockState = .unknown
+    var onLockStateChanged: ((DeviceLockState) -> Void)?
 
     private var canSendWindowInput: Bool {
         binding.acceptsEvents(isKeyWindow: window?.isKeyWindow == true)
@@ -78,6 +80,7 @@ final class PhoneControlView: NSView {
         activeShortcut = nil
         shortcutFeedback = nil
         connectionStatus = nil
+        lockState = .unknown
         lastShortcutState = nil
     }
 
@@ -261,6 +264,8 @@ final class PhoneControlView: NSView {
                 status = table.statusAutomaticallyCalibrating
             } else if available.isEmpty {
                 status = table.statusWaitingBluetooth
+            } else if lockState.showsNotice {
+                status = lockState.title
             } else if let shortcutFeedback, shortcutFeedback.expires > Date() {
                 status = shortcutFeedback.text
             } else {
@@ -284,6 +289,7 @@ final class PhoneControlView: NSView {
         // Publish connection changes first: they can cancel a gesture and clear
         // shortcut feedback before the sidebar computes its next visible state.
         defer {
+            updateLockState()
             updateConnectionState()
             updateShortcutState()
         }
@@ -373,6 +379,13 @@ final class PhoneControlView: NSView {
         cancelInteraction()
         if !ready { input?.invalidatePointerEstimate() }
         pointerReady = ready
+    }
+
+    private func updateLockState() {
+        let current = device?.lockState ?? .unknown
+        guard current != lockState else { return }
+        lockState = current
+        onLockStateChanged?(current)
     }
 
     // MARK: Pointer sampling and coordinate conversion

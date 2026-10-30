@@ -161,6 +161,9 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         controlView.onConnectionStateChanged = { [weak content] status in
             content?.updateConnectionState(status)
         }
+        controlView.onLockStateChanged = { [weak content] state in
+            content?.updateLockState(state)
+        }
         languageObserver = NotificationCenter.default.addObserver(
             forName: AppLanguageStore.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -179,7 +182,8 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     private func applyWindowStrings() {
         if let device = lastKnownDevice {
             window?.title = "\(device.screen.name) — \(device.id)"
-            window?.subtitle = ""
+            let lockState = device.lockState
+            window?.subtitle = lockState.showsNotice ? lockState.title : ""
         } else if deviceID != nil {
             // A bound window keeps its last device title so it stays clear which
             // phone is being waited for; only the subtitle explains the disconnect.
@@ -225,6 +229,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
 private final class ControlWindowContent: NSView {
     private let phoneView: NSView
     private let connectionOverlay = ControlConnectionOverlay(frame: .zero)
+    private let lockNotice = ControlLockNotice(frame: .zero)
 
     init(phoneView: NSView, sidebar: ControlSidebar) {
         self.phoneView = phoneView
@@ -233,9 +238,13 @@ private final class ControlWindowContent: NSView {
         sidebar.translatesAutoresizingMaskIntoConstraints = false
         addSubview(phoneView)
         addSubview(sidebar)
+        lockNotice.translatesAutoresizingMaskIntoConstraints = false
         connectionOverlay.translatesAutoresizingMaskIntoConstraints = false
         // Last sibling receives hit testing first while the overlay is visible.
         addSubview(connectionOverlay)
+        // The advisory remains visible over pairing guidance, and passes events
+        // through to the existing overlay or phone without changing either gate.
+        addSubview(lockNotice)
         NSLayoutConstraint.activate([
             phoneView.leadingAnchor.constraint(equalTo: leadingAnchor),
             phoneView.topAnchor.constraint(equalTo: topAnchor),
@@ -245,6 +254,9 @@ private final class ControlWindowContent: NSView {
             sidebar.topAnchor.constraint(equalTo: topAnchor),
             sidebar.trailingAnchor.constraint(equalTo: trailingAnchor),
             sidebar.bottomAnchor.constraint(equalTo: bottomAnchor),
+            lockNotice.centerXAnchor.constraint(equalTo: phoneView.centerXAnchor),
+            lockNotice.bottomAnchor.constraint(equalTo: phoneView.bottomAnchor, constant: -24),
+            lockNotice.widthAnchor.constraint(equalTo: phoneView.widthAnchor, constant: -24),
             connectionOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
             connectionOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
             connectionOverlay.topAnchor.constraint(equalTo: topAnchor),
@@ -259,6 +271,11 @@ private final class ControlWindowContent: NSView {
 
     func refreshLocalization() {
         connectionOverlay.refreshLocalization()
+        lockNotice.refreshLocalization()
+    }
+
+    func updateLockState(_ state: DeviceLockState) {
+        lockNotice.update(state)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
