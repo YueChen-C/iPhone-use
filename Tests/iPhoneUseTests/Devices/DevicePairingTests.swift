@@ -154,6 +154,15 @@ final class DevicePairingTests: XCTestCase {
         XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip([[0], [1], [0]]))
     }
 
+    func testOnlyOneCompleteAbsoluteProofCanSkipRelativeDiscovery() {
+        XCTAssertEqual(
+            DevicePairingRecovery.absoluteProbeResults(verified: [false, true, false]),
+            [.unavailable, .hit, .unavailable])
+        XCTAssertNil(DevicePairingRecovery.absoluteProbeResults(verified: []))
+        XCTAssertNil(DevicePairingRecovery.absoluteProbeResults(verified: [false, false]))
+        XCTAssertNil(DevicePairingRecovery.absoluteProbeResults(verified: [true, true]))
+    }
+
     func testAbsoluteProofAllowsAdaptivePointerColorAndClockAnimation() {
         let width = PointerScreenMatcher.width
         let height = PointerScreenMatcher.height

@@ -169,6 +169,39 @@ final class DeviceInputPointerTests: XCTestCase {
         XCTAssertFalse(input.isPointerReady, "a probe alone must not enable normal coordinate input")
     }
 
+    func testLocalRelativeProbeUsesEighteenReportsWithoutSweepingEdges() throws {
+        var position = CGPoint(x: 200, y: 400)
+        var positions: [CGPoint] = []
+        var reports: [(ReportID, [UInt8])] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), sleep: { _ in },
+            reportSender: { id, bytes in
+                reports.append((id, bytes))
+                position.x += Double(Int8(bitPattern: bytes[1])) * 3
+                position.y += Double(Int8(bitPattern: bytes[2])) * 3
+            })
+        _ = try input.relativePairingProbe(
+            preparePosition: false, isReady: { true },
+            capture: {
+                positions.append(position)
+                return [[0]]
+            })
+        XCTAssertEqual(reports.count, 18)
+        XCTAssertTrue(reports.allSatisfy { $0.0 == .relativeMouse && $0.1[0] == 0 })
+        XCTAssertEqual(
+            positions,
+            [
+                CGPoint(x: 200, y: 400), CGPoint(x: 296, y: 400), CGPoint(x: 296, y: 496),
+                CGPoint(x: 200, y: 496), CGPoint(x: 200, y: 400),
+            ])
+
+        reports.removeAll()
+        XCTAssertThrowsError(
+            try input.relativePairingProbe(
+                preparePosition: false, isReady: { reports.count < 1 }, capture: { [[0]] }))
+        XCTAssertEqual(reports.count, 1, "local probing must stop as soon as readiness is lost")
+    }
+
     func testRelativeProbeKeepsTheRectangleInsideScreenEdges() throws {
         for start in [CGPoint.zero, CGPoint(x: 749, y: 1333)] {
             var position = start

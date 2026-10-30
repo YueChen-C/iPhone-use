@@ -62,6 +62,7 @@ final class DeviceRegistry {
         var scores: [ObjectIdentifier: Int] = [:]
         var absoluteScreens: Set<ObjectIdentifier> = []
         var results: [ObjectIdentifier: DevicePairingRecovery.ProbeResult] = [:]
+        var pointerOrigins: [ObjectIdentifier: (point: CGPoint, activity: UInt64)] = [:]
         var preparedScreens: Set<ObjectIdentifier> = []
     }
     /// Recovery and generic discovery share one motion proof per host/round.
@@ -818,8 +819,8 @@ final class DeviceRegistry {
         return finishProbe(input, on: screen, evidence: evidence) ? .hit : .unavailable
     }
 
-    /// Scores only rank captures. A full relative rectangle is required before
-    /// either a saved association or a new Bluetooth binding becomes usable.
+    /// Scores only rank captures. A unique complete absolute trajectory or a
+    /// relative rectangle must identify the screen before its binding is usable.
     private func probe(_ host: UUID, among screens: [ScreenCaptureSession]) -> ScreenCaptureSession? {
         let knownID = lock.withLock { pairings.first { $0.value == host }?.key }
         let input: DeviceInput
@@ -848,9 +849,9 @@ final class DeviceRegistry {
         return screen
     }
 
-    /// Raw relative motion is gain-independent and never changes calibration.
-    /// All present screens are captured together, allowing recovery and generic
-    /// discovery to reuse this evidence without repeating pointer movements.
+    /// All present screens are captured together. A unique absolute trajectory
+    /// completes discovery directly; relative-only phones first try a local
+    /// rectangle, then the edge-prepared path if that observation fails.
     private func motionEvidence(_ input: DeviceInput, verifyAbsolute: Bool) -> ProbeEvidence {
         let empty = ProbeEvidence(session: input.session)
         guard let sequence = observeProbeActivity(input), input.session != nil,
@@ -906,25 +907,55 @@ final class DeviceRegistry {
             }
         }
         guard probingMayContinue(), input.inputActivitySequence == sequence else { return empty }
+        guard screens.allSatisfy({ screen in ScreenCaptureManager.shared.all.contains { $0 === screen } })
+        else { return empty }
+        if let results = DevicePairingRecovery.absoluteProbeResults(
+            verified: screens.map { evidence.absoluteScreens.contains(ObjectIdentifier($0)) })
+        {
+            for (screen, result) in zip(screens, results) { evidence.results[ObjectIdentifier(screen)] = result }
+            probeEvidence[host] = evidence
+            log("absolute trajectory matched \(host); relative discovery skipped")
+            return evidence
+        }
         let order = PointerScreenMatcher.candidateOrder(
             scores: screens.map { evidence.scores[ObjectIdentifier($0)] ?? 0 })
         let rankedScreens = order.map { screens[$0] }
         do {
-            let captures = try input.relativePairingProbe(
-                isReady: { isReady(.relativeMouse) },
-                capture: {
-                    rankedScreens.map {
-                        $0.thumbnail(
-                            width: RelativePointerScreenMatcher.width, height: RelativePointerScreenMatcher.height)
+            for preparePosition in [false, true] {
+                var originFrames: [PointerMotionObservation.Frame] = []
+                let originScreen = rankedScreens.first { screen in
+                    guard let calibration = input.calibration, let size = screen.size else { return false }
+                    return calibration.screenID == screen.id && calibration.matches(size)
+                }
+                let captures = try input.relativePairingProbe(
+                    preparePosition: preparePosition, isReady: { isReady(.relativeMouse) },
+                    capture: {
+                        if let originScreen, let size = originScreen.size,
+                            let pixels = originScreen.thumbnail(width: Int(size.width), height: Int(size.height))
+                        {
+                            originFrames.append(.init(width: Int(size.width), height: Int(size.height), pixels: pixels))
+                        }
+                        return rankedScreens.map {
+                            $0.thumbnail(
+                                width: RelativePointerScreenMatcher.width, height: RelativePointerScreenMatcher.height)
+                        }
+                    })
+                guard probingMayContinue(), input.inputActivitySequence == sequence,
+                    screens.allSatisfy({ screen in ScreenCaptureManager.shared.all.contains { $0 === screen } })
+                else { return empty }
+                for (i, screen) in rankedScreens.enumerated() {
+                    let result = DevicePairingRecovery.probeResult(for: captures.map { $0[i] })
+                    evidence.results[ObjectIdentifier(screen)] = result
+                    log("relative probe \(host) on \(screen.name): \(result), prepared=\(preparePosition)")
+                }
+                if evidence.results.values.filter({ $0 == .hit }).count == 1 {
+                    if let originScreen, evidence.results[ObjectIdentifier(originScreen)] == .hit,
+                        let origin = PointerMotionObservation.closedRectangleOrigin(originFrames)
+                    {
+                        evidence.pointerOrigins[ObjectIdentifier(originScreen)] = (origin, sequence)
                     }
-                })
-            guard probingMayContinue(), input.inputActivitySequence == sequence,
-                screens.allSatisfy({ screen in ScreenCaptureManager.shared.all.contains { $0 === screen } })
-            else { return empty }
-            for (i, screen) in rankedScreens.enumerated() {
-                let result = DevicePairingRecovery.probeResult(for: captures.map { $0[i] })
-                evidence.results[ObjectIdentifier(screen)] = result
-                log("relative probe \(host) on \(screen.name): \(result)")
+                    break
+                }
             }
         } catch {
             log("relative probe \(host) unavailable: \(error)")
@@ -959,6 +990,11 @@ final class DeviceRegistry {
             || RelativePointerCalibration.loadMatchingScreen(host: input.host, screenSize: nil, screenID: screen.id)
                 != nil
         let absoluteVerified = evidence.absoluteScreens.contains(key)
+        if let origin = evidence.pointerOrigins[key],
+            input.adoptObservedPointerOrigin(origin.point, screenID: screen.id, activity: origin.activity)
+        {
+            log("observed pointer origin retained for \(screen.name); initial homing skipped")
+        }
         if !hasProfile, absoluteVerified {
             do {
                 try RelativePointerCalibration.clearRequirementAfterAbsoluteProof(screenID: screen.id)

@@ -39,6 +39,30 @@ enum PointerMotionObservation {
         return zip(a.pixels, b.pixels).reduce(0) { $0 + (abs(Int($1.0) - Int($1.1)) > 12 ? 1 : 0) }
     }
 
+    /// Full-size frames refine a separately matched rectangle's final landing.
+    /// Every edge must join the next within two pixels and return to the same
+    /// origin. Ambiguous or morphed pointers leave normal homing as the fallback.
+    static func closedRectangleOrigin(_ frames: [Frame]) -> CGPoint? {
+        guard frames.count == 5 else { return nil }
+        let directions = [CGPoint(x: 1, y: 0), CGPoint(x: 0, y: 1), CGPoint(x: -1, y: 0), CGPoint(x: 0, y: -1)]
+        var edges: [Motion] = []
+        for i in directions.indices {
+            guard let edge = motion(from: frames[i], to: frames[i + 1], direction: directions[i]),
+                edge.delta.x * directions[i].x + edge.delta.y * directions[i].y > 0,
+                abs(edge.delta.x * directions[i].y - edge.delta.y * directions[i].x) <= 2
+            else { return nil }
+            edges.append(edge)
+        }
+        guard
+            edges.indices.allSatisfy({ i in
+                let arrival = edges[i].to
+                let departure = edges[(i + 1) % edges.count].from
+                return hypot(arrival.x - departure.x, arrival.y - departure.y) <= 2
+            })
+        else { return nil }
+        return edges.last?.to
+    }
+
     static func motion(from a: Frame, to b: Frame, direction: CGPoint) -> Motion? {
         guard a.isValid, b.isValid, a.width == b.width, a.height == b.height,
             direction.x.isFinite, direction.y.isFinite, hypot(direction.x, direction.y) > 0

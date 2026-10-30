@@ -159,6 +159,75 @@ final class DeviceInputTrackingTests: XCTestCase {
         XCTAssertTrue(pointer.reports.allSatisfy { $0.dx >= 0 && $0.dy >= 0 })
     }
 
+    private func observableInput() -> (DeviceInput, SimulatedPointer) {
+        let calibration = RelativePointerCalibration(
+            host: UUID(), screenWidth: 100, screenHeight: 200, reportInterval: 0.01,
+            distances: [0, 1, 3, 8, 20], screenID: "phone")
+        let pointer = SimulatedPointer(calibration: calibration)
+        let input = DeviceInput(
+            host: calibration.host, session: UUID(), calibration: calibration,
+            screenSize: { CGSize(width: 100, height: 200) }, sleep: { _ in },
+            reportSender: pointer.receive)
+        return (input, pointer)
+    }
+
+    func testObservedOriginAvoidsInitialHomingAndSurvivesForegroundTakeover() throws {
+        let (input, pointer) = observableInput()
+        pointer.position = CGPoint(x: 20, y: 30)
+        XCTAssertTrue(
+            input.adoptObservedPointerOrigin(
+                pointer.position, screenID: "phone",
+                activity: input.inputActivitySequence))
+        input.cancelBackgroundMotion()
+        try input.move(x: 0.7, y: 0.7)
+
+        XCTAssertEqual(pointer.position, CGPoint(x: 70, y: 140))
+        XCTAssertFalse(pointer.reports.isEmpty)
+        XCTAssertTrue(pointer.reports.allSatisfy { $0.dx >= 0 && $0.dy >= 0 && $0.buttons == 0 })
+    }
+
+    func testStaleOrWrongScreenObservationFallsBackToNormalHoming() throws {
+        let (input, pointer) = observableInput()
+        let activity = input.inputActivitySequence
+        input.cancelBackgroundMotion()
+        XCTAssertFalse(input.adoptObservedPointerOrigin(pointer.position, screenID: "phone", activity: activity))
+        XCTAssertFalse(
+            input.adoptObservedPointerOrigin(
+                pointer.position, screenID: "other",
+                activity: input.inputActivitySequence))
+        for point in [
+            CGPoint(x: -1, y: 20), CGPoint(x: 100, y: 20), CGPoint(x: 20, y: 200),
+            CGPoint(x: CGFloat.nan, y: 20),
+        ] {
+            XCTAssertFalse(
+                input.adoptObservedPointerOrigin(
+                    point, screenID: "phone",
+                    activity: input.inputActivitySequence))
+        }
+        try input.move(x: 0, y: 0)
+        XCTAssertEqual(pointer.reports.map(\.dx), pointer.calibration.homingReports.map(\.dx))
+        XCTAssertEqual(pointer.reports.map(\.dy), pointer.calibration.homingReports.map(\.dy))
+        XCTAssertEqual(pointer.position, .zero)
+    }
+
+    func testInvalidatingObservedOriginRestoresHoming() throws {
+        let (input, pointer) = observableInput()
+        XCTAssertTrue(
+            input.adoptObservedPointerOrigin(
+                pointer.position, screenID: "phone",
+                activity: input.inputActivitySequence))
+        input.invalidatePointerEstimate()
+        try input.move(x: 0, y: 0)
+        XCTAssertEqual(pointer.reports.map(\.dx), pointer.calibration.homingReports.map(\.dx))
+        XCTAssertEqual(pointer.reports.map(\.dy), pointer.calibration.homingReports.map(\.dy))
+
+        try input.retireForCalibrationReload()
+        XCTAssertFalse(
+            input.adoptObservedPointerOrigin(
+                CGPoint(x: 20, y: 30), screenID: "phone",
+                activity: input.inputActivitySequence))
+    }
+
     func testDuplicateMouseEventDoesNotCancelTargetAlreadySubmittedByTimer() throws {
         let (input, pointer) = try preparedInput(vectorModel: .radialQuantized)
         let target = CGPoint(x: 0.8, y: 0.7)

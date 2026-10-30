@@ -480,7 +480,9 @@ extension DeviceInput {
     /// Gain-independent fallback for hosts whose absolute coordinates do not
     /// reach the two matching targets. Capture an entire rectangle on one input
     /// queue, and never press a button or use a speculative calibration.
-    func relativePairingProbe(isReady: () -> Bool, capture: () -> [[UInt8]?]) throws -> [[[UInt8]]] {
+    func relativePairingProbe(
+        preparePosition: Bool = true, isReady: () -> Bool, capture: () -> [[UInt8]?]
+    ) throws -> [[[UInt8]]] {
         let sequence = backgroundSequence.current
         return try queue.sync {
             try requireIdlePointer()
@@ -498,12 +500,19 @@ extension DeviceInput {
                     pause(step)
                 }
             }
-            // First make room, then leave the top/left edges before capturing.
-            // A clipped pointer cannot provide a complete return trajectory.
-            try move(-8, 0, times: 12)
-            try move(0, -8, times: 12)
-            try move(8, 0, times: 4)
-            try move(0, 8, times: 4)
+            if preparePosition {
+                // Retry away from clipped screen edges only when the local
+                // trajectory could not establish a unique screen association.
+                try move(-8, 0, times: 12)
+                try move(0, -8, times: 12)
+                try move(8, 0, times: 4)
+                try move(0, 8, times: 4)
+            } else {
+                // Wake an idle pointer with a small reversible movement. Do
+                // not sweep either screen boundary before trying the rectangle.
+                try move(-8, 0, times: 1)
+                try move(8, 0, times: 1)
+            }
             var frames: [[[UInt8]]] = []
             for (dx, dy) in [(0, 0), (8, 0), (0, 8), (-8, 0), (0, -8)] {
                 try move(dx, dy, times: dx == 0 && dy == 0 ? 0 : 4)
@@ -518,6 +527,26 @@ extension DeviceInput {
                 frames.append(images.map { $0! })
             }
             return frames
+        }
+    }
+
+    /// A completed visual trajectory can establish the current origin without
+    /// touching an edge. Keep it only on this exact screen/profile/input queue;
+    /// cancellation or unrelated foreground activity invalidates the sample.
+    @discardableResult
+    func adoptObservedPointerOrigin(_ point: CGPoint, screenID: String, activity: UInt64) -> Bool {
+        queue.sync {
+            guard !isRetired, session != nil, inputIsAllowed(), !windowDragging, buttons == 0,
+                backgroundSequence.isCurrent(activity),
+                let calibration, calibration.screenID == screenID,
+                let size = screenSize?(), calibration.matches(size),
+                point.x.isFinite, point.y.isFinite,
+                (0..<size.width).contains(point.x), (0..<size.height).contains(point.y)
+            else { return false }
+            estimatedPosition = point
+            relativeHomingReportIndex = 0
+            lastTrackingMovement = nil
+            return true
         }
     }
 

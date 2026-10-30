@@ -209,6 +209,13 @@ enum DevicePairingRecovery {
         case unavailable
     }
 
+    /// A complete absolute trajectory already identifies the driven screen.
+    /// Scores or ambiguous trajectories must still use relative discovery.
+    static func absoluteProbeResults(verified: [Bool]) -> [ProbeResult]? {
+        guard verified.filter({ $0 }).count == 1 else { return nil }
+        return verified.map { $0 ? .hit : .unavailable }
+    }
+
     static func probeResult(for frames: [[UInt8]]) -> ProbeResult {
         guard frames.count == 5,
             frames.allSatisfy({ $0.count == RelativePointerScreenMatcher.width * RelativePointerScreenMatcher.height })

@@ -67,4 +67,44 @@ final class PointerMotionObservationTests: XCTestCase {
     func testLargeNonCircularChangeStillFails() {
         XCTAssertNil(motion(pair(nonCircularBlock: true)))
     }
+
+    private func rectangle(_ points: [CGPoint], animated: Bool = false) -> [PointerMotionObservation.Frame] {
+        points.enumerated().map { index, point in
+            var pixels = [UInt8](repeating: 255, count: width * height)
+            disk(&pixels, x: Int(point.x), y: Int(point.y))
+            if animated && index == 2 { disk(&pixels, x: 300, y: 300) }
+            return .init(width: width, height: height, pixels: pixels)
+        }
+    }
+
+    func testClosedRectangleRetainsTheObservedFinalPosition() throws {
+        let points = [
+            CGPoint(x: 80, y: 80), CGPoint(x: 200, y: 80), CGPoint(x: 200, y: 200),
+            CGPoint(x: 80, y: 200), CGPoint(x: 80, y: 80),
+        ]
+        let origin = try XCTUnwrap(PointerMotionObservation.closedRectangleOrigin(rectangle(points)))
+        XCTAssertEqual(origin, CGPoint(x: 80.5, y: 80.5))
+        XCTAssertNil(PointerMotionObservation.closedRectangleOrigin(rectangle(points, animated: true)))
+
+        var openPath = points
+        openPath[4] = CGPoint(x: 80, y: 100)
+        XCTAssertNil(PointerMotionObservation.closedRectangleOrigin(rectangle(openPath)))
+        XCTAssertNil(PointerMotionObservation.closedRectangleOrigin(rectangle(points.reversed())))
+        XCTAssertNil(PointerMotionObservation.closedRectangleOrigin(Array(rectangle(points).prefix(4))))
+    }
+
+    func testClippedOrDiagonalTrajectoryCannotSupplyAnOrigin() {
+        let clipped = [
+            CGPoint(x: 10, y: 80), CGPoint(x: 130, y: 80), CGPoint(x: 130, y: 200),
+            CGPoint(x: 10, y: 200), CGPoint(x: 10, y: 80),
+        ]
+        // Render safely, with the disk touching the image boundary.
+        let touching = clipped.map { CGPoint(x: $0.x + 4, y: $0.y) }
+        XCTAssertNil(PointerMotionObservation.closedRectangleOrigin(rectangle(touching)))
+        let diagonal = [
+            CGPoint(x: 80, y: 80), CGPoint(x: 200, y: 85), CGPoint(x: 200, y: 200),
+            CGPoint(x: 80, y: 200), CGPoint(x: 80, y: 80),
+        ]
+        XCTAssertNil(PointerMotionObservation.closedRectangleOrigin(rectangle(diagonal)))
+    }
 }
