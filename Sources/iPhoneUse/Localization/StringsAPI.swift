@@ -6,6 +6,7 @@ struct StringsAPI: LocalizedTable {
     // ControlAPI endpoint validation
     let pairHostRequired: String
     let noFrameFromDevice: (String) -> String
+    let captureFailedFromDevice: (String, String) -> String
     let pointerNotReady: String
     let textRequired: String
     let keyRequired: String
@@ -52,6 +53,7 @@ struct StringsAPI: LocalizedTable {
     static let zh = StringsAPI(
         pairHostRequired: "缺少 host（应为 unmatchedHosts 中的 UUID）",
         noFrameFromDevice: { "尚未收到来自 \($0) 的画面：请先解锁" },
+        captureFailedFromDevice: { "来自 \($0) 的 USB 画面捕获失败：\($1)" },
         pointerNotReady: "指针未就绪：请等待蓝牙鼠标订阅与有效校准",
         textRequired: "缺少 text",
         keyRequired: "缺少 key",
@@ -88,6 +90,7 @@ struct StringsAPI: LocalizedTable {
     static let en = StringsAPI(
         pairHostRequired: "host is required (a UUID from unmatchedHosts)",
         noFrameFromDevice: { "no frame yet from \($0): unlock it" },
+        captureFailedFromDevice: { "USB screen capture failed for \($0): \($1)" },
         pointerNotReady: "pointer is not ready: wait for Bluetooth mouse subscription and a valid calibration",
         textRequired: "text is required",
         keyRequired: "key is required",

@@ -109,6 +109,11 @@ final class HTTPServer {
         self.listener = listener
     }
 
+    func stop() {
+        listener?.cancel()
+        listener = nil
+    }
+
     private func accept(_ connection: NWConnection) {
         connection.start(queue: queue)
         receive(connection, buffer: Data())

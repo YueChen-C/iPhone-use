@@ -3,7 +3,7 @@ import Foundation
 
 /// The Mac as a BLE keyboard + pointer (HID over GATT). Classic Bluetooth HID is out:
 /// bluetoothd owns L2CAP PSM 17 and 19 on current macOS.
-final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
+final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManagerDelegate {
     static let shared = HIDPeripheral()
 
     let localName = "iPhone Use"
@@ -12,6 +12,10 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     /// Public readers synchronize here; all delegate callbacks already run here.
     private let queue = DispatchQueue(label: "iphone-use.bluetooth")
     private var manager: CBPeripheralManager!
+    private var centralManager: CBCentralManager?
+    private var reconnectTracker = HIDReconnectTracker()
+    private var reconnectingPeripherals: [UUID: CBPeripheral] = [:]
+    private let reconnectTimeout: TimeInterval = 12
     private var servicesToAdd: [CBMutableService] = []
     private var serviceBeingAdded: CBMutableService?
     private var published = false
@@ -39,12 +43,79 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     func start() {
         queue.async {
             self.manager = CBPeripheralManager(delegate: self, queue: self.queue)
+            self.centralManager = CBCentralManager(delegate: self, queue: self.queue)
         }
+    }
+
+    func stop() {
+        queue.sync {
+            if manager?.isAdvertising == true {
+                manager?.stopAdvertising()
+            }
+            cancelAllReconnections()
+        }
+    }
+
+    /// Initiates a bounded BLE link to saved bonded iPhones whose USB screens are
+    /// present, waking their HOGP client without requiring manual Settings > Bluetooth taps.
+    func reconnectKnownHosts(_ hosts: Set<UUID>, resetExhausted: Bool = true) {
+        queue.async {
+            let activeSessions = Set(self.connections.sessions.keys)
+            let toCancel = self.reconnectTracker.updateTargets(
+                hosts, activeSessions: activeSessions, resetExhausted: resetExhausted)
+            for host in toCancel {
+                if let peripheral = self.reconnectingPeripherals[host] {
+                    self.centralManager?.cancelPeripheralConnection(peripheral)
+                } else {
+                    _ = self.reconnectTracker.handleTermination(
+                        host: host, hasActiveSession: activeSessions.contains(host))
+                }
+            }
+            self.attemptReconnections()
+        }
+    }
+
+    /// Selects saved BLE hosts that should be woken for currently present, unmatched USB screens.
+    static func hostsToReconnect(
+        pairings: [String: UUID],
+        presentScreenIDs: Set<String>,
+        matchedScreenIDs: Set<String>,
+        connectedHosts: Set<UUID>
+    ) -> Set<UUID> {
+        let unmatchedScreens = presentScreenIDs.subtracting(matchedScreenIDs)
+        guard !unmatchedScreens.isEmpty else { return [] }
+        let matchedHosts = Set(matchedScreenIDs.compactMap { pairings[$0] })
+        var candidates = Set(unmatchedScreens.compactMap { pairings[$0] })
+        if unmatchedScreens.contains(where: { pairings[$0] == nil }) {
+            candidates.formUnion(Set(pairings.values).subtracting(matchedHosts))
+        }
+        return candidates.subtracting(connectedHosts)
     }
 
     /// Phones subscribed to at least one input report.
     var connectedHosts: [UUID] {
         queue.sync { hostsWithInput }
+    }
+
+    /// Saved hosts with an active or queued bounded BLE link attempt that have
+    /// not yet subscribed to any HID input report.
+    var reconnectingHosts: Set<UUID> {
+        queue.sync {
+            reconnectTracker.reconnectingHosts(activeSessions: Set(connections.sessions.keys))
+        }
+    }
+
+    /// Pointer report characteristics currently subscribed for the host's live session.
+    func subscribedPointerReports(for host: UUID, session: UUID?) -> Set<ReportID> {
+        queue.sync {
+            guard manager?.state == .poweredOn, published else { return [] }
+            var reports: Set<ReportID> = []
+            for report in [ReportID.absolutePointer, .relativeMouse]
+            where connections.isReady(report: report, host: host, session: session) {
+                reports.insert(report)
+            }
+            return reports
+        }
     }
 
     private var hostsWithInput: [UUID] {
@@ -191,6 +262,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
         guard !servicesToAdd.isEmpty else {
             published = true
             advertise()
+            attemptReconnections()
             return
         }
         let service = servicesToAdd.removeFirst()
@@ -286,18 +358,34 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
         }
     }
 
+    /// Records a GATT characteristic subscription without enqueuing unsolicited
+    /// input notifications. Initial idle report values are served on demand via
+    /// GATT Read (`didReceiveRead`); pushing zeroed pointer reports on CCCD
+    /// subscription moves `absolutePointer` to `(0, 0)` and wakes AssistiveTouch's
+    /// on-screen cursor whenever an unplugged iPhone reconnects over BLE.
+    @discardableResult
+    static func recordSubscription(
+        _ channel: HIDConnectionState.Channel,
+        host: UUID,
+        connections: inout HIDConnectionState,
+        reconnectTracker: inout HIDReconnectTracker
+    ) -> Bool {
+        connections.subscribe(channel, host: host)
+        guard channel.isInput else { return false }
+        reconnectTracker.noteSessionEstablished(host)
+        return true
+    }
+
     func peripheralManager(
         _ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic
     ) {
         guard published, peripheral.state == .poweredOn, let channel = channel(for: characteristic) else { return }
         remember(central)
-        connections.subscribe(channel, host: central.identifier)
+        let establishedInput = Self.recordSubscription(
+            channel, host: central.identifier,
+            connections: &connections, reconnectTracker: &reconnectTracker)
         log("subscribe \(characteristic.uuid) \(describe(characteristic)) from \(central.identifier)")
-        if case .report(let id) = channel {
-            connections.enqueue(
-                channel, data: Data(count: Self.length(id)), host: central.identifier,
-                session: connections.sessions[central.identifier])
-            drain()
+        if establishedInput {
             hostsChanged()
         }
     }
@@ -329,6 +417,13 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
         serviceBeingAdded = nil
         inputs.removeAll()
         published = false
+        for host in reconnectTracker.cancelEstablishedOnPeripheralReset() {
+            if let peripheral = reconnectingPeripherals[host] {
+                centralManager?.cancelPeripheralConnection(peripheral)
+            } else {
+                _ = reconnectTracker.handleTermination(host: host, hasActiveSession: false)
+            }
+        }
     }
 
     // MARK: Helpers
@@ -346,13 +441,15 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
             count == 0 ? "advertising as \(localName)" : "\(count) connected, advertising as \(localName)"
     }
 
-    /// Stop at the first rejected notification. CoreBluetooth resumes this FIFO
-    /// through peripheralManagerIsReady; removing it early would lose input.
+    /// Stop a host at its first rejected notification so per-host FIFO order is
+    /// preserved, while continuing to drain other subscribed centrals so a
+    /// stalled or suspended peer cannot head-of-line block active phones.
     private func drain() {
         guard manager?.state == .poweredOn, published else { return }
-        while let report = connections.nextPendingReport() {
+        var blockedHosts: Set<UUID> = []
+        while let (index, report) = connections.nextPendingReportIndex(excludingHosts: blockedHosts) {
             guard let characteristic = characteristic(for: report.channel), let central = centrals[report.host] else {
-                connections.removeFirst()
+                connections.removePending(at: index)
                 continue
             }
             let sent = manager.updateValue(report.data, for: characteristic, onSubscribedCentrals: [central])
@@ -364,8 +461,11 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
                     "pointer notify channel=\(report.channel) \([UInt8](report.data)) accepted=\(sent) host=\(report.host)"
                 )
             }
-            guard sent else { return }
-            connections.removeFirst()
+            guard sent else {
+                blockedHosts.insert(report.host)
+                continue
+            }
+            connections.removePending(at: index)
         }
     }
 
@@ -419,5 +519,110 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     private func describe(_ characteristic: CBCharacteristic) -> String {
         if let id = inputs.first(where: { $0.value === characteristic })?.key { return "(\(id))" }
         return ""
+    }
+
+    // MARK: Bonded host BLE link initiation
+
+    private func redactedHost(_ host: UUID) -> String {
+        tracePointer ? host.uuidString : "\(host.uuidString.prefix(8))…"
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        if central.state == .poweredOn {
+            attemptReconnections()
+        } else {
+            reconnectTracker.resetForCentralPowerOff()
+            reconnectingPeripherals.removeAll()
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        log("BLE link connected to saved host \(redactedHost(peripheral.identifier))")
+    }
+
+    func centralManager(
+        _ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?
+    ) {
+        handleCentralTermination(for: peripheral.identifier)
+    }
+
+    func centralManager(
+        _ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?
+    ) {
+        handleCentralTermination(for: peripheral.identifier)
+    }
+
+    private func handleCentralTermination(for host: UUID) {
+        reconnectingPeripherals[host] = nil
+        let hasSession = connections.sessions[host] != nil
+        switch reconnectTracker.handleTermination(host: host, hasActiveSession: hasSession) {
+        case .none:
+            break
+        case .retryNow:
+            attemptReconnections()
+        case .scheduleBackoff(let token, let delay):
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                let active = self.connections.sessions[host] != nil
+                if self.reconnectTracker.completeBackoff(
+                    host: host, token: token, hasActiveSession: active)
+                {
+                    self.attemptReconnections()
+                }
+            }
+        case .notifyChanged:
+            onHostsChanged?()
+        }
+    }
+
+    private func attemptReconnections() {
+        guard manager?.state == .poweredOn, published,
+            let centralManager, centralManager.state == .poweredOn
+        else { return }
+        let activeSessions = Set(connections.sessions.keys)
+        let missing = reconnectTracker.connectableHosts(activeSessions: activeSessions)
+        guard !missing.isEmpty else { return }
+        let peripherals = centralManager.retrievePeripherals(withIdentifiers: Array(missing))
+        let retrievedIDs = Set(peripherals.map(\.identifier))
+        var missingUnretrievable = false
+        for unretrievable in missing.subtracting(retrievedIDs) {
+            reconnectTracker.markUnretrievable(unretrievable)
+            missingUnretrievable = true
+        }
+        for peripheral in peripherals {
+            let host = peripheral.identifier
+            reconnectingPeripherals[host] = peripheral
+            let attempt = reconnectTracker.beginConnecting(host)
+            log("initiating BLE link to saved host \(redactedHost(host))")
+            centralManager.connect(peripheral, options: nil)
+            queue.asyncAfter(deadline: .now() + reconnectTimeout) { [weak self] in
+                guard let self else { return }
+                let hasSession = self.connections.sessions[host] != nil
+                guard
+                    self.reconnectTracker.markTimedOut(
+                        host: host, attempt: attempt, hasActiveSession: hasSession)
+                else { return }
+                if let active = self.reconnectingPeripherals[host] {
+                    self.centralManager?.cancelPeripheralConnection(active)
+                } else {
+                    self.handleCentralTermination(for: host)
+                }
+                if (self.reconnectTracker.attemptsUsed[host] ?? 0) >= HIDReconnectTracker.maxAutomaticAttempts {
+                    self.onHostsChanged?()
+                }
+            }
+        }
+        if missingUnretrievable {
+            onHostsChanged?()
+        }
+    }
+
+    private func cancelAllReconnections() {
+        for host in reconnectTracker.cancelAllForStop() {
+            if let peripheral = reconnectingPeripherals[host] {
+                centralManager?.cancelPeripheralConnection(peripheral)
+            }
+        }
+        reconnectingPeripherals.removeAll()
     }
 }

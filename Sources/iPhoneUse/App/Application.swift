@@ -40,6 +40,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         windows.stop()
+        let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Application.shutdownWaitTimeout)
+        if !stopResult.isClean {
+            log(
+                "capture shutdown incomplete: captureDrained=\(stopResult.captureDrained), usbRestored=\(stopResult.usbRestored)"
+            )
+        }
+        HIDPeripheral.shared.stop()
     }
 
     @objc private func showAllDevices(_ sender: Any?) { windows.showAllDevices() }
@@ -124,6 +131,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// Owns the startup sequence shared by SwiftPM and the packaged application.
 /// MCP mode bypasses this path entirely and never starts AppKit or hardware.
 enum Application {
+    static let shutdownWaitTimeout: TimeInterval = 3.0
+
+    static func terminationExitCode(for stopResult: ScreenCaptureStopResult) -> Int32 {
+        stopResult.isClean ? 0 : 1
+    }
+
     static func run() {
         let port = UInt16(ProcessInfo.processInfo.environment["IPHONE_USE_PORT"] ?? "") ?? 7390
 
@@ -153,8 +166,29 @@ enum Application {
 
         // NSApplication's delegate is weak. Retain both process-owned services until
         // the run loop exits, even when this entry point is optimized in release builds.
-        withExtendedLifetime((appDelegate, server)) {
+        let signalSources = installTerminationSignals(server: server)
+        withExtendedLifetime((appDelegate, server, signalSources)) {
             app.run()
+        }
+    }
+
+    private static func installTerminationSignals(server: HTTPServer) -> [DispatchSourceSignal] {
+        [SIGINT, SIGTERM].map { sig in
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler {
+                server.stop()
+                let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Self.shutdownWaitTimeout)
+                if !stopResult.isClean {
+                    log(
+                        "capture shutdown incomplete: captureDrained=\(stopResult.captureDrained), usbRestored=\(stopResult.usbRestored)"
+                    )
+                }
+                HIDPeripheral.shared.stop()
+                exit(Self.terminationExitCode(for: stopResult))
+            }
+            source.resume()
+            return source
         }
     }
 }
