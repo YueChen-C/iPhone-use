@@ -275,4 +275,174 @@ final class HIDConnectionStateTests: XCTestCase {
         latestIdentityAllowed = false
         XCTAssertNil(state.nextPendingReport())
     }
+
+    func testHostsToReconnectSelectsSavedHostForUnmatchedScreenWhileIgnoringUnrelatedWatch() {
+        let phoneA = UUID()
+        let phoneB = UUID()
+        let watch = UUID()
+        let pairings = ["screen-a": phoneA, "screen-b": phoneB]
+
+        // Unrelated CloudPaired Watch connected, phoneA still dormant over BLE.
+        XCTAssertEqual(
+            HIDPeripheral.hostsToReconnect(
+                pairings: pairings, presentScreenIDs: ["screen-a"],
+                matchedScreenIDs: [], connectedHosts: [watch]),
+            [phoneA])
+
+        // Once phoneA connects or matches, or when no USB screen is present, no wake is needed.
+        XCTAssertTrue(
+            HIDPeripheral.hostsToReconnect(
+                pairings: pairings, presentScreenIDs: ["screen-a"],
+                matchedScreenIDs: [], connectedHosts: [watch, phoneA]
+            ).isEmpty)
+        XCTAssertTrue(
+            HIDPeripheral.hostsToReconnect(
+                pairings: pairings, presentScreenIDs: ["screen-a"],
+                matchedScreenIDs: ["screen-a"], connectedHosts: []
+            ).isEmpty)
+        XCTAssertTrue(
+            HIDPeripheral.hostsToReconnect(
+                pairings: pairings, presentScreenIDs: [],
+                matchedScreenIDs: [], connectedHosts: []
+            ).isEmpty)
+
+        // Replaced USB screen ID wakes saved hosts not already matched to another live screen.
+        XCTAssertEqual(
+            HIDPeripheral.hostsToReconnect(
+                pairings: pairings, presentScreenIDs: ["screen-b", "screen-replaced"],
+                matchedScreenIDs: ["screen-b"], connectedHosts: [phoneB]),
+            [phoneA])
+    }
+
+    func testReconnectTrackerQueuesRetryAcrossAsyncCancelWithoutDroppingNewAttempt() {
+        let saved = UUID()
+        var tracker = HIDReconnectTracker()
+
+        XCTAssertTrue(
+            tracker.updateTargets([saved], activeSessions: [], resetExhausted: true).isEmpty)
+        XCTAssertEqual(tracker.connectableHosts(activeSessions: []), [saved])
+        let attempt1 = tracker.beginConnecting(saved)
+        XCTAssertEqual(tracker.reconnectingHosts(activeSessions: []), [saved])
+
+        // Attempt 1 times out and enters cancelling while waiting for CoreBluetooth's callback.
+        XCTAssertTrue(tracker.markTimedOut(host: saved, attempt: attempt1, hasActiveSession: false))
+        XCTAssertEqual(tracker.phases[saved], .cancelling(attempt: attempt1, retryDesired: false))
+
+        // A fresh request arrives before didDisconnectPeripheral fires; it must defer connect
+        // until cancellation finishes so the late callback cannot delete Attempt 2.
+        XCTAssertTrue(
+            tracker.updateTargets([saved], activeSessions: [], resetExhausted: true).isEmpty)
+        XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
+        XCTAssertEqual(tracker.phases[saved], .cancelling(attempt: attempt1, retryDesired: true))
+        XCTAssertEqual(tracker.reconnectingHosts(activeSessions: []), [saved])
+
+        // Now Attempt 1's late disconnect callback arrives and cleanly triggers Attempt 2.
+        XCTAssertEqual(
+            tracker.handleTermination(host: saved, hasActiveSession: false),
+            .retryNow)
+        XCTAssertEqual(tracker.connectableHosts(activeSessions: []), [saved])
+        let attempt2 = tracker.beginConnecting(saved)
+        XCTAssertNotEqual(attempt2, attempt1)
+        XCTAssertEqual(tracker.reconnectingHosts(activeSessions: []), [saved])
+    }
+
+    func testReconnectTrackerBoundsRetriesAndRecoversMidSessionDisconnect() {
+        let saved = UUID()
+        var tracker = HIDReconnectTracker()
+        _ = tracker.updateTargets([saved], activeSessions: [], resetExhausted: true)
+
+        // Attempt 1 fails -> backoff 2s.
+        _ = tracker.beginConnecting(saved)
+        guard
+            case .scheduleBackoff(let token1, let delay1) = tracker.handleTermination(
+                host: saved, hasActiveSession: false)
+        else {
+            return XCTFail("expected first backoff")
+        }
+        XCTAssertEqual(delay1, 2.0)
+        XCTAssertEqual(tracker.reconnectingHosts(activeSessions: []), [saved])
+        XCTAssertTrue(tracker.completeBackoff(host: saved, token: token1, hasActiveSession: false))
+
+        // Attempt 2 fails -> backoff 6s.
+        _ = tracker.beginConnecting(saved)
+        guard
+            case .scheduleBackoff(let token2, let delay2) = tracker.handleTermination(
+                host: saved, hasActiveSession: false)
+        else {
+            return XCTFail("expected second backoff")
+        }
+        XCTAssertEqual(delay2, 6.0)
+        XCTAssertTrue(tracker.completeBackoff(host: saved, token: token2, hasActiveSession: false))
+
+        // Attempt 3 fails -> budget exhausted; no endless 12-second loop.
+        _ = tracker.beginConnecting(saved)
+        XCTAssertEqual(
+            tracker.handleTermination(host: saved, hasActiveSession: false),
+            .notifyChanged)
+        XCTAssertTrue(tracker.reconnectingHosts(activeSessions: []).isEmpty)
+        XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
+
+        // Passive host-change re-evaluation keeps the exhausted budget quiet.
+        _ = tracker.updateTargets([saved], activeSessions: [], resetExhausted: false)
+        XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
+
+        // Explicit /match or USB event resets budget; active session also resets budget for
+        // later mid-session BLE drops while USB stays online.
+        _ = tracker.updateTargets([saved], activeSessions: [], resetExhausted: true)
+        _ = tracker.beginConnecting(saved)
+        tracker.noteSessionEstablished(saved)
+        XCTAssertEqual(tracker.attemptsUsed[saved], 0)
+        XCTAssertTrue(tracker.reconnectingHosts(activeSessions: [saved]).isEmpty)
+
+        // Mid-session BLE unsubscribe before central disconnect cancels stale link and retries.
+        let toCancel = tracker.updateTargets([saved], activeSessions: [], resetExhausted: false)
+        XCTAssertEqual(toCancel, [saved])
+        XCTAssertEqual(
+            tracker.handleTermination(host: saved, hasActiveSession: false),
+            .retryNow)
+        XCTAssertEqual(tracker.connectableHosts(activeSessions: []), [saved])
+    }
+
+    func testExcludedBackpressuredHostDoesNotHeadOfLineBlockOtherSubscribedPhone() throws {
+        var state = HIDConnectionState()
+        let watchHost = host
+        let phoneHost = other
+        for channel in [HIDConnectionState.Channel.report(.absolutePointer), .report(.relativeMouse)] {
+            state.subscribe(channel, host: watchHost)
+            state.subscribe(channel, host: phoneHost)
+        }
+        let watchSession = try XCTUnwrap(state.sessions[watchHost])
+        let phoneSession = try XCTUnwrap(state.sessions[phoneHost])
+
+        // Watch queues two relative reports before stalling CoreBluetooth's transmit slot.
+        state.enqueue(.report(.relativeMouse), data: Data([0, 1, 0, 0]), host: watchHost, session: watchSession)
+        state.enqueue(.report(.relativeMouse), data: Data([0, 2, 0, 0]), host: watchHost, session: watchSession)
+
+        // Phone queues one report whose identity permission later expires, followed by two valid reports.
+        var stalePhoneAllowed = true
+        state.enqueue(
+            .report(.relativeMouse), data: Data([0, 9, 0, 0]), host: phoneHost, session: phoneSession,
+            isAllowed: { stalePhoneAllowed })
+        state.enqueue(.report(.absolutePointer), data: Data([0, 10, 0, 20, 0]), host: phoneHost, session: phoneSession)
+        state.enqueue(.report(.relativeMouse), data: Data([0, 3, 0, 0]), host: phoneHost, session: phoneSession)
+        stalePhoneAllowed = false
+
+        var dropped: [Data] = []
+        var drainedPhone: [Data] = []
+        let blocked: Set<UUID> = [watchHost]
+        while let next = state.nextPendingReportIndex(
+            excludingHosts: blocked,
+            onDrop: { dropped.append($0.data) })
+        {
+            XCTAssertEqual(next.report.host, phoneHost)
+            drainedPhone.append(next.report.data)
+            state.removePending(at: next.index)
+        }
+
+        XCTAssertEqual(dropped, [Data([0, 9, 0, 0])])
+        XCTAssertEqual(drainedPhone, [Data([0, 10, 0, 20, 0]), Data([0, 3, 0, 0])])
+        // Watch's queued reports remain untouched in strict FIFO order for peripheralManagerIsReady.
+        XCTAssertEqual(state.pending.map(\.host), [watchHost, watchHost])
+        XCTAssertEqual(state.pending.map(\.data), [Data([0, 1, 0, 0]), Data([0, 2, 0, 0])])
+    }
 }

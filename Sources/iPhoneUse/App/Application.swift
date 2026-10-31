@@ -40,6 +40,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         windows.stop()
+        let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: 1.5)
+        if !stopResult.isClean {
+            log(
+                "capture shutdown incomplete: captureDrained=\(stopResult.captureDrained), usbRestored=\(stopResult.usbRestored)"
+            )
+        }
+        HIDPeripheral.shared.stop()
     }
 
     @objc private func showAllDevices(_ sender: Any?) { windows.showAllDevices() }
@@ -153,8 +160,29 @@ enum Application {
 
         // NSApplication's delegate is weak. Retain both process-owned services until
         // the run loop exits, even when this entry point is optimized in release builds.
-        withExtendedLifetime((appDelegate, server)) {
+        let signalSources = installTerminationSignals(server: server)
+        withExtendedLifetime((appDelegate, server, signalSources)) {
             app.run()
+        }
+    }
+
+    private static func installTerminationSignals(server: HTTPServer) -> [DispatchSourceSignal] {
+        [SIGINT, SIGTERM].map { sig in
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler {
+                server.stop()
+                let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: 1.5)
+                if !stopResult.isClean {
+                    log(
+                        "capture shutdown incomplete: captureDrained=\(stopResult.captureDrained), usbRestored=\(stopResult.usbRestored)"
+                    )
+                }
+                HIDPeripheral.shared.stop()
+                exit(0)
+            }
+            source.resume()
+            return source
         }
     }
 }
