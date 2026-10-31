@@ -5,8 +5,8 @@ import Foundation
 /// more than one phone is plugged in. Tap and swipe coordinates are pixels of the full
 /// screen, or of a resized screenshot when `width`/`height` or `maxEdge` say so.
 enum ControlAPI {
-    /// Coordinate actions use their existing mapping, or observed USB feedback.
-    enum Action: String {
+    /// Only absolute pointer actions require a calibrated, subscribed mouse.
+    private enum Action: String {
         case tap = "/tap"
         case swipe = "/swipe"
         case move = "/move"
@@ -171,17 +171,23 @@ enum ControlAPI {
         // very measurement that the user is trying to interrupt.
         DeviceRegistry.shared.cancelBackgroundMotion(for: device)
         let input = try DeviceRegistry.shared.input(for: device)
+        if action.requiresPointer, !input.isPointerReady {
+            // Keep readiness ahead of parameter parsing. API callers may have no window
+            // polling readiness, and a lost subscription or screen change invalidates origin.
+            input.invalidatePointerEstimate()
+            return .error(StringsAPI.current.pointerNotReady, status: 503)
+        }
+
         switch action {
-        case .tap, .swipe, .move:
-            let failure = try performPointerAction(
-                action, body: body, input: input, screenSize: device.screen.size, screenName: device.screen.name,
-                capture: { after, notBefore in
-                    guard ScreenCaptureManager.shared.isCurrent(device.screen),
-                        ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen)
-                    else { throw DeviceError("USB capture identity changed") }
-                    return try device.screen.pointerFrame(after: after, notBefore: notBefore)
-                })
-            if let failure { return failure }
+        case .tap:
+            let (x, y) = try point(body, "x", "y", on: device)
+            try input.tap(x: x, y: y, hold: (body["hold"] as? Double) ?? 0.08)
+        case .swipe:
+            let swipe = try SwipeRequest(body, screenSize: device.screen.size, screenName: device.screen.name)
+            try input.swipe(points: swipe.points, duration: swipe.duration)
+        case .move:
+            let (x, y) = try point(body, "x", "y", on: device)
+            try input.move(x: x, y: y)
         case .nudge:
             try input.nudge(
                 dx: (body["dx"] as? Int) ?? 0, dy: (body["dy"] as? Int) ?? 0,
@@ -202,65 +208,11 @@ enum ControlAPI {
         return .json(["ok": true, "device": device.id])
     }
 
-    /// Executes the same coordinate path used by HTTP, independent of discovery.
-    /// A ready mapping retains its existing behavior; visual feedback is a fallback.
-    /// Nil means the action completed; transport unavailability returns the original 503.
-    static func performPointerAction(
-        _ action: Action, body: [String: Any], input: DeviceInput,
-        screenSize: CGSize?, screenName: String,
-        capture: @escaping (UInt64?, TimeInterval) throws -> VisualPointerFrame,
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
-    ) throws -> HTTPResponse? {
-        guard action.requiresPointer else { throw DeviceError("not a coordinate pointer action") }
-        let mapped = input.isPointerReady
-        guard mapped || input.visualPointerTransportAvailable else {
-            // Preserve readiness priority over malformed parameters, including
-            // callers without a window polling subscription or capture changes.
-            input.invalidatePointerEstimate()
-            return .error(StringsAPI.current.pointerNotReady, status: 503)
-        }
-
-        switch action {
-        case .tap:
-            let (x, y) = try RequestCoordinates.point(
-                body, "x", "y", screenSize: screenSize, screenName: screenName)
-            if mapped {
-                try input.tap(x: x, y: y, hold: (body["hold"] as? Double) ?? 0.08)
-            } else {
-                let hold: Double
-                if let raw = body["hold"] {
-                    guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
-                        number.doubleValue.isFinite, (0...10).contains(number.doubleValue)
-                    else { throw DeviceError("hold must be a finite duration between 0 and 10 seconds") }
-                    hold = number.doubleValue
-                } else {
-                    hold = 0.08
-                }
-                guard let screenSize else { throw DeviceError("no USB frame for visual pointer") }
-                try input.visualTap(x: x, y: y, hold: hold, size: screenSize, capture: capture, now: now)
-            }
-        case .move:
-            let (x, y) = try RequestCoordinates.point(
-                body, "x", "y", screenSize: screenSize, screenName: screenName)
-            if mapped {
-                try input.move(x: x, y: y)
-            } else {
-                guard let screenSize else { throw DeviceError("no USB frame for visual pointer") }
-                try input.visualMove(x: x, y: y, size: screenSize, capture: capture, now: now)
-            }
-        case .swipe:
-            let swipe = try SwipeRequest(body, screenSize: screenSize, screenName: screenName)
-            if mapped {
-                try input.swipe(points: swipe.points, duration: swipe.duration)
-            } else {
-                guard let screenSize else { throw DeviceError("no USB frame for visual pointer") }
-                try input.visualSwipe(
-                    points: swipe.points, duration: swipe.duration, size: screenSize, capture: capture, now: now)
-            }
-        default:
-            throw DeviceError("not a coordinate pointer action")
-        }
-        return nil
+    private static func point(
+        _ body: [String: Any], _ xKey: String, _ yKey: String, on device: Device
+    ) throws -> (Double, Double) {
+        try RequestCoordinates.point(
+            body, xKey, yKey, screenSize: device.screen.size, screenName: device.screen.name)
     }
 }
 

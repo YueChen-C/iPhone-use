@@ -25,7 +25,6 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
 
     private var centrals: [UUID: CBCentral] = [:]
     private var connections = HIDConnectionState()
-    private let drainBarriers = HIDDrainBarrier()
     private var serviceChangedSent = Set<UUID>()
 
     private var stateDescription = "starting"
@@ -105,33 +104,6 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
                 .report(id), data: Data(bytes), host: host, session: session, isAllowed: isAllowed)
             self.drain()
         }
-    }
-
-    /// Waits for this host's reports already queued before this call to be
-    /// accepted by CoreBluetooth. This is not acknowledgement from the phone.
-    /// Call from the serial input queue after send(), never from the BLE queue:
-    /// FIFO dispatch puts registration after those asynchronous enqueue blocks.
-    func waitUntilReportsDrained(host: UUID, session: UUID?, timeout: TimeInterval) -> Bool {
-        dispatchPrecondition(condition: .notOnQueue(queue))
-        guard let session, timeout.isFinite, timeout > 0 else { return false }
-        let waiter = HIDDrainBarrier.Waiter(host: host, session: session, timeout: timeout)
-        queue.async {
-            guard self.manager?.state == .poweredOn, self.published,
-                self.centrals[host] != nil, self.connections.sessions[host] == session
-            else {
-                waiter.finish(false)
-                return
-            }
-            let pendingCount = self.connections.pending.filter {
-                $0.host == host && $0.session == session && $0.channel.isInput
-            }.count
-            self.drainBarriers.register(waiter, pendingCount: pendingCount)
-        }
-        let drained = waiter.wait()
-        if !drained {
-            queue.async { self.drainBarriers.cancel(waiter) }
-        }
-        return drained
     }
 
     // MARK: GATT database
@@ -334,9 +306,6 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
         _ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic
     ) {
         guard peripheral.state == .poweredOn, published, let channel = channel(for: characteristic) else { return }
-        if connections.pending.contains(where: { $0.host == central.identifier && $0.channel == channel }) {
-            drainBarriers.invalidate(host: central.identifier, session: connections.sessions[central.identifier])
-        }
         connections.unsubscribe(channel, host: central.identifier)
         if connections.subscriptions[central.identifier] == nil {
             centrals[central.identifier] = nil
@@ -353,7 +322,6 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     private func resetConnectionState() {
         // CoreBluetooth invalidates connections and the local GATT database on a
         // reset. Never keep notifications or DeviceInput sessions from the old database.
-        drainBarriers.invalidateAll()
         connections.reset()
         centrals.removeAll()
         serviceChangedSent.removeAll()
@@ -381,23 +349,9 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     /// Stop at the first rejected notification. CoreBluetooth resumes this FIFO
     /// through peripheralManagerIsReady; removing it early would lose input.
     private func drain() {
-        guard manager?.state == .poweredOn, published else {
-            drainBarriers.invalidateAll()
-            return
-        }
-        while true {
-            // nextPendingReport may discard stale identity/session reports.
-            // Such removal must not satisfy a waiter as if updateValue accepted it.
-            let before = drainBarriers.count > 0 ? connections.pending : []
-            let next = connections.nextPendingReport()
-            if before.count > connections.pending.count {
-                for dropped in before.prefix(before.count - connections.pending.count) {
-                    drainBarriers.invalidate(host: dropped.host, session: dropped.session)
-                }
-            }
-            guard let report = next else { return }
+        guard manager?.state == .poweredOn, published else { return }
+        while let report = connections.nextPendingReport() {
             guard let characteristic = characteristic(for: report.channel), let central = centrals[report.host] else {
-                drainBarriers.invalidate(host: report.host, session: report.session)
                 connections.removeFirst()
                 continue
             }
@@ -412,7 +366,6 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
             }
             guard sent else { return }
             connections.removeFirst()
-            drainBarriers.didAccept(host: report.host, session: report.session)
         }
     }
 
