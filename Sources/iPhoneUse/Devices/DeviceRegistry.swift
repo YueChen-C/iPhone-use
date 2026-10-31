@@ -86,9 +86,19 @@ final class DeviceRegistry {
 
     func start() {
         load()
-        ScreenCaptureManager.shared.onScreensChanged = { [weak self] in self?.scheduleMatch() }
-        HIDPeripheral.shared.onHostsChanged = { [weak self] in self?.scheduleMatch() }
+        ScreenCaptureManager.shared.onScreensChanged = { [weak self] in
+            self?.reconnectSavedBluetoothHostsIfNeeded(resetExhausted: true)
+            self?.scheduleMatch()
+        }
+        HIDPeripheral.shared.onHostsChanged = { [weak self] in
+            // Dispatch off HIDPeripheral.queue before querying queue-synchronized readers.
+            self?.matchQueue.async {
+                self?.reconnectSavedBluetoothHostsIfNeeded(resetExhausted: false)
+            }
+            self?.scheduleMatch()
+        }
         DeviceLockMonitor.shared.start()
+        reconnectSavedBluetoothHostsIfNeeded(resetExhausted: true)
     }
 
     func all() -> [Device] {
@@ -255,6 +265,7 @@ final class DeviceRegistry {
 
     func pair(_ device: Device, host: UUID) {
         store([device.id: host], motionVerified: false)
+        reconnectSavedBluetoothHostsIfNeeded(resetExhausted: true)
         scheduleMatch()
     }
 
@@ -392,10 +403,26 @@ final class DeviceRegistry {
     /// explicit matching may move pointers, with at most one delayed retry.
     @discardableResult
     func match(force: Bool = false, probe: Bool = false, allowProbing: Bool = true) -> [String: UUID] {
-        if allowProbing { ScreenCaptureManager.shared.retryIdentityVerification() }
+        if allowProbing {
+            reconnectSavedBluetoothHostsIfNeeded(resetExhausted: true)
+            ScreenCaptureManager.shared.retryIdentityVerification()
+        }
         return matchQueue.sync {
             runMatch(force: force, alwaysProbe: probe, allowProbing: allowProbing, restartProbing: allowProbing)
         }
+    }
+
+    private func reconnectSavedBluetoothHostsIfNeeded(resetExhausted: Bool) {
+        let pairings = lock.withLock { self.pairings }
+        guard !pairings.isEmpty else { return }
+        let devices = all()
+        let presentIDs = Set(devices.map(\.id))
+        let matchedIDs = Set(devices.filter { $0.host != nil }.map(\.id))
+        let connected = Set(HIDPeripheral.shared.connectedHosts)
+        let targets = HIDPeripheral.hostsToReconnect(
+            pairings: pairings, presentScreenIDs: presentIDs,
+            matchedScreenIDs: matchedIDs, connectedHosts: connected)
+        HIDPeripheral.shared.reconnectKnownHosts(targets, resetExhausted: resetExhausted)
     }
 
     // MARK: Matching
@@ -427,13 +454,29 @@ final class DeviceRegistry {
         guard ScreenCaptureManager.shared.permitsPointerAssociation else { return [:] }
         let screens = ScreenCaptureManager.shared.associationScreens
         let hosts = HIDPeripheral.shared.connectedHosts
+        let reconnectingHosts = restartProbing ? Set<UUID>() : HIDPeripheral.shared.reconnectingHosts
         if allowProbing {
+            let pointerReports = Dictionary(
+                uniqueKeysWithValues: hosts.map { host in
+                    let session = HIDPeripheral.shared.connectionSession(for: host)
+                    return (host, HIDPeripheral.shared.subscribedPointerReports(for: host, session: session))
+                })
+            if !restartProbing {
+                let hasCapturedFrame = screens.contains { $0.frame() != nil }
+                let hasReadyPointerHost = pointerReports.values.contains { !$0.isEmpty }
+                guard
+                    DevicePairingProbeSchedule.isReadyForAutomaticProbe(
+                        hasCapturedFrame: hasCapturedFrame, hasReadyPointerHost: hasReadyPointerHost)
+                else { return [:] }
+            }
             let topology = DevicePairingProbeSchedule.Topology(
                 screens: Dictionary(uniqueKeysWithValues: screens.map { ($0.id, ObjectIdentifier($0)) }),
                 sessions: Dictionary(
                     uniqueKeysWithValues: hosts.compactMap { host in
                         HIDPeripheral.shared.connectionSession(for: host).map { (host, $0) }
-                    }))
+                    }),
+                pointerReports: pointerReports,
+                reconnectingHosts: reconnectingHosts)
             let changed = probeSchedule.update(topology, restart: restartProbing)
             guard !requireChangedTopology || changed else { return [:] }
             probingCancelled = false
@@ -503,7 +546,7 @@ final class DeviceRegistry {
         let freeScreenIDs = Set(
             DevicePairingRecovery.matchingScreenIDs(
                 screenIDs: screens.map(\.id), pairings: pairings, connectedHosts: hosts,
-                recoveryBlocked: recoveryBlocked))
+                reconnectingHosts: reconnectingHosts, recoveryBlocked: recoveryBlocked))
         var freeScreens = screens.filter { freeScreenIDs.contains($0.id) }
         let freeHosts = hosts.filter { !matchedHosts.contains($0) }
         guard !freeScreens.isEmpty, !freeHosts.isEmpty else { return [:] }
@@ -639,9 +682,20 @@ final class DeviceRegistry {
         // still-connected old host before it had any calibration identity.
         // In that case, first test only truly unmapped hosts. Probe the current
         // mapping only after exactly one candidate clearly affects this screen.
+        let isCurrentSessionVerified: Bool = {
+            guard let mappedHost = pairings[screen.id],
+                let session = HIDPeripheral.shared.connectionSession(for: mappedHost)
+            else { return false }
+            return lock.withLock {
+                verifiedAssociations.contains(
+                    Association(screen: screen.associationIdentity, host: mappedHost, session: session))
+            }
+        }()
         if mismatchedIDs.isEmpty,
             let mappedHost = pairings[screen.id], hosts.contains(mappedHost),
-            RelativePointerCalibration.boundScreenID(host: mappedHost) == nil,
+            DevicePairingRecovery.shouldVerifyUnidentifiedCurrentMapping(
+                isCurrentSessionVerified: isCurrentSessionVerified,
+                boundScreenID: RelativePointerCalibration.boundScreenID(host: mappedHost)),
             let candidate = DevicePairingRecovery.currentMappingCandidate(
                 screenIDs: screens.map(\.id), pairings: pairings,
                 connectedHosts: hosts, unmatchedHosts: freeHosts)
@@ -874,13 +928,14 @@ final class DeviceRegistry {
                 && HIDPeripheral.shared.isReady(report: report, host: host, session: session)
         }
         if verifyAbsolute {
-            do {
+            func runAbsoluteTriangle(_ targets: [PointerScreenMatcher.ProbeTarget]) throws -> Bool {
+                guard targets.count == 3 else { return false }
                 let captures = try input.pairingProbe(
                     calibration: nil,
-                    firstPoint: CGPoint(x: PointerScreenMatcher.firstPoint.x, y: PointerScreenMatcher.firstPoint.y),
-                    secondPoint: CGPoint(x: PointerScreenMatcher.secondPoint.x, y: PointerScreenMatcher.secondPoint.y),
+                    firstPoint: CGPoint(x: targets[0].x, y: targets[0].y),
+                    secondPoint: CGPoint(x: targets[1].x, y: targets[1].y),
                     returnToStart: true,
-                    thirdPoint: CGPoint(x: PointerScreenMatcher.thirdPoint.x, y: PointerScreenMatcher.thirdPoint.y),
+                    thirdPoint: CGPoint(x: targets[2].x, y: targets[2].y),
                     isReady: { isReady(.absolutePointer) },
                     capture: {
                         let frames = screens.map {
@@ -890,17 +945,42 @@ final class DeviceRegistry {
                         return frames.flatMap { $0! }
                     })
                 let pixels = PointerScreenMatcher.width * PointerScreenMatcher.height
+                var sawPartialReversibleActivity = false
                 if let intermediate = captures.intermediate, let returned = captures.returned {
                     for (i, screen) in screens.enumerated() {
                         let range = (i * pixels)..<((i + 1) * pixels)
                         let frames = [captures.before, captures.after, intermediate, returned].map { Array($0[range]) }
                         let key = ObjectIdentifier(screen)
-                        evidence.scores[key] = PointerScreenMatcher.score(before: frames[0], after: frames[1])
-                        if PointerScreenMatcher.matchesAbsoluteRoundTrip(frames) {
-                            evidence.absoluteScreens.insert(key)
-                            log("absolute pointer targets verified on \(screen.name) for \(host)")
+                        let candidateScore = PointerScreenMatcher.score(
+                            before: frames[0],
+                            after: frames[1],
+                            first: targets[0],
+                            second: targets[1])
+                        evidence.scores[key] = max(evidence.scores[key] ?? .min, candidateScore)
+                        if PointerScreenMatcher.matchesAbsoluteRoundTrip(frames, targets: targets) {
+                            if evidence.absoluteScreens.insert(key).inserted {
+                                log("absolute pointer targets verified on \(screen.name) for \(host)")
+                            }
+                        } else if PointerScreenMatcher.hasReversibleTargetActivity(frames, targets: targets) {
+                            sawPartialReversibleActivity = true
                         }
                     }
+                }
+                return sawPartialReversibleActivity
+            }
+
+            do {
+                let sawPartialActivity = try runAbsoluteTriangle(PointerScreenMatcher.gutterProbeTargets)
+                let matchedUniquely =
+                    DevicePairingRecovery.absoluteProbeResults(
+                        verified: screens.map { evidence.absoluteScreens.contains(ObjectIdentifier($0)) }) != nil
+                if !matchedUniquely,
+                    sawPartialActivity,
+                    probingMayContinue(),
+                    input.inputActivitySequence == sequence,
+                    screens.allSatisfy({ screen in ScreenCaptureManager.shared.all.contains { $0 === screen } })
+                {
+                    _ = try runAbsoluteTriangle(PointerScreenMatcher.fallbackProbeTargets)
                 }
             } catch {
                 log("absolute probe \(host) unavailable: \(error)")

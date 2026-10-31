@@ -450,6 +450,200 @@ final class DevicePairingTests: XCTestCase {
                 connectedHosts: [wrongHost, trueOwner], isVerifiedOwner: isVerifiedOwner))
     }
 
+    func testAutomaticProbeReadinessAndTopologyTracksPointerReportsAndReconnectingHosts() {
+        XCTAssertFalse(
+            DevicePairingProbeSchedule.isReadyForAutomaticProbe(
+                hasCapturedFrame: false, hasReadyPointerHost: true))
+        XCTAssertFalse(
+            DevicePairingProbeSchedule.isReadyForAutomaticProbe(
+                hasCapturedFrame: true, hasReadyPointerHost: false))
+        XCTAssertTrue(
+            DevicePairingProbeSchedule.isReadyForAutomaticProbe(
+                hasCapturedFrame: true, hasReadyPointerHost: true))
+
+        let capture = NSObject()
+        let host = UUID()
+        let session = UUID()
+        let savedHost = UUID()
+        var schedule = DevicePairingProbeSchedule()
+
+        // Keyboard-only session followed by pointer report subscription updates topology.
+        let keyboardOnly = DevicePairingProbeSchedule.Topology(
+            screens: ["phone": ObjectIdentifier(capture)],
+            sessions: [host: session],
+            pointerReports: [host: []],
+            reconnectingHosts: [savedHost])
+        XCTAssertTrue(schedule.update(keyboardOnly))
+        XCTAssertFalse(schedule.update(keyboardOnly))
+
+        let pointerReady = DevicePairingProbeSchedule.Topology(
+            screens: ["phone": ObjectIdentifier(capture)],
+            sessions: [host: session],
+            pointerReports: [host: [.absolutePointer, .relativeMouse]],
+            reconnectingHosts: [savedHost])
+        XCTAssertTrue(schedule.update(pointerReady))
+
+        // Clearing an in-flight reconnection after timeout also grants a fresh probe attempt.
+        let reconnectFinished = DevicePairingProbeSchedule.Topology(
+            screens: ["phone": ObjectIdentifier(capture)],
+            sessions: [host: session],
+            pointerReports: [host: [.absolutePointer, .relativeMouse]],
+            reconnectingHosts: [])
+        XCTAssertTrue(schedule.update(reconnectFinished))
+    }
+
+    func testProbeResultToleratesSubThresholdNoiseButKeepsSmallCursorMotionUnavailable() {
+        let width = RelativePointerScreenMatcher.width
+        let base = [UInt8](repeating: 120, count: width * RelativePointerScreenMatcher.height)
+
+        // Sub-threshold compression noise (<= 12) across the screen stays a clean miss.
+        var jittered = base
+        for i in stride(from: 0, to: jittered.count, by: 7) {
+            jittered[i] = 132
+        }
+        XCTAssertEqual(
+            DevicePairingRecovery.probeResult(for: [base, base, base, jittered, base]),
+            .miss)
+
+        // A small 2x2 high-contrast block shifting 1px horizontally per frame (e.g. clipped
+        // or low-gain cursor motion) must stay `.unavailable`, never a confirmed `.miss`.
+        func smallBlockFrame(x: Int, y: Int, value: UInt8 = 220) -> [UInt8] {
+            var frame = base
+            for dy in 0..<2 {
+                for dx in 0..<2 {
+                    frame[(y + dy) * width + (x + dx)] = value
+                }
+            }
+            return frame
+        }
+        let clippedMotion = (0..<5).map { step in smallBlockFrame(x: 40 + step, y: 60) }
+        XCTAssertEqual(
+            DevicePairingRecovery.probeResult(for: clippedMotion),
+            .unavailable)
+
+        // A fading cursor in the tail (> 12 intensity delta) also remains `.unavailable`.
+        let fadingTail = [
+            base, base,
+            smallBlockFrame(x: 2, y: 60, value: 210),
+            smallBlockFrame(x: 2, y: 60, value: 160),
+            base,
+        ]
+        XCTAssertEqual(
+            DevicePairingRecovery.probeResult(for: fadingTail),
+            .unavailable)
+    }
+
+    func testCurrentSessionVerifiedAbsoluteMappingSkipsUnidentifiedRecoveryAndWaitsForReconnectingSavedHost() {
+        XCTAssertFalse(
+            DevicePairingRecovery.shouldVerifyUnidentifiedCurrentMapping(
+                isCurrentSessionVerified: true, boundScreenID: nil))
+        XCTAssertTrue(
+            DevicePairingRecovery.shouldVerifyUnidentifiedCurrentMapping(
+                isCurrentSessionVerified: false, boundScreenID: nil))
+        XCTAssertFalse(
+            DevicePairingRecovery.shouldVerifyUnidentifiedCurrentMapping(
+                isCurrentSessionVerified: false, boundScreenID: "usb-a"))
+
+        let savedHost = UUID()
+        let watchHost = UUID()
+        XCTAssertTrue(
+            DevicePairingRecovery.matchingScreenIDs(
+                screenIDs: ["usb-a"], pairings: ["usb-a": savedHost],
+                connectedHosts: [watchHost], reconnectingHosts: [savedHost],
+                recoveryBlocked: false
+            ).isEmpty)
+        XCTAssertEqual(
+            DevicePairingRecovery.matchingScreenIDs(
+                screenIDs: ["usb-a"], pairings: ["usb-a": savedHost],
+                connectedHosts: [watchHost], reconnectingHosts: [],
+                recoveryBlocked: false),
+            ["usb-a"])
+    }
+
+    func testHomeScreenGutterAndFallbackProbeTargetsAvoidSpringBoardIconBoxesAndDetectPartialMagnetism() {
+        let defaultTargets = [
+            PointerScreenMatcher.firstPoint,
+            PointerScreenMatcher.secondPoint,
+            PointerScreenMatcher.thirdPoint,
+        ]
+        XCTAssertTrue(PointerScreenMatcher.targetsAreValidProbeSet(defaultTargets))
+        XCTAssertTrue(PointerScreenMatcher.targetsAreValidProbeSet(PointerScreenMatcher.gutterProbeTargets))
+        XCTAssertTrue(PointerScreenMatcher.targetsAreValidProbeSet(PointerScreenMatcher.fallbackProbeTargets))
+        XCTAssertFalse(PointerScreenMatcher.targetsAreValidProbeSet([]))
+        XCTAssertFalse(
+            PointerScreenMatcher.targetsAreValidProbeSet([
+                (x: 0.30, y: 0.35), (x: 0.32, y: 0.36), (x: 0.70, y: 0.65),
+            ]))
+        XCTAssertFalse(
+            PointerScreenMatcher.targetsAreValidProbeSet([
+                (x: 0.45, y: 0.25), (x: 0.50, y: 0.50), (x: 0.55, y: 0.75),
+            ]))
+
+        // Standard 4-column iOS SpringBoard Home Screen icon bounds on the 90x195 thumbnail grid,
+        // plus the bottom Dock region (y >= 172). Both gutter triangles must stay in free gutters.
+        let iconColumns = [8...20, 28...40, 50...62, 70...82]
+        let iconRows = [62...74, 85...97, 108...120, 131...143, 154...166]
+        for targets in [PointerScreenMatcher.gutterProbeTargets, PointerScreenMatcher.fallbackProbeTargets] {
+            for target in targets {
+                let px = Int((target.x * Double(PointerScreenMatcher.width)).rounded())
+                let py = Int((target.y * Double(PointerScreenMatcher.height)).rounded())
+                let hitsIcon = iconColumns.contains { $0.contains(px) } && iconRows.contains { $0.contains(py) }
+                XCTAssertFalse(hitsIcon, "probe target (\(px), \(py)) landed inside a Home Screen icon box")
+                XCTAssertLessThan(py, 172, "probe target (\(px), \(py)) entered the Home Screen Dock")
+            }
+            for inverted in [false, true] {
+                let frames = [targets[0], targets[1], targets[2], targets[0]].map { point in
+                    absolutePointerFrame(
+                        Int((point.x * Double(PointerScreenMatcher.width)).rounded()),
+                        Int((point.y * Double(PointerScreenMatcher.height)).rounded()),
+                        inverted: inverted)
+                }
+                XCTAssertTrue(PointerScreenMatcher.matchesAbsoluteRoundTrip(frames, targets: targets))
+            }
+        }
+
+        // Simulate UIPointerInteraction magnetism at target 0 (a 13x13=169px morphed control highlight
+        // shifted toward an adjacent control center) while targets 1 & 2 land as compact cursors:
+        // strict `matchesAbsoluteRoundTrip` still rejects the morphed landing (thresholds unweakened),
+        // while `hasReversibleTargetActivity` detects the localized reversible activity so the single
+        // fallback trajectory runs. Silent Watch frames and non-reversing background shifts stay false.
+        let targets = PointerScreenMatcher.gutterProbeTargets
+        let width = PointerScreenMatcher.width
+        let base = [UInt8](repeating: 240, count: width * PointerScreenMatcher.height)
+        var morphedFirst = base
+        let x0 = Int(targets[0].x * Double(width))
+        let y0 = Int(targets[0].y * Double(PointerScreenMatcher.height))
+        for dy in -6...6 {
+            for dx in -4...8 {
+                let px = min(max(0, x0 + dx), width - 1)
+                let py = min(max(0, y0 + dy), PointerScreenMatcher.height - 1)
+                morphedFirst[py * width + px] = 110
+            }
+        }
+        let second = absolutePointerFrame(
+            Int((targets[1].x * Double(width)).rounded()),
+            Int((targets[1].y * Double(PointerScreenMatcher.height)).rounded()))
+        let third = absolutePointerFrame(
+            Int((targets[2].x * Double(width)).rounded()),
+            Int((targets[2].y * Double(PointerScreenMatcher.height)).rounded()))
+        let magneticFrames = [morphedFirst, second, third, morphedFirst]
+        XCTAssertFalse(PointerScreenMatcher.matchesAbsoluteRoundTrip(magneticFrames, targets: targets))
+        XCTAssertTrue(PointerScreenMatcher.hasReversibleTargetActivity(magneticFrames, targets: targets))
+
+        XCTAssertFalse(
+            PointerScreenMatcher.hasReversibleTargetActivity(
+                [base, base, base, base], targets: targets))
+        XCTAssertFalse(
+            PointerScreenMatcher.hasReversibleTargetActivity(
+                [base, morphedFirst, morphedFirst, morphedFirst], targets: targets))
+        XCTAssertFalse(
+            PointerScreenMatcher.hasReversibleTargetActivity(
+                [base, base, morphedFirst, morphedFirst], targets: targets))
+        XCTAssertFalse(
+            PointerScreenMatcher.hasReversibleTargetActivity(
+                [base, base, base, morphedFirst], targets: targets))
+    }
+
     private func absolutePointerFrame(_ x: Int, _ y: Int, inverted: Bool = false) -> [UInt8] {
         pointerFrame(x, y, width: PointerScreenMatcher.width, height: PointerScreenMatcher.height, inverted: inverted)
     }

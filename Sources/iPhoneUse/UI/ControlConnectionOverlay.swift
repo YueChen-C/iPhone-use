@@ -21,6 +21,10 @@ enum ControlConnectionStatus {
 /// Covers the complete content area, including shortcuts, while keeping the
 /// captured screen visible underneath. Window input is also gated at its source.
 final class ControlConnectionOverlay: NSView {
+    private static let controllerNameLock = NSLock()
+    private static var cachedControllerName: String?
+    private static var controllerNameLoaded = false
+
     private let title = NSTextField(labelWithString: StringsUI.current.overlayNotConnectedTitle)
     private let message = NSTextField(wrappingLabelWithString: "")
     private var hasConnected = false
@@ -74,16 +78,34 @@ final class ControlConnectionOverlay: NSView {
         let instructions = NSTextField(wrappingLabelWithString: pairingText())
         instructions.font = .systemFont(ofSize: 12)
         instructionsField = instructions
+        resolveControllerNameIfNeeded()
         return instructions
     }
 
     private func pairingText() -> String {
         let advertisedName = HIDPeripheral.shared.localName
         // The advertising name does not give this app a separate Bluetooth
-        // identity. iOS may show the Mac's controller name instead.
-        let controllerName = IOBluetoothHostController.default()?.nameAsString()?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // identity. iOS may show the Mac's controller name instead. Resolve it
+        // off the main thread so IOBluetooth initialization cannot freeze launch.
+        let controllerName = Self.controllerNameLock.withLock { Self.cachedControllerName }
         return StringsUI.current.pairingInstructions(advertisedName, controllerName)
+    }
+
+    private func resolveControllerNameIfNeeded() {
+        let alreadyLoaded = Self.controllerNameLock.withLock { Self.controllerNameLoaded }
+        guard !alreadyLoaded else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let resolved = IOBluetoothHostController.default()?.nameAsString()?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            Self.controllerNameLock.withLock {
+                Self.cachedControllerName = resolved
+                Self.controllerNameLoaded = true
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.instructionsField?.stringValue = self.pairingText()
+            }
+        }
     }
 
     private func makeTroubleshootingLabel() -> NSTextField {

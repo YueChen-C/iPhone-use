@@ -54,6 +54,8 @@ struct DevicePairingProbeSchedule {
     struct Topology: Equatable {
         let screens: [String: ObjectIdentifier]
         let sessions: [UUID: UUID]
+        var pointerReports: [UUID: Set<ReportID>] = [:]
+        var reconnectingHosts: Set<UUID> = []
     }
 
     private var topology: Topology?
@@ -86,6 +88,13 @@ struct DevicePairingProbeSchedule {
         return true
     }
 
+    /// Automatic background discovery waits for at least one captured USB frame
+    /// and one pointer report subscription so transient startup states do not
+    /// burn the topology's single delayed retry budget.
+    static func isReadyForAutomaticProbe(hasCapturedFrame: Bool, hasReadyPointerHost: Bool) -> Bool {
+        hasCapturedFrame && hasReadyPointerHost
+    }
+
     /// User input wins over both the active probe and a queued retry.
     mutating func cancel() {
         generation &+= 1
@@ -97,11 +106,32 @@ struct DevicePairingProbeSchedule {
 /// Two-frame differences rank candidates only. Identity requires the separate
 /// reversible trajectory proof; background animation can score at both targets.
 enum PointerScreenMatcher {
+    typealias ProbeTarget = (x: Double, y: Double)
+
     static let width = 90
     static let height = 195
-    static let firstPoint = (x: 0.3, y: 0.35)
-    static let secondPoint = (x: 0.7, y: 0.65)
-    static let thirdPoint = (x: 0.5, y: 0.5)
+    static let firstPoint: ProbeTarget = (x: 0.3, y: 0.35)
+    static let secondPoint: ProbeTarget = (x: 0.7, y: 0.65)
+    static let thirdPoint: ProbeTarget = (x: 0.5, y: 0.5)
+
+    /// Primary 3-point trajectory aligned with the inter-column and inter-row
+    /// gutters of the 4-column iOS Home Screen grid so SpringBoard `SBIconView`
+    /// pointer magnetism does not morph the free cursor into a full-icon highlight.
+    static let gutterProbeTargets: [ProbeTarget] = [
+        (x: 24.0 / 90.0, y: 103.0 / 195.0),
+        (x: 66.0 / 90.0, y: 126.0 / 195.0),
+        (x: 45.0 / 90.0, y: 81.0 / 195.0),
+    ]
+
+    /// Disjoint backup trajectory used at most once when the primary probe
+    /// observed localized reversible UI activity (for example, a UIKit control
+    /// with `UIPointerInteraction` morphing at one of the primary targets)
+    /// without completing all three compact cursor landings.
+    static let fallbackProbeTargets: [ProbeTarget] = [
+        (x: 24.0 / 90.0, y: 159.0 / 195.0),
+        (x: 66.0 / 90.0, y: 103.0 / 195.0),
+        (x: 45.0 / 90.0, y: 126.0 / 195.0),
+    ]
 
     struct ChangeMetrics: Equatable {
         let signal: Int
@@ -109,17 +139,27 @@ enum PointerScreenMatcher {
     }
 
     /// Buffers come from ScreenCaptureSession.thumbnail and contain width * height gray pixels.
-    static func score(before: [UInt8], after: [UInt8]) -> Int {
-        let metrics = changeMetrics(before: before, after: after)
+    static func score(
+        before: [UInt8],
+        after: [UInt8],
+        first: ProbeTarget = firstPoint,
+        second: ProbeTarget = secondPoint
+    ) -> Int {
+        let metrics = changeMetrics(before: before, after: after, first: first, second: second)
         return metrics.signal - metrics.noise
     }
 
     /// Separates changes around the two pointer targets from changes in the
     /// crossed control regions. A zero score alone is not enough to prove a
     /// miss: background activity can cancel a real signal.
-    static func changeMetrics(before: [UInt8], after: [UInt8]) -> ChangeMetrics {
-        let a = firstPoint
-        let b = secondPoint
+    static func changeMetrics(
+        before: [UInt8],
+        after: [UInt8],
+        first: ProbeTarget = firstPoint,
+        second: ProbeTarget = secondPoint
+    ) -> ChangeMetrics {
+        let a = first
+        let b = second
         let signal = min(changed(before, after, around: a), changed(before, after, around: b))
         let noise = max(changed(before, after, around: (a.x, b.y)), changed(before, after, around: (b.x, a.y)))
         return ChangeMetrics(signal: signal, noise: noise)
@@ -129,13 +169,43 @@ enum PointerScreenMatcher {
         scores.indices.sorted { scores[$0] == scores[$1] ? $0 < $1 : scores[$0] > scores[$1] }
     }
 
+    static func targetsAreValidProbeSet(_ targets: [ProbeTarget]) -> Bool {
+        guard targets.count == 3,
+            targets.allSatisfy({
+                $0.x.isFinite && $0.y.isFinite
+                    && (0.05...0.95).contains($0.x)
+                    && (0.05...0.95).contains($0.y)
+            })
+        else { return false }
+        let pixels = targets.map { (x: $0.x * Double(width), y: $0.y * Double(height)) }
+        for i in 0..<pixels.count {
+            for j in (i + 1)..<pixels.count {
+                if hypot(pixels[i].x - pixels[j].x, pixels[i].y - pixels[j].y) < 20 {
+                    return false
+                }
+            }
+        }
+        let xs = pixels.map(\.x)
+        let ys = pixels.map(\.y)
+        guard let minX = xs.min(), let maxX = xs.max(),
+            let minY = ys.min(), let maxY = ys.max()
+        else { return false }
+        return (maxX - minX) >= 30 && (maxY - minY) >= 35
+    }
+
     /// Confirms three requested landings and the return independently of identity
     /// discovery. iOS changes pointer color with its background: arrival and
     /// departure can have the same polarity at different targets. Require local
     /// reversal at each target instead of opposite polarities across the screen.
-    static func matchesAbsoluteRoundTrip(_ frames: [[UInt8]]) -> Bool {
-        guard frames.count == 4, frames.allSatisfy({ $0.count == width * height }) else { return false }
-        for (corner, point) in [firstPoint, secondPoint, thirdPoint].enumerated() {
+    static func matchesAbsoluteRoundTrip(
+        _ frames: [[UInt8]],
+        targets: [ProbeTarget] = [firstPoint, secondPoint, thirdPoint]
+    ) -> Bool {
+        guard frames.count == 4,
+            frames.allSatisfy({ $0.count == width * height }),
+            targetsAreValidProbeSet(targets)
+        else { return false }
+        for (corner, point) in targets.enumerated() {
             let x = Int(point.x * Double(width))
             let y = Int(point.y * Double(height))
             // At this target only its own frame (and A's return) may contain
@@ -172,6 +242,51 @@ enum PointerScreenMatcher {
         return true
     }
 
+    /// Detects localized arrival-and-departure pixel reversal at one or more
+    /// probe targets so a single backup trajectory can run when a primary target
+    /// hit a `UIPointerInteraction` morphing control, without re-probing silent
+    /// unrelated BLE hosts (such as an Apple Watch).
+    static func hasReversibleTargetActivity(
+        _ frames: [[UInt8]],
+        targets: [ProbeTarget] = [firstPoint, secondPoint, thirdPoint]
+    ) -> Bool {
+        guard frames.count == 4,
+            frames.allSatisfy({ $0.count == width * height }),
+            targetsAreValidProbeSet(targets)
+        else { return false }
+        for (corner, point) in targets.enumerated() {
+            let x = Int(point.x * Double(width))
+            let y = Int(point.y * Double(height))
+            let absent = (0..<3).filter { $0 != corner }
+            let occupied = frames[corner]
+            let before = frames[absent[0]]
+            let after = frames[absent[1]]
+            var arrival: Set<Int> = []
+            var departure: Set<Int> = []
+            var backgroundChanges = 0
+            var returnChanges = 0
+            for py in max(0, y - 7)...min(height - 1, y + 7) {
+                for px in max(0, x - 7)...min(width - 1, x + 7) {
+                    let i = py * width + px
+                    if abs(Int(occupied[i]) - Int(before[i])) > 12 { arrival.insert(i) }
+                    if abs(Int(occupied[i]) - Int(after[i])) > 12 { departure.insert(i) }
+                    if abs(Int(before[i]) - Int(after[i])) > 12 { backgroundChanges += 1 }
+                    if abs(Int(frames[0][i]) - Int(frames[3][i])) > 12 { returnChanges += 1 }
+                }
+            }
+            let common = arrival.intersection(departure)
+            if arrival.count >= 3,
+                departure.count >= 3,
+                common.count * 2 >= max(arrival.count, departure.count),
+                backgroundChanges <= 4,
+                returnChanges <= max(4, common.count / 4)
+            {
+                return true
+            }
+        }
+        return false
+    }
+
     /// Count pixels above the original noise threshold in a 15-by-15 region.
     private static func changed(_ before: [UInt8], _ after: [UInt8], around point: (Double, Double)) -> Int {
         let radius = 7
@@ -194,12 +309,15 @@ enum PointerScreenMatcher {
 enum DevicePairingRecovery {
     /// A blocked recovery must protect existing identities, while absent
     /// phones' historical records must not prevent discovering a new screen.
+    /// Screens whose saved host has an active outbound BLE reconnection wait
+    /// for that bounded attempt before probing unrelated connected hosts.
     static func matchingScreenIDs(
-        screenIDs: [String], pairings: [String: UUID], connectedHosts: [UUID], recoveryBlocked: Bool
+        screenIDs: [String], pairings: [String: UUID], connectedHosts: [UUID],
+        reconnectingHosts: Set<UUID> = [], recoveryBlocked: Bool
     ) -> [String] {
         screenIDs.filter { id in
             guard let host = pairings[id] else { return true }
-            return !recoveryBlocked && !connectedHosts.contains(host)
+            return !recoveryBlocked && !connectedHosts.contains(host) && !reconnectingHosts.contains(host)
         }
     }
 
@@ -222,9 +340,36 @@ enum DevicePairingRecovery {
         else { return .unavailable }
         if RelativePointerScreenMatcher.matches(frames) { return .hit }
         // A previous candidate's pointer can fade during the first capture.
-        // The stable tail still covers two distinct requested directions.
-        let tail = frames.suffix(3)
-        return tail.allSatisfy({ $0 == tail.first! }) ? .miss : .unavailable
+        // The stable tail still covers two distinct requested directions, while
+        // ignoring only sub-threshold video compression jitter (<= 12). Any
+        // above-threshold pixel change remains `.unavailable` so clipped or
+        // low-gain cursor motion is never misclassified as a confirmed `.miss`.
+        return isStableTail(Array(frames.suffix(3))) ? .miss : .unavailable
+    }
+
+    private static func isStableTail(_ tail: [[UInt8]]) -> Bool {
+        guard tail.count == 3 else { return false }
+        let a = tail[0]
+        let b = tail[1]
+        let c = tail[2]
+        for i in a.indices {
+            if abs(Int(b[i]) - Int(a[i])) > 12
+                || abs(Int(c[i]) - Int(b[i])) > 12
+                || abs(Int(c[i]) - Int(a[i])) > 12
+            {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// An association already proven by motion in the live BLE session is not an
+    /// unidentified legacy mapping, even when it uses absolute mode without a
+    /// persisted relative calibration file.
+    static func shouldVerifyUnidentifiedCurrentMapping(
+        isCurrentSessionVerified: Bool, boundScreenID: String?
+    ) -> Bool {
+        !isCurrentSessionVerified && boundScreenID == nil
     }
 
     static func shouldRequireCalibration(hasProfile: Bool, absoluteVerified: Bool) -> Bool {

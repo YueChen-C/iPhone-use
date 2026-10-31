@@ -114,12 +114,16 @@ enum ControlAPI {
             "identityState": manager.identityState.rawValue,
             "permitsPointerAssociation": manager.permitsPointerAssociation,
             "screens": manager.all.map { screen -> [String: Any] in
-                [
+                var info: [String: Any] = [
                     "physicalID": screen.id,
                     "sourceID": screen.sourceID,
                     "identityVerified": manager.identityVerified(for: screen),
                     "permitsPointerAssociation": manager.permitsPointerAssociation(for: screen),
                 ]
+                if let error = screen.captureError {
+                    info["captureError"] = error
+                }
+                return info
             },
         ]
     }
@@ -150,7 +154,13 @@ enum ControlAPI {
         let maxEdge = query["maxEdge"].flatMap(Int.init)
         guard let size = device.screen.size,
             let data = device.screen.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge)
-        else { return .error(StringsAPI.current.noFrameFromDevice(device.screen.name), status: 503) }
+        else {
+            if let error = device.screen.captureError {
+                return .error(
+                    StringsAPI.current.captureFailedFromDevice(device.screen.name, error), status: 503)
+            }
+            return .error(StringsAPI.current.noFrameFromDevice(device.screen.name), status: 503)
+        }
         let image = RequestCoordinates.imageSize(size, maxWidth: maxWidth, maxEdge: maxEdge)
         return HTTPResponse(
             contentType: png ? "image/png" : "image/jpeg",
