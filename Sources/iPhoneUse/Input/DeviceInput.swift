@@ -47,8 +47,6 @@ final class DeviceInput {
     private let inputIsAllowed: () -> Bool
     private var buttons: UInt8 = 0
     private let reportSender: (ReportID, [UInt8]) -> Void
-    private let visualReportSender: (ReportID, [UInt8], @escaping () -> Bool) -> Void
-    private let reportDrainer: (TimeInterval) -> Bool
     private let sleep: (TimeInterval) -> Void
     private var windowDragging = false
     let calibration: RelativePointerCalibration?
@@ -112,13 +110,6 @@ final class DeviceInput {
             "sessionCurrent": isCurrentSession,
             "coordinateMappingAvailable": coordinateMappingAvailable,
             "calibration": calibrationInfo,
-            "visualFeedback": [
-                "available": visualPointerTransportAvailable,
-                "actions": ["tap", "long_press", "move_pointer", "swipe"],
-                "requiresFreshObservation": true,
-                "observedTargetTolerancePixels": 3,
-                "swipePath": "estimated-after-observed-start",
-            ] as [String: Any],
         ]
     }
 
@@ -141,9 +132,7 @@ final class DeviceInput {
         inputIsAllowed: @escaping () -> Bool = { true },
         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
         reportSender: ((ReportID, [UInt8]) -> Void)? = nil,
-        reportReadiness: ((ReportID, UUID, UUID?) -> Bool)? = nil,
-        reportDrainer: ((TimeInterval) -> Bool)? = nil,
-        visualReportSender: ((ReportID, [UInt8], @escaping () -> Bool) -> Void)? = nil
+        reportReadiness: ((ReportID, UUID, UUID?) -> Bool)? = nil
     ) {
         self.host = host
         self.session = session
@@ -161,21 +150,6 @@ final class DeviceInput {
             reportSender ?? { id, bytes in
                 HIDPeripheral.shared.send(id, bytes, to: host, session: session, isAllowed: inputIsAllowed)
             }
-        if let visualReportSender {
-            self.visualReportSender = visualReportSender
-        } else if let reportSender {
-            self.visualReportSender = { id, bytes, allowed in
-                if allowed() { reportSender(id, bytes) }
-            }
-        } else {
-            self.visualReportSender = { id, bytes, allowed in
-                HIDPeripheral.shared.send(id, bytes, to: host, session: session, isAllowed: allowed)
-            }
-        }
-        self.reportDrainer =
-            reportDrainer ?? { timeout in
-                HIDPeripheral.shared.waitUntilReportsDrained(host: host, session: session, timeout: timeout)
-            }
         queue = DispatchQueue(label: "iphone-use.input.\(host)")
     }
 
@@ -187,200 +161,6 @@ final class DeviceInput {
 // MARK: - Pointer gestures
 
 extension DeviceInput {
-    /// Availability of an independent observed-position path. This deliberately
-    /// does not change the meaning of calibrated readiness or save a curve.
-    var visualPointerTransportAvailable: Bool {
-        !isRetired && session != nil && inputIsAllowed()
-            && reportReadiness(.relativeMouse, host, session)
-    }
-
-    func visualMove(
-        x: Double, y: Double, size: CGSize,
-        capture: @escaping (UInt64?, TimeInterval) throws -> VisualPointerFrame,
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
-    ) throws {
-        try performVisualPointer(x: x, y: y, hold: nil, size: size, capture: capture, now: now)
-    }
-
-    func visualTap(
-        x: Double, y: Double, hold: TimeInterval = 0.08, size: CGSize,
-        capture: @escaping (UInt64?, TimeInterval) throws -> VisualPointerFrame,
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
-    ) throws {
-        try performVisualPointer(x: x, y: y, hold: hold, size: size, capture: capture, now: now)
-    }
-
-    /// Observe the press position, then estimate a drag from the measured local
-    /// gain. Scrolling changes the background, so the path is not a 5px claim.
-    func visualSwipe(
-        points: [(Double, Double)], duration: TimeInterval, size: CGSize,
-        capture: @escaping (UInt64?, TimeInterval) throws -> VisualPointerFrame,
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
-    ) throws {
-        guard (2...128).contains(points.count), duration.isFinite, duration > 0, duration <= 5,
-            points.allSatisfy({ $0.0.isFinite && $0.1.isFinite && (0...1).contains($0.0) && (0...1).contains($0.1) })
-        else { throw DeviceError("visual swipe needs a finite path and a duration of at most 5 seconds") }
-        try performVisualPointer(
-            x: points[0].0, y: points[0].1, hold: nil, size: size,
-            drag: (points, duration), capture: capture, now: now)
-    }
-
-    private func performVisualPointer(
-        x: Double, y: Double, hold: TimeInterval?, size: CGSize,
-        drag: (points: [(Double, Double)], duration: TimeInterval)? = nil,
-        capture: @escaping (UInt64?, TimeInterval) throws -> VisualPointerFrame,
-        now: @escaping () -> TimeInterval
-    ) throws {
-        guard x.isFinite, y.isFinite, (0...1).contains(x), (0...1).contains(y),
-            size.width.isFinite, size.height.isFinite,
-            step.isFinite, step > 0, step <= 1,
-            (200...4096).contains(size.width), (300...4096).contains(size.height),
-            hold.map({ $0.isFinite && (0...10).contains($0) }) ?? true
-        else { throw DeviceError("invalid visual pointer coordinates or hold duration") }
-        // This deadline starts BEFORE queueing. A timed-out caller must never
-        // receive a delayed click when an earlier operation finally completes.
-        let deadline = now() + 40
-        let sequence = advanceMotionSequence()
-        let operation = PointerMotionSequence()
-        let operationSequence = operation.current
-        defer { operation.advance() }
-        try queue.sync {
-            try requireIdlePointer()
-            guard buttons == 0 else { throw InputError.pointerBusy }
-            clearPointerEstimate()
-            absolutePointerPosition = nil
-            defer {
-                clearPointerEstimate()
-                absolutePointerPosition = nil
-            }
-            func requireCurrent() throws {
-                guard now() < deadline, motionSequence.isCurrent(sequence),
-                    visualPointerTransportAvailable,
-                    screenSize.map({ $0() == size }) ?? true
-                else { throw DeviceError("visual pointer operation expired or its device changed") }
-            }
-            try requireCurrent()
-            let mayDeliver = { [self] in
-                now() < deadline && !isRetired && inputIsAllowed() && motionSequence.isCurrent(sequence)
-                    && operation.isCurrent(operationSequence)
-                    && (screenSize.map({ $0() == size }) ?? true)
-            }
-            let controller = VisualPointerController(
-                width: Int(size.width), height: Int(size.height),
-                send: { dx, dy in
-                    try requireCurrent()
-                    guard (-127...127).contains(dx), (-127...127).contains(dy) else {
-                        throw DeviceError("visual pointer report exceeds HID range")
-                    }
-                    self.visualReportSender(
-                        .relativeMouse, HIDReportPayload.relativeMouse(buttons: 0, dx: dx, dy: dy), mayDeliver)
-                    self.pause(self.step)
-                },
-                capture: { after, notBefore in
-                    try requireCurrent()
-                    guard self.reportDrainer(min(2, deadline - now())) else {
-                        throw DeviceError("pointer reports did not drain; no click sent")
-                    }
-                    try requireCurrent()
-                    // CoreBluetooth acceptance is not remote delivery. Wait for
-                    // a later USB frame as well; the controller checks stability.
-                    let frame = try capture(after, max(notBefore, now() + 0.15))
-                    try requireCurrent()
-                    return frame
-                }, now: now)
-            let target = CGPoint(
-                x: min(size.width - 1, x * size.width),
-                y: min(size.height - 1, y * size.height))
-            let landing = try controller.land(to: target)
-            try requireCurrent()
-            var dragReports: [(dx: Int, dy: Int, wait: TimeInterval)] = []
-            if let drag {
-                guard landing.gainX.isFinite, landing.gainY.isFinite,
-                    (0.005...256).contains(landing.gainX), (0.005...256).contains(landing.gainY)
-                else { throw DeviceError("observed pointer gain cannot safely describe a drag") }
-                let durations = swipeSegmentDurations(points: drag.points, duration: drag.duration)
-                var residualX = 0.0
-                var residualY = 0.0
-                for (index, segmentDuration) in durations.enumerated() {
-                    let count = segmentDuration / step
-                    guard count.isFinite, count <= 256 else { throw DeviceError("visual swipe exceeds report budget") }
-                    let steps = max(2, Int(count))
-                    let from = drag.points[index]
-                    let to = drag.points[index + 1]
-                    for _ in 0..<steps {
-                        residualX += (to.0 - from.0) * size.width / Double(steps) / landing.gainX
-                        residualY += (to.1 - from.1) * size.height / Double(steps) / landing.gainY
-                        guard residualX.isFinite, residualY.isFinite,
-                            abs(residualX) <= 32512, abs(residualY) <= 32512
-                        else { throw DeviceError("visual swipe exceeds report budget") }
-                        let dx = Int(residualX.rounded())
-                        let dy = Int(residualY.rounded())
-                        residualX -= Double(dx)
-                        residualY -= Double(dy)
-                        let pieces = max(1, (max(abs(dx), abs(dy)) + 126) / 127)
-                        guard dragReports.count + pieces <= 256 else {
-                            throw DeviceError("visual swipe exceeds report budget")
-                        }
-                        var sentX = 0
-                        var sentY = 0
-                        for piece in 1...pieces {
-                            let nextX = Int((Double(dx) * Double(piece) / Double(pieces)).rounded())
-                            let nextY = Int((Double(dy) * Double(piece) / Double(pieces)).rounded())
-                            let sx = nextX - sentX
-                            let sy = nextY - sentY
-                            dragReports.append((sx, sy, step + segmentDuration / Double(steps * pieces)))
-                            sentX = nextX
-                            sentY = nextY
-                        }
-                    }
-                }
-            }
-            if hold != nil || drag != nil {
-                let actionWait = (hold ?? step) + dragReports.reduce(0.0) { $0 + $1.wait }
-                guard now() + actionWait + 0.5 < deadline else {
-                    throw DeviceError("visual pointer click deadline exceeded; no click sent")
-                }
-                try requireCurrent()
-                buttons = 1
-                visualReportSender(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 1), mayDeliver)
-                defer {
-                    if buttons != 0 {
-                        buttons = 0
-                        visualReportSender(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 0), { true })
-                        // Best effort only: a disconnected host cannot confirm
-                        // release. Preserve the original operation error.
-                        _ = reportDrainer(min(1, max(0, deadline - now())))
-                    }
-                }
-                // Start hold timing only after BLE accepted the press. Otherwise
-                // backpressure can queue press and release together as a tap.
-                guard reportDrainer(min(2, max(0, deadline - now()))) else {
-                    throw DeviceError("button press delivery could not be confirmed; release was requested")
-                }
-                try requireCurrent()
-                guard now() + actionWait + 0.5 < deadline else {
-                    throw DeviceError("visual pointer hold deadline exceeded; release was requested")
-                }
-                pause(hold ?? step)
-                for report in dragReports {
-                    try requireCurrent()
-                    visualReportSender(
-                        .relativeMouse,
-                        HIDReportPayload.relativeMouse(buttons: 1, dx: report.dx, dy: report.dy), mayDeliver)
-                    pause(report.wait)
-                }
-                buttons = 0
-                // A release remains valid even if the capture disappeared or
-                // a user interrupted us after the press; session checks remain.
-                visualReportSender(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 0), { true })
-                guard reportDrainer(min(2, max(0, deadline - now()))) else {
-                    throw DeviceError("click delivery could not be confirmed; button release was requested")
-                }
-                try requireCurrent()
-            }
-        }
-    }
-
     /// Coordinates are fractions of the screen, 0...1 from the top-left corner.
     func tap(x: Double, y: Double, hold: TimeInterval = 0.08) throws {
         try performCoordinateGesture {
