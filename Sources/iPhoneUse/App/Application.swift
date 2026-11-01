@@ -153,7 +153,8 @@ enum Application {
         app.delegate = appDelegate
 
         DeviceRegistry.shared.start()
-        HIDPeripheral.shared.start()
+        HIDPeripheral.shared.start(initialDisplaySleeping: HIDPeripheral.areOnlineDisplaysAsleep())
+        let powerObservers = installPowerObservers()
         ScreenCaptureManager.shared.start()
         let server = HTTPServer(port: port, handler: ControlAPI.handle)
         do {
@@ -164,12 +165,38 @@ enum Application {
             exit(1)
         }
 
-        // NSApplication's delegate is weak. Retain both process-owned services until
-        // the run loop exits, even when this entry point is optimized in release builds.
+        // NSApplication's delegate is weak. Retain process-owned services and
+        // observers until the run loop exits, even when optimized in release builds.
         let signalSources = installTerminationSignals(server: server)
-        withExtendedLifetime((appDelegate, server, signalSources)) {
+        withExtendedLifetime((appDelegate, server, signalSources, powerObservers)) {
             app.run()
         }
+    }
+
+    private static func installPowerObservers() -> [NSObjectProtocol] {
+        let center = NSWorkspace.shared.notificationCenter
+        return [
+            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { _ in
+                log("system will sleep; unregistering Bluetooth sessions")
+                HIDPeripheral.shared.systemWillSleep()
+            },
+            center.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil, queue: nil) { _ in
+                HIDPeripheral.shared.systemWillSleep()
+            },
+            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { _ in
+                let displaysAsleep = HIDPeripheral.areOnlineDisplaysAsleep()
+                log("system did wake (displaysAsleep=\(displaysAsleep))")
+                HIDPeripheral.shared.systemDidWake(areDisplaysAsleep: displaysAsleep)
+            },
+            center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: nil) { _ in
+                log("displays did sleep")
+                HIDPeripheral.shared.screensDidSleep()
+            },
+            center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: nil) { _ in
+                log("displays did wake")
+                HIDPeripheral.shared.screensDidWake()
+            },
+        ]
     }
 
     private static func installTerminationSignals(server: HTTPServer) -> [DispatchSourceSignal] {

@@ -87,6 +87,7 @@ final class DeviceRegistry {
     func start() {
         load()
         ScreenCaptureManager.shared.onScreensChanged = { [weak self] in
+            self?.updateBluetoothUSBDemand()
             self?.reconnectSavedBluetoothHostsIfNeeded(resetExhausted: true)
             self?.scheduleMatch()
         }
@@ -98,7 +99,12 @@ final class DeviceRegistry {
             self?.scheduleMatch()
         }
         DeviceLockMonitor.shared.start()
+        updateBluetoothUSBDemand()
         reconnectSavedBluetoothHostsIfNeeded(resetExhausted: true)
+    }
+
+    private func updateBluetoothUSBDemand() {
+        HIDPeripheral.shared.setUSBScreenDemand(!ScreenCaptureManager.shared.all.isEmpty)
     }
 
     func all() -> [Device] {

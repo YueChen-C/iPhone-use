@@ -477,4 +477,142 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertEqual(tracker.phases[host], .established(attempt: attempt))
         XCTAssertEqual(tracker.attemptsUsed[host], 0)
     }
+
+    func testLifecyclePolicyStaysIdleUntilUSBOrAwakeControlWindowDemandsBluetooth() {
+        var policy = HIDLifecyclePolicy()
+        let waitingWindow = UUID()
+        let deviceWindow = UUID()
+
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .notStarted)
+        XCTAssertEqual(policy.inactiveReason?.stateDescription, "starting")
+
+        // Quiet background startup with 0 USB screens and 0 windows keeps CoreBluetooth unregistered.
+        policy.start(initialDisplaySleeping: false)
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .idleNoDemand)
+        XCTAssertEqual(policy.inactiveReason?.stateDescription, "idle (waiting for iPhone)")
+
+        // Opening Waiting for iPhone window advertises Bluetooth for pre-USB pairing.
+        policy.beginWindowDemand(waitingWindow)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+        XCTAssertNil(policy.inactiveReason)
+
+        // Placeholder replacement registers the device window before closing the waiting window.
+        policy.beginWindowDemand(deviceWindow)
+        policy.endWindowDemand(waitingWindow)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+
+        // Idempotent close of the last window with 0 USB screens suspends back to idle.
+        policy.endWindowDemand(deviceWindow)
+        policy.endWindowDemand(deviceWindow)
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .idleNoDemand)
+
+        // Plugging in an iPhone over USB with 0 open windows activates BLE for headless MCP.
+        policy.setUSBScreenDemand(true)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+        policy.setUSBScreenDemand(false)
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .idleNoDemand)
+    }
+
+    func testLifecyclePolicyBlocksDarkWakeAndResumesOnDisplayOrHeadlessWake() {
+        var policy = HIDLifecyclePolicy()
+        let windowToken = UUID()
+        policy.start(initialDisplaySleeping: false)
+        policy.setUSBScreenDemand(true)
+        policy.beginWindowDemand(windowToken)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+
+        // Entering system sleep tears down CoreBluetooth even while USB and windows are present.
+        policy.systemWillSleep()
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .systemSleeping)
+        XCTAssertEqual(policy.inactiveReason?.stateDescription, "suspended for system sleep")
+
+        // Backpack maintenance DarkWake (all online displays asleep) must NOT re-register BLE.
+        policy.systemDidWake(areDisplaysAsleep: true)
+        XCTAssertTrue(policy.isSystemSleeping)
+        XCTAssertTrue(policy.isDisplaySleeping)
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .systemSleeping)
+
+        // Opening the lid / waking displays clears DarkWake hold and resumes BLE.
+        policy.screensDidWake()
+        XCTAssertFalse(policy.isSystemSleeping)
+        XCTAssertFalse(policy.isDisplaySleeping)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+
+        // Headless desktop Mac with zero online displays (areDisplaysAsleep == false)
+        // resumes immediately on systemDidWake without requiring screensDidWake.
+        policy.systemWillSleep()
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        policy.systemDidWake(areDisplaysAsleep: false)
+        XCTAssertFalse(policy.isSystemSleeping)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+    }
+
+    func testLifecyclePolicyKeepsHeadlessUSBActiveAcrossDisplaySleepButSuspendsWindowOnlyIdle() {
+        var policy = HIDLifecyclePolicy()
+        let waitingWindow = UUID()
+        policy.start(initialDisplaySleeping: false)
+        policy.beginWindowDemand(waitingWindow)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+
+        // Display sleep with 0 USB phones suspends window-only BLE advertising immediately.
+        policy.screensDidSleep()
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .idleNoDemand)
+
+        // Headless MCP with a connected USB iPhone stays active while displays are asleep.
+        policy.setUSBScreenDemand(true)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+
+        // Permanent stop overrides all demands and ignores subsequent events.
+        policy.stop()
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .stopped)
+        XCTAssertEqual(policy.inactiveReason?.stateDescription, "stopped")
+        policy.start(initialDisplaySleeping: false)
+        policy.setUSBScreenDemand(true)
+        policy.beginWindowDemand(UUID())
+        policy.screensDidWake()
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .stopped)
+    }
+
+    func testReconnectTrackerSuspendForLifecycleTeardownPreservesTargetsAndResetsRetryBudget() {
+        var tracker = HIDReconnectTracker()
+        _ = tracker.updateTargets([host, other], activeSessions: [], resetExhausted: true)
+
+        // `host` fails twice into backoff; `other` is actively connecting when sleep occurs.
+        _ = tracker.beginConnecting(host)
+        guard
+            case .scheduleBackoff(let staleBackoffToken, _) = tracker.handleTermination(
+                host: host, hasActiveSession: false)
+        else {
+            return XCTFail("expected backoff for host")
+        }
+        let staleConnectAttempt = tracker.beginConnecting(other)
+
+        let cancelledForSleep = tracker.suspendForLifecycleTeardown()
+        XCTAssertEqual(cancelledForSleep, [other])
+        XCTAssertEqual(tracker.targets, [host, other])
+        XCTAssertTrue(tracker.phases.isEmpty)
+        XCTAssertTrue(tracker.attemptsUsed.isEmpty)
+
+        // Stale pre-sleep timer callbacks cannot mutate post-wake reconnection state.
+        XCTAssertFalse(tracker.completeBackoff(host: host, token: staleBackoffToken, hasActiveSession: false))
+        XCTAssertFalse(tracker.markTimedOut(host: other, attempt: staleConnectAttempt, hasActiveSession: false))
+
+        // On wake, both targets are immediately connectable with fresh retry budgets.
+        XCTAssertEqual(tracker.connectableHosts(activeSessions: []), [host, other])
+
+        // Permanent stop clears targets as well as active phases.
+        _ = tracker.beginConnecting(host)
+        XCTAssertEqual(tracker.cancelAllForStop(), [host])
+        XCTAssertTrue(tracker.targets.isEmpty)
+        XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
+    }
 }

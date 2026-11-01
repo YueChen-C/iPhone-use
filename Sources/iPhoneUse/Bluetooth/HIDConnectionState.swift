@@ -330,6 +330,13 @@ struct HIDReconnectTracker {
 
     mutating func cancelAllForStop() -> [UUID] {
         targets.removeAll()
+        return suspendForLifecycleTeardown()
+    }
+
+    /// Cancels active outbound central links across temporary CoreBluetooth teardown
+    /// (system sleep or idle suspension) while preserving `targets` and resetting
+    /// retry budgets so resumption wakes still-needed saved hosts cleanly.
+    mutating func suspendForLifecycleTeardown() -> [UUID] {
         var toCancel: [UUID] = []
         for (host, phase) in phases {
             switch phase {
@@ -347,5 +354,115 @@ struct HIDReconnectTracker {
     mutating func resetForCentralPowerOff() {
         phases.removeAll()
         attemptsUsed.removeAll()
+    }
+}
+
+/// Pure power and demand gate deciding when `HIDPeripheral` should hold live
+/// CoreBluetooth XPC sessions (`CBPeripheralManager` / `CBCentralManager`).
+///
+/// Unregistering CoreBluetooth managers during system sleep, DarkWake, or idle
+/// background residency (no USB iPhone screen and no open control window on an
+/// awake display) prevents bonded iPhones or Watches from keeping an active BLE
+/// ATT link that triggers `AP wakeup by LE Data` or drains battery unplugged.
+struct HIDLifecyclePolicy: Equatable {
+    enum InactiveReason: Equatable {
+        case notStarted
+        case stopped
+        case systemSleeping
+        case idleNoDemand
+
+        var stateDescription: String {
+            switch self {
+            case .notStarted:
+                return "starting"
+            case .stopped:
+                return "stopped"
+            case .systemSleeping:
+                return "suspended for system sleep"
+            case .idleNoDemand:
+                return "idle (waiting for iPhone)"
+            }
+        }
+    }
+
+    private(set) var isStarted = false
+    private(set) var isPermanentlyStopped = false
+    private(set) var isSystemSleeping = false
+    private(set) var isDisplaySleeping = false
+    private(set) var hasPresentUSBScreens = false
+    private(set) var activeWindowTokens: Set<UUID> = []
+
+    var hasOpenControlWindows: Bool {
+        !activeWindowTokens.isEmpty
+    }
+
+    /// Open control windows show Bluetooth pairing instructions only while at least
+    /// one display is awake. Headless USB/MCP control remains active across display
+    /// blanking (`isDisplaySleeping`) until actual system sleep (`isSystemSleeping`).
+    var hasEffectiveDemand: Bool {
+        hasPresentUSBScreens || (hasOpenControlWindows && !isDisplaySleeping)
+    }
+
+    var shouldRunCoreBluetooth: Bool {
+        isStarted && !isPermanentlyStopped && !isSystemSleeping && hasEffectiveDemand
+    }
+
+    var inactiveReason: InactiveReason? {
+        if isPermanentlyStopped { return .stopped }
+        if !isStarted { return .notStarted }
+        if isSystemSleeping { return .systemSleeping }
+        if !hasEffectiveDemand { return .idleNoDemand }
+        return nil
+    }
+
+    mutating func start(initialDisplaySleeping: Bool = false) {
+        guard !isPermanentlyStopped, !isStarted else { return }
+        isStarted = true
+        isDisplaySleeping = initialDisplaySleeping
+    }
+
+    mutating func stop() {
+        isStarted = false
+        isPermanentlyStopped = true
+        hasPresentUSBScreens = false
+        activeWindowTokens.removeAll()
+    }
+
+    mutating func systemWillSleep() {
+        isSystemSleeping = true
+    }
+
+    /// Maintenance DarkWakes run while all online displays remain asleep; keeping
+    /// `isSystemSleeping = true` until a non-dark wake or `screensDidWake` prevents
+    /// re-publishing GATT services inside a closed backpack. Headless Macs with zero
+    /// online displays pass `areDisplaysAsleep == false` and resume immediately.
+    mutating func systemDidWake(areDisplaysAsleep: Bool) {
+        isDisplaySleeping = areDisplaysAsleep
+        if !areDisplaysAsleep {
+            isSystemSleeping = false
+        }
+    }
+
+    mutating func screensDidSleep() {
+        isDisplaySleeping = true
+    }
+
+    mutating func screensDidWake() {
+        isDisplaySleeping = false
+        isSystemSleeping = false
+    }
+
+    mutating func setUSBScreenDemand(_ hasScreens: Bool) {
+        guard !isPermanentlyStopped else { return }
+        hasPresentUSBScreens = hasScreens
+    }
+
+    mutating func beginWindowDemand(_ token: UUID) {
+        guard !isPermanentlyStopped else { return }
+        activeWindowTokens.insert(token)
+    }
+
+    mutating func endWindowDemand(_ token: UUID) {
+        activeWindowTokens.remove(token)
     }
 }
