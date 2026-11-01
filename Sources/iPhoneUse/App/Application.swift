@@ -153,7 +153,7 @@ enum Application {
         app.delegate = appDelegate
 
         DeviceRegistry.shared.start()
-        HIDPeripheral.shared.start(initialDisplaySleeping: HIDPeripheral.areOnlineDisplaysAsleep())
+        HIDPeripheral.shared.start(initialDisplayState: HIDPeripheral.onlineDisplayState())
         let powerObservers = installPowerObservers()
         ScreenCaptureManager.shared.start()
         let server = HTTPServer(port: port, handler: ControlAPI.handle)
@@ -184,9 +184,9 @@ enum Application {
                 HIDPeripheral.shared.systemWillSleep()
             },
             center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { _ in
-                let displaysAsleep = HIDPeripheral.areOnlineDisplaysAsleep()
-                log("system did wake (displaysAsleep=\(displaysAsleep))")
-                HIDPeripheral.shared.systemDidWake(areDisplaysAsleep: displaysAsleep)
+                let displayState = HIDPeripheral.onlineDisplayState()
+                log("system did wake (displayState=\(displayState))")
+                HIDPeripheral.shared.systemDidWake(displayState: displayState)
             },
             center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: nil) { _ in
                 log("displays did sleep")

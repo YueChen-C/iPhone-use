@@ -229,6 +229,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     private var startupReconciliationGate = CaptureStartupReconciliationGate()
     private var captureDiscoveryEnabled = false
     private var lifecycleGeneration: UInt64 = 0
+    private var usbDemandRevision: UInt64 = 0
     private var isStopped = false
 
     /// Called when a phone's screen appears or goes away.
@@ -385,6 +386,15 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
 
     var all: [ScreenCaptureSession] {
         lock.withLock { screens.values.sorted { $0.name < $1.name } }
+    }
+
+    /// Captures a linearizable snapshot of present USB screens together with a strictly
+    /// monotonic revision minted under `lock`, preventing out-of-order demand updates.
+    func sampleScreensWithRevision() -> (screens: [ScreenCaptureSession], revision: UInt64) {
+        lock.withLock {
+            usbDemandRevision &+= 1
+            return (screens.values.sorted { $0.name < $1.name }, usbDemandRevision)
+        }
     }
 
     var identityState: ScreenCaptureIdentityState { lock.withLock { verificationState } }

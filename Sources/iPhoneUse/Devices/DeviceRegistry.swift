@@ -87,8 +87,9 @@ final class DeviceRegistry {
     func start() {
         load()
         ScreenCaptureManager.shared.onScreensChanged = { [weak self] in
-            self?.updateBluetoothUSBDemand()
-            self?.reconnectSavedBluetoothHostsIfNeeded(resetExhausted: true)
+            self?.matchQueue.async {
+                self?.syncBluetoothForCurrentScreens(resetExhausted: true)
+            }
             self?.scheduleMatch()
         }
         HIDPeripheral.shared.onHostsChanged = { [weak self] in
@@ -99,21 +100,29 @@ final class DeviceRegistry {
             self?.scheduleMatch()
         }
         DeviceLockMonitor.shared.start()
-        updateBluetoothUSBDemand()
-        reconnectSavedBluetoothHostsIfNeeded(resetExhausted: true)
+        matchQueue.async { [weak self] in
+            self?.syncBluetoothForCurrentScreens(resetExhausted: true)
+        }
     }
 
-    private func updateBluetoothUSBDemand() {
-        HIDPeripheral.shared.setUSBScreenDemand(!ScreenCaptureManager.shared.all.isEmpty)
+    private func syncBluetoothForCurrentScreens(resetExhausted: Bool) {
+        dispatchPrecondition(condition: .onQueue(matchQueue))
+        let snapshot = ScreenCaptureManager.shared.sampleScreensWithRevision()
+        HIDPeripheral.shared.setUSBScreenDemand(!snapshot.screens.isEmpty, revision: snapshot.revision)
+        reconnectSavedBluetoothHosts(for: snapshot.screens, resetExhausted: resetExhausted)
     }
 
     func all() -> [Device] {
+        buildDevices(from: ScreenCaptureManager.shared.all)
+    }
+
+    private func buildDevices(from screens: [ScreenCaptureSession]) -> [Device] {
         let sessions = Dictionary(
             uniqueKeysWithValues: HIDPeripheral.shared.hostDetails.compactMap { detail in
                 detail.session.map { (detail.host, $0) }
             })
         let (pairings, verified) = lock.withLock { (self.pairings, verifiedAssociations) }
-        return ScreenCaptureManager.shared.all.map { screen in
+        return screens.map { screen in
             let host = pairings[screen.id].flatMap { host -> UUID? in
                 guard ScreenCaptureManager.shared.isCurrent(screen), let session = sessions[host],
                     verified.contains(
@@ -419,9 +428,15 @@ final class DeviceRegistry {
     }
 
     private func reconnectSavedBluetoothHostsIfNeeded(resetExhausted: Bool) {
+        reconnectSavedBluetoothHosts(for: ScreenCaptureManager.shared.all, resetExhausted: resetExhausted)
+    }
+
+    private func reconnectSavedBluetoothHosts(
+        for screens: [ScreenCaptureSession], resetExhausted: Bool
+    ) {
         let pairings = lock.withLock { self.pairings }
         guard !pairings.isEmpty else { return }
-        let devices = all()
+        let devices = buildDevices(from: screens)
         let presentIDs = Set(devices.map(\.id))
         let matchedIDs = Set(devices.filter { $0.host != nil }.map(\.id))
         let connected = Set(HIDPeripheral.shared.connectedHosts)

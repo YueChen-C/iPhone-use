@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// State owned exclusively by HIDPeripheral's Bluetooth queue. Keeping it separate
@@ -357,6 +358,32 @@ struct HIDReconnectTracker {
     }
 }
 
+/// Online display power classification derived from CoreGraphics display queries.
+/// Separating `.unknown` (query failure) from `.noOnlineDisplays` (confirmed headless Mac)
+/// prevents a transient CoreGraphics error during DarkWake from clearing the sleep gate.
+enum HIDOnlineDisplayState: Equatable, Sendable {
+    case noOnlineDisplays
+    case allAsleep
+    case atLeastOneAwake
+    case unknown
+
+    static func classify(
+        countQueryError: CGError,
+        reportedCount: UInt32,
+        listQueryError: CGError? = nil,
+        resolvedCount: UInt32 = 0,
+        asleepFlags: [Bool] = []
+    ) -> HIDOnlineDisplayState {
+        guard countQueryError == .success else { return .unknown }
+        guard reportedCount > 0 else { return .noOnlineDisplays }
+        guard let listQueryError, listQueryError == .success else { return .unknown }
+        guard resolvedCount > 0 else { return .noOnlineDisplays }
+        let count = Int(resolvedCount)
+        guard asleepFlags.count >= count else { return .unknown }
+        return asleepFlags.prefix(count).allSatisfy { $0 } ? .allAsleep : .atLeastOneAwake
+    }
+}
+
 /// Pure power and demand gate deciding when `HIDPeripheral` should hold live
 /// CoreBluetooth XPC sessions (`CBPeripheralManager` / `CBCentralManager`).
 ///
@@ -390,6 +417,7 @@ struct HIDLifecyclePolicy: Equatable {
     private(set) var isSystemSleeping = false
     private(set) var isDisplaySleeping = false
     private(set) var hasPresentUSBScreens = false
+    private(set) var lastUSBDemandRevision: UInt64 = 0
     private(set) var activeWindowTokens: Set<UUID> = []
 
     var hasOpenControlWindows: Bool {
@@ -415,10 +443,15 @@ struct HIDLifecyclePolicy: Equatable {
         return nil
     }
 
-    mutating func start(initialDisplaySleeping: Bool = false) {
+    mutating func start(initialDisplayState: HIDOnlineDisplayState = .atLeastOneAwake) {
         guard !isPermanentlyStopped, !isStarted else { return }
         isStarted = true
-        isDisplaySleeping = initialDisplaySleeping
+        switch initialDisplayState {
+        case .atLeastOneAwake, .noOnlineDisplays:
+            isDisplaySleeping = false
+        case .allAsleep, .unknown:
+            isDisplaySleeping = true
+        }
     }
 
     mutating func stop() {
@@ -433,13 +466,18 @@ struct HIDLifecyclePolicy: Equatable {
     }
 
     /// Maintenance DarkWakes run while all online displays remain asleep; keeping
-    /// `isSystemSleeping = true` until a non-dark wake or `screensDidWake` prevents
-    /// re-publishing GATT services inside a closed backpack. Headless Macs with zero
-    /// online displays pass `areDisplaysAsleep == false` and resume immediately.
-    mutating func systemDidWake(areDisplaysAsleep: Bool) {
-        isDisplaySleeping = areDisplaysAsleep
-        if !areDisplaysAsleep {
+    /// `isSystemSleeping = true` until a positive non-dark wake (`.atLeastOneAwake` or
+    /// confirmed headless `.noOnlineDisplays`) or `screensDidWake` prevents re-publishing
+    /// GATT services inside a closed backpack, even if a CoreGraphics query returns `.unknown`.
+    mutating func systemDidWake(displayState: HIDOnlineDisplayState) {
+        switch displayState {
+        case .atLeastOneAwake, .noOnlineDisplays:
+            isDisplaySleeping = false
             isSystemSleeping = false
+        case .allAsleep:
+            isDisplaySleeping = true
+        case .unknown:
+            break
         }
     }
 
@@ -452,9 +490,14 @@ struct HIDLifecyclePolicy: Equatable {
         isSystemSleeping = false
     }
 
-    mutating func setUSBScreenDemand(_ hasScreens: Bool) {
-        guard !isPermanentlyStopped else { return }
+    /// Applies a monotonically versioned USB screen presence snapshot, rejecting stale
+    /// out-of-order updates (`revision <= lastUSBDemandRevision`).
+    @discardableResult
+    mutating func setUSBScreenDemand(_ hasScreens: Bool, revision: UInt64) -> Bool {
+        guard !isPermanentlyStopped, revision > lastUSBDemandRevision else { return false }
+        lastUSBDemandRevision = revision
         hasPresentUSBScreens = hasScreens
+        return true
     }
 
     mutating func beginWindowDemand(_ token: UUID) {

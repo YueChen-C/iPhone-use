@@ -42,25 +42,40 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
     /// Called on the Bluetooth queue when a phone starts or stops listening for input.
     var onHostsChanged: (() -> Void)?
 
-    /// Returns `true` when at least one online display exists and all online displays
-    /// are asleep (such as clamshell sleep or a headless maintenance DarkWake).
-    /// Returns `false` when any online display is awake or when running on a truly
-    /// headless Mac with zero online displays.
-    static func areOnlineDisplaysAsleep() -> Bool {
-        var count: UInt32 = 0
-        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else {
-            return false
+    /// Classifies online displays via CoreGraphics, explicitly separating query errors
+    /// (`.unknown`) from confirmed zero-display headless Macs (`.noOnlineDisplays`),
+    /// clamshell/DarkWake sleep (`.allAsleep`), and active displays (`.atLeastOneAwake`).
+    static func onlineDisplayState() -> HIDOnlineDisplayState {
+        var reportedCount: UInt32 = 0
+        let countStatus = CGGetOnlineDisplayList(0, nil, &reportedCount)
+        guard countStatus == .success, reportedCount > 0 else {
+            return HIDOnlineDisplayState.classify(
+                countQueryError: countStatus,
+                reportedCount: reportedCount)
         }
-        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
-        guard CGGetOnlineDisplayList(count, &displays, &count) == .success, count > 0 else {
-            return false
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(reportedCount))
+        var resolvedCount = reportedCount
+        let listStatus = CGGetOnlineDisplayList(reportedCount, &displays, &resolvedCount)
+        guard listStatus == .success, resolvedCount > 0 else {
+            return HIDOnlineDisplayState.classify(
+                countQueryError: countStatus,
+                reportedCount: reportedCount,
+                listQueryError: listStatus,
+                resolvedCount: resolvedCount)
         }
-        return displays.prefix(Int(count)).allSatisfy { CGDisplayIsAsleep($0) != 0 }
+        let count = min(Int(resolvedCount), displays.count)
+        let asleepFlags = displays.prefix(count).map { CGDisplayIsAsleep($0) != 0 }
+        return HIDOnlineDisplayState.classify(
+            countQueryError: countStatus,
+            reportedCount: reportedCount,
+            listQueryError: listStatus,
+            resolvedCount: UInt32(count),
+            asleepFlags: asleepFlags)
     }
 
-    func start(initialDisplaySleeping: Bool = false) {
+    func start(initialDisplayState: HIDOnlineDisplayState = .atLeastOneAwake) {
         queue.async {
-            self.lifecyclePolicy.start(initialDisplaySleeping: initialDisplaySleeping)
+            self.lifecyclePolicy.start(initialDisplayState: initialDisplayState)
             if self.applyCoreBluetoothLifecycleOnQueue() {
                 self.onHostsChanged?()
             }
@@ -87,9 +102,9 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
         callback?()
     }
 
-    func systemDidWake(areDisplaysAsleep: Bool) {
+    func systemDidWake(displayState: HIDOnlineDisplayState) {
         queue.async {
-            self.lifecyclePolicy.systemDidWake(areDisplaysAsleep: areDisplaysAsleep)
+            self.lifecyclePolicy.systemDidWake(displayState: displayState)
             if self.applyCoreBluetoothLifecycleOnQueue() {
                 self.onHostsChanged?()
             }
@@ -114,9 +129,11 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
         }
     }
 
-    func setUSBScreenDemand(_ hasScreens: Bool) {
+    func setUSBScreenDemand(_ hasScreens: Bool, revision: UInt64) {
         queue.async {
-            self.lifecyclePolicy.setUSBScreenDemand(hasScreens)
+            guard self.lifecyclePolicy.setUSBScreenDemand(hasScreens, revision: revision) else {
+                return
+            }
             if self.applyCoreBluetoothLifecycleOnQueue() {
                 self.onHostsChanged?()
             }

@@ -488,7 +488,7 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertEqual(policy.inactiveReason?.stateDescription, "starting")
 
         // Quiet background startup with 0 USB screens and 0 windows keeps CoreBluetooth unregistered.
-        policy.start(initialDisplaySleeping: false)
+        policy.start(initialDisplayState: .atLeastOneAwake)
         XCTAssertFalse(policy.shouldRunCoreBluetooth)
         XCTAssertEqual(policy.inactiveReason, .idleNoDemand)
         XCTAssertEqual(policy.inactiveReason?.stateDescription, "idle (waiting for iPhone)")
@@ -510,18 +510,100 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertEqual(policy.inactiveReason, .idleNoDemand)
 
         // Plugging in an iPhone over USB with 0 open windows activates BLE for headless MCP.
-        policy.setUSBScreenDemand(true)
+        XCTAssertTrue(policy.setUSBScreenDemand(true, revision: 1))
         XCTAssertTrue(policy.shouldRunCoreBluetooth)
-        policy.setUSBScreenDemand(false)
+        XCTAssertTrue(policy.setUSBScreenDemand(false, revision: 2))
         XCTAssertFalse(policy.shouldRunCoreBluetooth)
         XCTAssertEqual(policy.inactiveReason, .idleNoDemand)
     }
 
-    func testLifecyclePolicyBlocksDarkWakeAndResumesOnDisplayOrHeadlessWake() {
+    func testLifecyclePolicyRejectsOutOfOrderUSBScreenDemandAcrossWindowlessAndDisplaySleep() {
+        var policy = HIDLifecyclePolicy()
+        let waitingWindow = UUID()
+        policy.start(initialDisplayState: .atLeastOneAwake)
+
+        // Out-of-order false->true race (revision 2 `true` applied before stale revision 1 `false`)
+        // under windowless MCP must keep CoreBluetooth running.
+        XCTAssertTrue(policy.setUSBScreenDemand(true, revision: 2))
+        XCTAssertEqual(policy.lastUSBDemandRevision, 2)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+        XCTAssertFalse(policy.setUSBScreenDemand(false, revision: 1))
+        XCTAssertFalse(policy.setUSBScreenDemand(false, revision: 2))
+        XCTAssertTrue(policy.hasPresentUSBScreens)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+
+        // Same out-of-order stale `false` rejection while displays are asleep with an open window.
+        policy.beginWindowDemand(waitingWindow)
+        policy.screensDidSleep()
+        XCTAssertFalse(policy.setUSBScreenDemand(false, revision: 1))
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+
+        // Reverse out-of-order true->false race (revision 4 `false` applied before stale revision 3 `true`)
+        // must keep CoreBluetooth torn down while displays remain asleep.
+        XCTAssertTrue(policy.setUSBScreenDemand(false, revision: 4))
+        XCTAssertEqual(policy.lastUSBDemandRevision, 4)
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .idleNoDemand)
+        XCTAssertFalse(policy.setUSBScreenDemand(true, revision: 3))
+        XCTAssertFalse(policy.hasPresentUSBScreens)
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+    }
+
+    func testOnlineDisplayClassifierSeparatesQueryErrorsFromHeadlessAndSleepStates() {
+        // First CGGetOnlineDisplayList count query fails -> `.unknown` (never `.noOnlineDisplays`).
+        XCTAssertEqual(
+            HIDOnlineDisplayState.classify(countQueryError: .failure, reportedCount: 0),
+            .unknown)
+
+        // Confirmed zero online displays -> `.noOnlineDisplays` (headless Mac mini).
+        XCTAssertEqual(
+            HIDOnlineDisplayState.classify(countQueryError: .success, reportedCount: 0),
+            .noOnlineDisplays)
+
+        // Second CGGetOnlineDisplayList list query fails -> `.unknown`.
+        XCTAssertEqual(
+            HIDOnlineDisplayState.classify(
+                countQueryError: .success,
+                reportedCount: 1,
+                listQueryError: .illegalArgument,
+                resolvedCount: 1,
+                asleepFlags: [false]),
+            .unknown)
+
+        // Sole external display detached between first and second query with `.success` -> `.noOnlineDisplays`.
+        XCTAssertEqual(
+            HIDOnlineDisplayState.classify(
+                countQueryError: .success,
+                reportedCount: 1,
+                listQueryError: .success,
+                resolvedCount: 0,
+                asleepFlags: []),
+            .noOnlineDisplays)
+
+        // Online displays all asleep vs at least one awake.
+        XCTAssertEqual(
+            HIDOnlineDisplayState.classify(
+                countQueryError: .success,
+                reportedCount: 2,
+                listQueryError: .success,
+                resolvedCount: 2,
+                asleepFlags: [true, true]),
+            .allAsleep)
+        XCTAssertEqual(
+            HIDOnlineDisplayState.classify(
+                countQueryError: .success,
+                reportedCount: 2,
+                listQueryError: .success,
+                resolvedCount: 2,
+                asleepFlags: [true, false]),
+            .atLeastOneAwake)
+    }
+
+    func testLifecyclePolicyBlocksDarkWakeAndUnknownWakeQueriesUntilPositiveEvidence() {
         var policy = HIDLifecyclePolicy()
         let windowToken = UUID()
-        policy.start(initialDisplaySleeping: false)
-        policy.setUSBScreenDemand(true)
+        policy.start(initialDisplayState: .atLeastOneAwake)
+        XCTAssertTrue(policy.setUSBScreenDemand(true, revision: 1))
         policy.beginWindowDemand(windowToken)
         XCTAssertTrue(policy.shouldRunCoreBluetooth)
 
@@ -532,7 +614,14 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertEqual(policy.inactiveReason?.stateDescription, "suspended for system sleep")
 
         // Backpack maintenance DarkWake (all online displays asleep) must NOT re-register BLE.
-        policy.systemDidWake(areDisplaysAsleep: true)
+        policy.systemDidWake(displayState: .allAsleep)
+        XCTAssertTrue(policy.isSystemSleeping)
+        XCTAssertTrue(policy.isDisplaySleeping)
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .systemSleeping)
+
+        // Transient CoreGraphics failure (`.unknown`) during DarkWake must also preserve the sleep gate.
+        policy.systemDidWake(displayState: .unknown)
         XCTAssertTrue(policy.isSystemSleeping)
         XCTAssertTrue(policy.isDisplaySleeping)
         XCTAssertFalse(policy.shouldRunCoreBluetooth)
@@ -544,11 +633,19 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertFalse(policy.isDisplaySleeping)
         XCTAssertTrue(policy.shouldRunCoreBluetooth)
 
-        // Headless desktop Mac with zero online displays (areDisplaysAsleep == false)
+        // Headless desktop Mac with confirmed zero online displays (`.noOnlineDisplays`)
         // resumes immediately on systemDidWake without requiring screensDidWake.
         policy.systemWillSleep()
         XCTAssertFalse(policy.shouldRunCoreBluetooth)
-        policy.systemDidWake(areDisplaysAsleep: false)
+        policy.systemDidWake(displayState: .noOnlineDisplays)
+        XCTAssertFalse(policy.isSystemSleeping)
+        XCTAssertFalse(policy.isDisplaySleeping)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+
+        // Full user wake with an awake display (`.atLeastOneAwake`) also resumes immediately.
+        policy.systemWillSleep()
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        policy.systemDidWake(displayState: .atLeastOneAwake)
         XCTAssertFalse(policy.isSystemSleeping)
         XCTAssertTrue(policy.shouldRunCoreBluetooth)
     }
@@ -556,8 +653,11 @@ final class HIDConnectionStateTests: XCTestCase {
     func testLifecyclePolicyKeepsHeadlessUSBActiveAcrossDisplaySleepButSuspendsWindowOnlyIdle() {
         var policy = HIDLifecyclePolicy()
         let waitingWindow = UUID()
-        policy.start(initialDisplaySleeping: false)
+        policy.start(initialDisplayState: .unknown)
         policy.beginWindowDemand(waitingWindow)
+        // Unknown display state at startup gates window-only BLE advertising until positive wake.
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        policy.screensDidWake()
         XCTAssertTrue(policy.shouldRunCoreBluetooth)
 
         // Display sleep with 0 USB phones suspends window-only BLE advertising immediately.
@@ -566,7 +666,7 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertEqual(policy.inactiveReason, .idleNoDemand)
 
         // Headless MCP with a connected USB iPhone stays active while displays are asleep.
-        policy.setUSBScreenDemand(true)
+        XCTAssertTrue(policy.setUSBScreenDemand(true, revision: 1))
         XCTAssertTrue(policy.shouldRunCoreBluetooth)
 
         // Permanent stop overrides all demands and ignores subsequent events.
@@ -574,8 +674,8 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertFalse(policy.shouldRunCoreBluetooth)
         XCTAssertEqual(policy.inactiveReason, .stopped)
         XCTAssertEqual(policy.inactiveReason?.stateDescription, "stopped")
-        policy.start(initialDisplaySleeping: false)
-        policy.setUSBScreenDemand(true)
+        policy.start(initialDisplayState: .atLeastOneAwake)
+        XCTAssertFalse(policy.setUSBScreenDemand(true, revision: 2))
         policy.beginWindowDemand(UUID())
         policy.screensDidWake()
         XCTAssertFalse(policy.shouldRunCoreBluetooth)
