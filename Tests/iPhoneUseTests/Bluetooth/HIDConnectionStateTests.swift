@@ -655,9 +655,17 @@ final class HIDConnectionStateTests: XCTestCase {
         let waitingWindow = UUID()
         policy.start(initialDisplayState: .unknown)
         policy.beginWindowDemand(waitingWindow)
-        // Unknown display state at startup gates window-only BLE advertising until positive wake.
+        // Unknown display state at startup gates window-only BLE advertising until a bounded
+        // re-query or demand-triggered refresh observes an awake display (without needing a
+        // new `screensDidWakeNotification` when the screen was already awake).
         XCTAssertFalse(policy.shouldRunCoreBluetooth)
-        policy.screensDidWake()
+        XCTAssertTrue(policy.hasUnresolvedDisplayQuery)
+        guard let startupRetry = policy.nextUnknownDisplayRetry() else {
+            return XCTFail("expected bounded retry slot after start(.unknown)")
+        }
+        XCTAssertTrue(
+            policy.resolveUnknownDisplayQuery(.atLeastOneAwake, generation: startupRetry.generation))
+        XCTAssertFalse(policy.hasUnresolvedDisplayQuery)
         XCTAssertTrue(policy.shouldRunCoreBluetooth)
 
         // Display sleep with 0 USB phones suspends window-only BLE advertising immediately.
@@ -680,6 +688,75 @@ final class HIDConnectionStateTests: XCTestCase {
         policy.screensDidWake()
         XCTAssertFalse(policy.shouldRunCoreBluetooth)
         XCTAssertEqual(policy.inactiveReason, .stopped)
+    }
+
+    func testLifecyclePolicyRecoversFromTransientUnknownWakeWithoutNewWakeNotificationAndRejectsStaleGenerations() {
+        var policy = HIDLifecyclePolicy()
+        policy.start(initialDisplayState: .noOnlineDisplays)
+        XCTAssertTrue(policy.setUSBScreenDemand(true, revision: 1))
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+
+        // Headless Mac enters sleep, then wakes while CoreGraphics transiently fails (`.unknown`).
+        policy.systemWillSleep()
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        policy.systemDidWake(displayState: .unknown)
+        XCTAssertTrue(policy.isSystemSleeping)
+        XCTAssertTrue(policy.isDisplaySleeping)
+        XCTAssertTrue(policy.hasUnresolvedDisplayQuery)
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+
+        // First retry still returns `.unknown`; retry budget remains bounded to 3 slots.
+        guard let retry1 = policy.nextUnknownDisplayRetry() else {
+            return XCTFail("expected retry 1")
+        }
+        XCTAssertFalse(policy.resolveUnknownDisplayQuery(.unknown, generation: retry1.generation))
+        XCTAssertTrue(policy.isSystemSleeping)
+        XCTAssertTrue(policy.hasUnresolvedDisplayQuery)
+
+        // Second retry succeeds with confirmed 0 displays (`.noOnlineDisplays`) and unlocks BLE
+        // without requiring any `screensDidWakeNotification` or second `systemDidWake`.
+        guard let retry2 = policy.nextUnknownDisplayRetry() else {
+            return XCTFail("expected retry 2")
+        }
+        XCTAssertTrue(
+            policy.resolveUnknownDisplayQuery(.noOnlineDisplays, generation: retry2.generation))
+        XCTAssertFalse(policy.hasUnresolvedDisplayQuery)
+        XCTAssertFalse(policy.isSystemSleeping)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+        XCTAssertNil(policy.nextUnknownDisplayRetry())
+
+        // Stale retry from a prior wake generation must NEVER cross a newer `systemWillSleep`.
+        policy.systemWillSleep()
+        policy.systemDidWake(displayState: .unknown)
+        guard let staleWakeRetry = policy.nextUnknownDisplayRetry() else {
+            return XCTFail("expected retry before re-sleep")
+        }
+        policy.systemWillSleep()
+        XCTAssertFalse(policy.hasUnresolvedDisplayQuery)
+        XCTAssertFalse(
+            policy.resolveUnknownDisplayQuery(.atLeastOneAwake, generation: staleWakeRetry.generation))
+        XCTAssertTrue(policy.isSystemSleeping)
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+
+        // If all bounded scheduled retries return `.unknown`, `hasUnresolvedDisplayQuery` stays
+        // armed so a later demand inflow (window open, USB plug-in, or `/match`) can still resolve it.
+        policy.systemDidWake(displayState: .unknown)
+        var lastGeneration: UInt64 = 0
+        for expectedDelay in HIDLifecyclePolicy.unknownDisplayRetryDelays {
+            guard let slot = policy.nextUnknownDisplayRetry() else {
+                return XCTFail("expected bounded retry slot")
+            }
+            XCTAssertEqual(slot.delay, expectedDelay)
+            lastGeneration = slot.generation
+            XCTAssertFalse(policy.resolveUnknownDisplayQuery(.unknown, generation: slot.generation))
+        }
+        XCTAssertNil(policy.nextUnknownDisplayRetry())
+        XCTAssertTrue(policy.hasUnresolvedDisplayQuery)
+        XCTAssertTrue(
+            policy.resolveUnknownDisplayQuery(.noOnlineDisplays, generation: lastGeneration))
+        XCTAssertFalse(policy.hasUnresolvedDisplayQuery)
+        XCTAssertFalse(policy.isSystemSleeping)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
     }
 
     func testReconnectTrackerSuspendForLifecycleTeardownPreservesTargetsAndResetsRetryBudget() {

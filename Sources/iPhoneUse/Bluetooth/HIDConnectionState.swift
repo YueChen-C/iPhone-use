@@ -412,10 +412,15 @@ struct HIDLifecyclePolicy: Equatable {
         }
     }
 
+    static let unknownDisplayRetryDelays: [TimeInterval] = [0.25, 1.0, 3.0]
+
     private(set) var isStarted = false
     private(set) var isPermanentlyStopped = false
     private(set) var isSystemSleeping = false
     private(set) var isDisplaySleeping = false
+    private(set) var hasUnresolvedDisplayQuery = false
+    private(set) var displayQueryGeneration: UInt64 = 0
+    private(set) var unknownDisplayRetryAttempts = 0
     private(set) var hasPresentUSBScreens = false
     private(set) var lastUSBDemandRevision: UInt64 = 0
     private(set) var activeWindowTokens: Set<UUID> = []
@@ -446,48 +451,116 @@ struct HIDLifecyclePolicy: Equatable {
     mutating func start(initialDisplayState: HIDOnlineDisplayState = .atLeastOneAwake) {
         guard !isPermanentlyStopped, !isStarted else { return }
         isStarted = true
+        displayQueryGeneration &+= 1
+        unknownDisplayRetryAttempts = 0
         switch initialDisplayState {
         case .atLeastOneAwake, .noOnlineDisplays:
             isDisplaySleeping = false
-        case .allAsleep, .unknown:
+            hasUnresolvedDisplayQuery = false
+        case .allAsleep:
             isDisplaySleeping = true
+            hasUnresolvedDisplayQuery = false
+        case .unknown:
+            isDisplaySleeping = true
+            hasUnresolvedDisplayQuery = true
         }
     }
 
     mutating func stop() {
         isStarted = false
         isPermanentlyStopped = true
+        displayQueryGeneration &+= 1
+        hasUnresolvedDisplayQuery = false
+        unknownDisplayRetryAttempts = 0
         hasPresentUSBScreens = false
         activeWindowTokens.removeAll()
     }
 
     mutating func systemWillSleep() {
+        displayQueryGeneration &+= 1
+        hasUnresolvedDisplayQuery = false
+        unknownDisplayRetryAttempts = 0
         isSystemSleeping = true
     }
 
     /// Maintenance DarkWakes run while all online displays remain asleep; keeping
     /// `isSystemSleeping = true` until a positive non-dark wake (`.atLeastOneAwake` or
     /// confirmed headless `.noOnlineDisplays`) or `screensDidWake` prevents re-publishing
-    /// GATT services inside a closed backpack, even if a CoreGraphics query returns `.unknown`.
+    /// GATT services inside a closed backpack, while marking `.unknown` for bounded re-query.
     mutating func systemDidWake(displayState: HIDOnlineDisplayState) {
+        guard !isPermanentlyStopped else { return }
+        displayQueryGeneration &+= 1
+        unknownDisplayRetryAttempts = 0
         switch displayState {
         case .atLeastOneAwake, .noOnlineDisplays:
             isDisplaySleeping = false
             isSystemSleeping = false
+            hasUnresolvedDisplayQuery = false
         case .allAsleep:
             isDisplaySleeping = true
+            hasUnresolvedDisplayQuery = false
         case .unknown:
-            break
+            isDisplaySleeping = true
+            hasUnresolvedDisplayQuery = true
         }
     }
 
     mutating func screensDidSleep() {
+        guard !isPermanentlyStopped else { return }
+        displayQueryGeneration &+= 1
+        hasUnresolvedDisplayQuery = false
+        unknownDisplayRetryAttempts = 0
         isDisplaySleeping = true
     }
 
     mutating func screensDidWake() {
+        guard !isPermanentlyStopped else { return }
+        displayQueryGeneration &+= 1
+        hasUnresolvedDisplayQuery = false
+        unknownDisplayRetryAttempts = 0
         isDisplaySleeping = false
         isSystemSleeping = false
+    }
+
+    /// Reserves the next bounded retry slot for an unresolved `.unknown` display query,
+    /// returning the generation token that must still match when the retry completes.
+    mutating func nextUnknownDisplayRetry() -> (generation: UInt64, delay: TimeInterval)? {
+        guard isStarted, !isPermanentlyStopped, hasUnresolvedDisplayQuery,
+            unknownDisplayRetryAttempts < Self.unknownDisplayRetryDelays.count
+        else {
+            return nil
+        }
+        let delay = Self.unknownDisplayRetryDelays[unknownDisplayRetryAttempts]
+        unknownDisplayRetryAttempts += 1
+        return (displayQueryGeneration, delay)
+    }
+
+    /// Resolves a previously `.unknown` display query only when `generation` still matches
+    /// the current sleep/display epoch so late retries cannot cross a newer `systemWillSleep`.
+    @discardableResult
+    mutating func resolveUnknownDisplayQuery(
+        _ displayState: HIDOnlineDisplayState, generation: UInt64
+    ) -> Bool {
+        guard !isPermanentlyStopped, hasUnresolvedDisplayQuery,
+            displayQueryGeneration == generation
+        else {
+            return false
+        }
+        switch displayState {
+        case .atLeastOneAwake, .noOnlineDisplays:
+            hasUnresolvedDisplayQuery = false
+            unknownDisplayRetryAttempts = 0
+            isDisplaySleeping = false
+            isSystemSleeping = false
+            return true
+        case .allAsleep:
+            hasUnresolvedDisplayQuery = false
+            unknownDisplayRetryAttempts = 0
+            isDisplaySleeping = true
+            return true
+        case .unknown:
+            return false
+        }
     }
 
     /// Applies a monotonically versioned USB screen presence snapshot, rejecting stale

@@ -41,6 +41,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
 
     /// Called on the Bluetooth queue when a phone starts or stops listening for input.
     var onHostsChanged: (() -> Void)?
+    private let queryOnlineDisplayState: () -> HIDOnlineDisplayState = HIDPeripheral.onlineDisplayState
 
     /// Classifies online displays via CoreGraphics, explicitly separating query errors
     /// (`.unknown`) from confirmed zero-display headless Macs (`.noOnlineDisplays`),
@@ -79,6 +80,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
             if self.applyCoreBluetoothLifecycleOnQueue() {
                 self.onHostsChanged?()
             }
+            self.scheduleUnknownDisplayRetryIfNeededOnQueue()
         }
     }
 
@@ -108,6 +110,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
             if self.applyCoreBluetoothLifecycleOnQueue() {
                 self.onHostsChanged?()
             }
+            self.scheduleUnknownDisplayRetryIfNeededOnQueue()
         }
     }
 
@@ -134,6 +137,9 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
             guard self.lifecyclePolicy.setUSBScreenDemand(hasScreens, revision: revision) else {
                 return
             }
+            if hasScreens {
+                self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
+            }
             if self.applyCoreBluetoothLifecycleOnQueue() {
                 self.onHostsChanged?()
             }
@@ -143,6 +149,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
     func beginWindowDemand(_ token: UUID) {
         queue.async {
             self.lifecyclePolicy.beginWindowDemand(token)
+            self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
             if self.applyCoreBluetoothLifecycleOnQueue() {
                 self.onHostsChanged?()
             }
@@ -154,6 +161,46 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
             self.lifecyclePolicy.endWindowDemand(token)
             if self.applyCoreBluetoothLifecycleOnQueue() {
                 self.onHostsChanged?()
+            }
+        }
+    }
+
+    func refreshDisplayStateIfNeeded() {
+        queue.async {
+            guard self.lifecyclePolicy.hasUnresolvedDisplayQuery else { return }
+            self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
+            if self.applyCoreBluetoothLifecycleOnQueue() {
+                self.onHostsChanged?()
+            }
+        }
+    }
+
+    private func refreshUnresolvedDisplayQueryIfNeededOnQueue() {
+        guard lifecyclePolicy.hasUnresolvedDisplayQuery else { return }
+        let generation = lifecyclePolicy.displayQueryGeneration
+        let state = queryOnlineDisplayState()
+        if lifecyclePolicy.resolveUnknownDisplayQuery(state, generation: generation) {
+            log("resolved deferred display state on demand (\(state))")
+        }
+    }
+
+    private func scheduleUnknownDisplayRetryIfNeededOnQueue() {
+        guard let retry = lifecyclePolicy.nextUnknownDisplayRetry() else { return }
+        queue.asyncAfter(deadline: .now() + retry.delay) { [weak self] in
+            guard let self else { return }
+            guard self.lifecyclePolicy.hasUnresolvedDisplayQuery,
+                self.lifecyclePolicy.displayQueryGeneration == retry.generation
+            else {
+                return
+            }
+            let state = self.queryOnlineDisplayState()
+            if self.lifecyclePolicy.resolveUnknownDisplayQuery(state, generation: retry.generation) {
+                log("resolved deferred display state (\(state))")
+                if self.applyCoreBluetoothLifecycleOnQueue() {
+                    self.onHostsChanged?()
+                }
+            } else {
+                self.scheduleUnknownDisplayRetryIfNeededOnQueue()
             }
         }
     }
@@ -217,6 +264,12 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
     /// present, waking their HOGP client without requiring manual Settings > Bluetooth taps.
     func reconnectKnownHosts(_ hosts: Set<UUID>, resetExhausted: Bool = true) {
         queue.async {
+            if !hosts.isEmpty {
+                self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
+                if self.applyCoreBluetoothLifecycleOnQueue() {
+                    self.onHostsChanged?()
+                }
+            }
             let activeSessions = Set(self.connections.sessions.keys)
             let toCancel = self.reconnectTracker.updateTargets(
                 hosts, activeSessions: activeSessions, resetExhausted: resetExhausted)

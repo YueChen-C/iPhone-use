@@ -196,6 +196,11 @@ enum Application {
                 log("displays did wake")
                 HIDPeripheral.shared.screensDidWake()
             },
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification, object: nil, queue: nil
+            ) { _ in
+                HIDPeripheral.shared.refreshDisplayStateIfNeeded()
+            },
         ]
     }
 
