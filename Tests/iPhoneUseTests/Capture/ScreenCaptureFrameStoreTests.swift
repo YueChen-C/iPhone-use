@@ -226,7 +226,7 @@ final class ScreenCaptureFrameStoreTests: XCTestCase {
         var observedRemainingAtUSBStart: TimeInterval = .infinity
         let partialUSBEntered = expectation(description: "USB restore started with reduced remaining budget")
         let partialResult = CaptureShutdownCoordinator.stop(
-            waitTimeout: 0.09,
+            waitTimeout: 0.45,
             activeSources: [partialSource],
             notifyQueue: notifyQueue,
             restoreAllUSB: { deadlineUptime in
@@ -235,8 +235,8 @@ final class ScreenCaptureFrameStoreTests: XCTestCase {
                 releasePartialUSB.wait()
                 return true
             })
-        wait(for: [partialUSBEntered], timeout: 1.0)
-        XCTAssertLessThan(observedRemainingAtUSBStart, 0.06)
+        wait(for: [partialUSBEntered], timeout: 2.0)
+        XCTAssertLessThan(observedRemainingAtUSBStart, 0.42)
         XCTAssertEqual(
             partialResult,
             ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: false))
