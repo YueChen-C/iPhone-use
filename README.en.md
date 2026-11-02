@@ -87,7 +87,7 @@ The script builds a Release executable, opens the control window, and starts the
 4. On that page, open **Devices → Bluetooth Devices**, select **iPhone Use** or the Mac name shown in the control window, and confirm pairing on both devices when prompted.
 5. Wait for the screen and control connection to become ready, then use your Mac’s mouse and keyboard in the phone window.
 
-Keep the app running while using MCP or the API. Closing the last window exits the app and stops the service.
+Keep the app running while using MCP or the API. By default, closing the last window exits the app and stops the service; enable **iPhone Use → Quiet Background Mode** (or launch with `--resident-quiet`) to keep the service running after closing windows and suppress automatic window pop-ups on launch or USB connection whenever no unminimized waiting window is open (an already-open unminimized waiting window transitions in place to connected device windows).
 
 ## AI Integration
 

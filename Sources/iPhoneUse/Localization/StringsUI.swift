@@ -4,6 +4,8 @@ import Foundation
 /// overlay, and the canvas waiting message.
 struct StringsUI: LocalizedTable {
     // Main menu (Application.swift)
+    let quietBackgroundMode: String
+    let quietBackgroundModeHelp: String
     let quitApp: String
     let windowMenu: String
     let showAllDevices: String
@@ -76,6 +78,8 @@ struct StringsUI: LocalizedTable {
     static var current: StringsUI { StringsUI(language: AppLanguageStore.shared.language) }
 
     static let zh = StringsUI(
+        quietBackgroundMode: "后台静默常驻",
+        quietBackgroundModeHelp: "关闭窗口后保持后台服务运行，启动与连接 iPhone 时不自动弹出窗口",
         quitApp: "退出 iPhone Use",
         windowMenu: "窗口",
         showAllDevices: "显示所有设备",
@@ -149,6 +153,9 @@ struct StringsUI: LocalizedTable {
         canvasWaitingText: "等待 iPhone 画面…\n请解锁手机并确认已配对 Bluetooth")
 
     static let en = StringsUI(
+        quietBackgroundMode: "Quiet Background Mode",
+        quietBackgroundModeHelp:
+            "Keep the background service running after closing windows, without opening windows automatically on launch or USB connection",
         quitApp: "Quit iPhone Use",
         windowMenu: "Window",
         showAllDevices: "Show All Devices",
