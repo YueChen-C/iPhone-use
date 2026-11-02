@@ -1,0 +1,47 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Show build tools
+        run: |
+          xcodebuild -version
+          swift --version
+          python3 --version
+
+      - name: Run Swift tests
+        run: swift test
+
+      # swift test builds the debug executable used by the MCP integration tests.
+      - name: Run Python tests
+        env:
+          IPHONE_USE_TEST_CONFIG: debug
+        run: python3 -B -m unittest discover -s Tests/PythonTests -p 'test_*.py'
