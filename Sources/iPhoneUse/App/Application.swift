@@ -10,6 +10,7 @@ func log(_ message: String) {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     // Retain all device controllers for as long as their windows remain open.
     private let windows = ControlWindowCoordinator()
+    private var quietModeItem: NSMenuItem?
     private var quitItem: NSMenuItem?
     private var windowMenu: NSMenu?
     private var windowItem: NSMenuItem?
@@ -18,11 +19,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var bringToFrontItem: NSMenuItem?
     private var languageItems: [NSMenuItem] = []
     private var languageObserver: NSObjectProtocol?
+    private var runModeObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMenus()
         windows.start()
-        NSApp.activate(ignoringOtherApps: true)
+        if AppRunModeStore.shared.mode == .desktop {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         // Retitle items in place when the language changes. Swapping NSApp.mainMenu
         // or reassigning windowsMenu would dismiss the open menu and duplicate
         // AppKit-managed items; in-place title/state changes repaint live.
@@ -31,6 +35,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in
             self?.refreshMenuTitles()
         }
+        runModeObserver = NotificationCenter.default.addObserver(
+            forName: AppRunModeStore.didChangeNotification, object: AppRunModeStore.shared, queue: .main
+        ) { [weak self] _ in
+            self?.refreshRunModeMenuState()
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -39,10 +52,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let languageObserver { NotificationCenter.default.removeObserver(languageObserver) }
+        languageObserver = nil
+        if let runModeObserver { NotificationCenter.default.removeObserver(runModeObserver) }
+        runModeObserver = nil
         windows.stop()
     }
 
     @objc private func showAllDevices(_ sender: Any?) { windows.showAllDevices() }
+
+    @objc private func toggleQuietBackgroundMode(_ sender: NSMenuItem) {
+        let next: AppRunMode = AppRunModeStore.shared.mode == .residentQuiet ? .desktop : .residentQuiet
+        AppRunModeStore.shared.set(next)
+    }
 
     @objc private func selectLanguage(_ sender: NSMenuItem) {
         guard AppLanguage.allCases.indices.contains(sender.tag) else { return }
@@ -70,6 +92,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             languageMenu.addItem(item)
             languageItems.append(item)
         }
+        let quietMode = NSMenuItem(
+            title: StringsUI.current.quietBackgroundMode,
+            action: #selector(toggleQuietBackgroundMode(_:)),
+            keyEquivalent: "")
+        quietMode.target = self
+        quietMode.state = AppRunModeStore.shared.mode == .residentQuiet ? .on : .off
+        quietMode.toolTip = StringsUI.current.quietBackgroundModeHelp
+        appMenu.addItem(quietMode)
+        quietModeItem = quietMode
         appMenu.addItem(.separator())
 
         let quit = NSMenuItem(
@@ -108,6 +139,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshMenuTitles() {
         let table = StringsUI.current
+        quietModeItem?.title = table.quietBackgroundMode
+        quietModeItem?.toolTip = table.quietBackgroundModeHelp
         quitItem?.title = table.quitApp
         windowMenu?.title = table.windowMenu
         windowItem?.title = table.windowMenu
@@ -118,6 +151,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for (index, item) in languageItems.enumerated() {
             item.state = AppLanguage.allCases[index] == current ? .on : .off
         }
+    }
+
+    private func refreshRunModeMenuState() {
+        quietModeItem?.state = AppRunModeStore.shared.mode == .residentQuiet ? .on : .off
     }
 }
 
