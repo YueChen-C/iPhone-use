@@ -857,7 +857,7 @@ final class USBValeriaConfiguratorTests: XCTestCase {
             source: sourceA,
             trackedSwitchID: 771,
             expectedLifecycle: 1,
-            delay: 0.09,
+            delay: 0.35,
             supersedeExisting: true,
             restoreUSB: { entryID in
                 let outcome = restoreClosure(entryID)
@@ -865,14 +865,16 @@ final class USBValeriaConfiguratorTests: XCTestCase {
                 return outcome
             })
 
+        var countAfterStaleTimer = -1
         let staleTimerPassed = expectation(description: "stale shorter timer elapsed without restore")
-        queue.asyncAfter(deadline: .now() + 0.045) {
+        queue.asyncAfter(deadline: .now() + 0.06) {
+            countAfterStaleTimer = ledgerLock.withLock { restoreCallCount }
             staleTimerPassed.fulfill()
         }
-        wait(for: [staleTimerPassed], timeout: 1.0)
-        XCTAssertEqual(ledgerLock.withLock { restoreCallCount }, 2)
+        wait(for: [staleTimerPassed], timeout: 2.0)
+        XCTAssertEqual(countAfterStaleTimer, 2)
 
-        wait(for: [finalRestoreDone], timeout: 1.0)
+        wait(for: [finalRestoreDone], timeout: 2.0)
         queue.sync {}
         XCTAssertEqual(ledgerLock.withLock { restoreCallCount }, 3)
         XCTAssertEqual(session.currentConfiguration, 6)
