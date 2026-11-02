@@ -885,13 +885,13 @@ final class CaptureSourceLifecycle {
     }
 
     func stop(onStopLocked: (() -> Void)? = nil, completion: (() -> Void)? = nil) {
+        let session = self.session
+        let frames = self.frames
         stateLock.withLock {
             stopped = true
             frames.stop()
             onStopLocked?()
         }
-        let session = self.session
-        let frames = self.frames
         queue.async {
             frames.stop()
             session.stopRunning()
