@@ -38,6 +38,8 @@ final class DeviceRegistry {
     // matching state, which Bluetooth callbacks access on that queue.
     private let inputLock = NSLock()
     private var pairings: [String: UUID] = [:]
+    // Protected by lock; never carry an orientation across a BLE/USB session.
+    private var pointerTurns: [UUID: (session: UUID?, screen: ObjectIdentifier, turn: PointerTurn)] = [:]
     /// Cache identity includes both the BLE session and USB device. Keeping the
     /// entry together prevents an DeviceInput from being reused for another screen.
     private struct CachedInput {
@@ -61,6 +63,7 @@ final class DeviceRegistry {
         let session: UUID?
         var scores: [ObjectIdentifier: Int] = [:]
         var absoluteScreens: Set<ObjectIdentifier> = []
+        var turns: [ObjectIdentifier: PointerTurn] = [:]
         var results: [ObjectIdentifier: DevicePairingRecovery.ProbeResult] = [:]
         var pointerOrigins: [ObjectIdentifier: (point: CGPoint, activity: UInt64)] = [:]
         var preparedScreens: Set<ObjectIdentifier> = []
@@ -276,13 +279,28 @@ final class DeviceRegistry {
                 return manager.permitsPointerAssociation(for: screen)
             },
             pointerFrame: { [weak screen] in
-                guard let screen, let size = screen.size,
+                guard let screen, let size = screen.size else { return nil }
+                let scale = min(1, 1200 / max(size.width, size.height))
+                let width = Int((size.width * scale).rounded())
+                let height = Int((size.height * scale).rounded())
+                guard
                     let pixels = screen.probeThumbnail(
-                        width: Int(size.width), height: Int(size.height),
+                        width: width, height: height,
                         isReady: { ScreenCaptureManager.shared.permitsPointerAssociation(for: screen) })
                 else { return nil }
-                return .init(width: Int(size.width), height: Int(size.height), pixels: pixels)
+                return .init(width: width, height: height, pixels: pixels)
+            },
+            orientationFrame: { [weak screen] in
+                guard let screen else { return nil }
+                return screen.probeThumbnail(
+                    width: PointerScreenMatcher.width, height: PointerScreenMatcher.height,
+                    isReady: { ScreenCaptureManager.shared.permitsPointerAssociation(for: screen) })
             })
+        if let screen, let proof = lock.withLock({ pointerTurns[host] }),
+            proof.session == session, proof.screen == ObjectIdentifier(screen)
+        {
+            input.adoptPointerTurn(proof.turn)
+        }
         return input
     }
 
@@ -994,7 +1012,8 @@ final class DeviceRegistry {
                             first: targets[0],
                             second: targets[1])
                         evidence.scores[key] = max(evidence.scores[key] ?? .min, candidateScore)
-                        if PointerScreenMatcher.matchesAbsoluteRoundTrip(frames, targets: targets) {
+                        if let turn = PointerScreenMatcher.pointerTurn(frames, targets: targets) {
+                            evidence.turns[key] = turn
                             if evidence.absoluteScreens.insert(key).inserted {
                                 log("absolute pointer targets verified on \(screen.name) for \(host)")
                             }
@@ -1109,6 +1128,10 @@ final class DeviceRegistry {
             || RelativePointerCalibration.loadMatchingScreen(host: input.host, screenSize: nil, screenID: screen.id)
                 != nil
         let absoluteVerified = evidence.absoluteScreens.contains(key)
+        if let turn = evidence.turns[key] {
+            lock.withLock { pointerTurns[input.host] = (input.session, key, turn) }
+            input.adoptPointerTurn(turn)
+        }
         if let origin = evidence.pointerOrigins[key],
             input.adoptObservedPointerOrigin(origin.point, screenID: screen.id, activity: origin.activity)
         {

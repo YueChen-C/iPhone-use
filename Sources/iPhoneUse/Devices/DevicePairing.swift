@@ -197,14 +197,26 @@ enum PointerScreenMatcher {
     /// discovery. iOS changes pointer color with its background: arrival and
     /// departure can have the same polarity at different targets. Require local
     /// reversal at each target instead of opposite polarities across the screen.
+    static func pointerTurn(_ frames: [[UInt8]], targets: [ProbeTarget]) -> PointerTurn? {
+        let matches = PointerTurn.allCases.filter {
+            matchesAbsoluteRoundTrip(frames, targets: targets, turn: $0)
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
     static func matchesAbsoluteRoundTrip(
         _ frames: [[UInt8]],
-        targets: [ProbeTarget] = [firstPoint, secondPoint, thirdPoint]
+        targets: [ProbeTarget] = [firstPoint, secondPoint, thirdPoint],
+        turn: PointerTurn = .none
     ) -> Bool {
         guard frames.count == 4,
             frames.allSatisfy({ $0.count == width * height }),
             targetsAreValidProbeSet(targets)
         else { return false }
+        let targets = targets.map { target -> ProbeTarget in
+            let p = turn.screenPoint(for: CGPoint(x: target.x, y: target.y))
+            return (p.x, p.y)
+        }
         for (corner, point) in targets.enumerated() {
             let x = Int(point.x * Double(width))
             let y = Int(point.y * Double(height))

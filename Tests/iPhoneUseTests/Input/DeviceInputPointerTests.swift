@@ -55,6 +55,7 @@ final class DeviceInputPointerTests: XCTestCase {
             })
 
         input.press(x: 0.5, y: 0.5)
+        try input.type("")
         input.cancelPointer()
         try input.nudge(dx: 0, dy: 0, click: false)
 
@@ -97,6 +98,38 @@ final class DeviceInputPointerTests: XCTestCase {
             reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
         XCTAssertThrowsError(try input.swipe(points: [(0.5, 0.8), (0.5, 0.3)], duration: 0.4))
         XCTAssertFalse(reports.contains { $0.0 == .relativeMouse && $0.1[0] != 0 })
+    }
+
+    func testWindowFirstDragWithUnavailableFramesNeverPresses() throws {
+        var reports: [(ReportID, [UInt8])] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), screenSize: { CGSize(width: 1320, height: 2868) },
+            pointerFrame: { nil }, sleep: { _ in },
+            reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+        input.press(x: 0.5, y: 0.8)
+        input.drag(x: 0.5, y: 0.5)
+        input.release(x: 0.5, y: 0.3)
+        try input.nudge(dx: 0, dy: 0, click: false)
+        XCTAssertFalse(reports.contains { $0.0 == .relativeMouse && $0.1[0] != 0 })
+    }
+
+    func testRotatedAbsoluteOutputAndRawDiagnosticNudge() throws {
+        for turn in PointerTurn.allCases {
+            var reports: [(ReportID, [UInt8])] = []
+            let input = DeviceInput(
+                host: UUID(), session: UUID(), sleep: { _ in },
+                reportSender: { reports.append(($0, $1)) })
+            input.adoptPointerTurn(turn)
+            try input.move(x: 0.25, y: 0.75)
+            try input.nudge(dx: 7, dy: -3, click: false)
+            let point = turn.rawPoint(for: CGPoint(x: 0.25, y: 0.75))
+            XCTAssertEqual(
+                reports[0].1,
+                HIDReportPayload.absolutePointer(
+                    buttons: 0,
+                    x: UInt16((point.x * 32767).rounded()), y: UInt16((point.y * 32767).rounded())))
+            XCTAssertEqual(reports.last?.1, HIDReportPayload.relativeMouse(buttons: 0, dx: 7, dy: -3))
+        }
     }
 
     func testAutomaticMeasurementReportsSessionAndCancellationSeparately() {
@@ -713,6 +746,7 @@ final class DeviceInputPointerTests: XCTestCase {
         let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
 
         input.press(x: 0.5, y: 0.5)
+        try input.type("")
         for gesture in [
             { try input.tap(x: 1, y: 1) },
             { try input.swipe(points: [(0, 0), (1, 0), (1, 1)], duration: 0.06) },
@@ -739,6 +773,7 @@ final class DeviceInputPointerTests: XCTestCase {
         var reports: [(ReportID, [UInt8])] = []
         let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
         input.press(x: 0, y: 0)
+        try input.type("")
         input.cancelPointer()
         // A stale AppKit mouse-up after cancellation must not reposition the phone.
         input.release(x: 1, y: 1)

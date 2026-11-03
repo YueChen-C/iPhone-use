@@ -49,6 +49,26 @@ final class DeviceInput {
     private let reportSender: (ReportID, [UInt8]) -> Void
     private let sleep: (TimeInterval) -> Void
     private var windowDragging = false
+    private let windowSequence = PointerMotionSequence()
+    private var pointerTurn: PointerTurn = .none
+    private var orientationCheckedAt: TimeInterval = -.infinity
+    private var orientationSize: CGSize?
+    private let orientationFrame: (() -> [UInt8]?)?
+    private let diagnosticLock = NSLock()
+    private var preparationInfo: [String: Any] = [:]
+
+    func adoptPointerTurn(_ turn: PointerTurn) {
+        queue.sync {
+            self.orientationCheckedAt = ProcessInfo.processInfo.systemUptime
+            self.orientationSize = self.screenSize?()
+            self.diagnosticLock.withLock { self.preparationInfo["rotationDegrees"] = turn.rawValue * 90 }
+            if self.pointerTurn != turn {
+                self.pointerTurn = turn
+                self.measuredDragCurve = nil
+                self.clearPointerEstimate()
+            }
+        }
+    }
     let calibration: RelativePointerCalibration?
     private var absolutePointerPosition: (x: UInt16, y: UInt16)?
     private var estimatedPosition: CGPoint?
@@ -60,6 +80,7 @@ final class DeviceInput {
     /// drag runs on the relative collection. Nil outside a drag.
     private var measuredDragCurve: [Double]?
     private var measuredDragSize: CGSize?
+    private var measuredDragVerticalScale = 1.0
     private let pointerFrame: (() -> PointerMotionObservation.Frame?)?
     private var dragPosition: CGPoint?
     private var lastEstimatedMovement: RelativePointerCalibration.Movement?
@@ -113,6 +134,7 @@ final class DeviceInput {
             "sessionCurrent": isCurrentSession,
             "coordinateMappingAvailable": coordinateMappingAvailable,
             "calibration": calibrationInfo,
+            "preparation": diagnosticLock.withLock { preparationInfo },
         ]
     }
 
@@ -134,6 +156,7 @@ final class DeviceInput {
         screenSize: (() -> CGSize?)? = nil,
         inputIsAllowed: @escaping () -> Bool = { true },
         pointerFrame: (() -> PointerMotionObservation.Frame?)? = nil,
+        orientationFrame: (() -> [UInt8]?)? = nil,
         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
         reportSender: ((ReportID, [UInt8]) -> Void)? = nil,
         reportReadiness: ((ReportID, UUID, UUID?) -> Bool)? = nil
@@ -146,6 +169,7 @@ final class DeviceInput {
         self.screenSize = screenSize
         self.inputIsAllowed = inputIsAllowed
         self.pointerFrame = pointerFrame
+        self.orientationFrame = orientationFrame
         self.sleep = sleep
         self.reportReadiness =
             reportReadiness ?? {
@@ -169,6 +193,7 @@ extension DeviceInput {
     /// Coordinates are fractions of the screen, 0...1 from the top-left corner.
     func tap(x: Double, y: Double, hold: TimeInterval = 0.08) throws {
         try performCoordinateGesture {
+            try prepareOrientation()
             pointer(x, y)
             pause(step * 2)
             button(down: true)
@@ -199,6 +224,7 @@ extension DeviceInput {
                 reportCount.isFinite, reportCount < Double(Int.max)
             else { throw InputError.invalidSwipe(table.swipeReasonReportCount) }
 
+            try prepareOrientation()
             try prepareMeasuredDrag()
             let durations = swipeSegmentDurations(points: points, duration: duration)
             // iOS synthesizes the touch on the relative collection only, and
@@ -247,6 +273,7 @@ extension DeviceInput {
 
     func move(x: Double, y: Double) throws {
         try performCoordinateGesture {
+            try prepareOrientation()
             pointer(x, y)
             pause(step)
         }
@@ -477,7 +504,7 @@ extension DeviceInput {
         if let calibration {
             moveCalibratedPointer(point.x, point.y, calibration: calibration, sequence: sequence, isReady: isReady)
         } else if isReady() {
-            moveAbsolutePointer(point.x, point.y, sequence: sequence)
+            moveAbsolutePointer(point.x, point.y, sequence: sequence, raw: true)
         }
     }
 
@@ -497,8 +524,19 @@ extension DeviceInput {
     /// forwarded while it is happening instead of being buffered as one long swipe.
     func press(x: Double, y: Double) {
         discardPendingMotion()
+        let gesture = windowSequence.current
         queue.async {
-            guard !self.windowDragging, self.coordinateMappingAvailable else { return }
+            guard !self.windowDragging, self.coordinateMappingAvailable,
+                self.windowSequence.isCurrent(gesture)
+            else { return }
+            do {
+                try self.prepareOrientation(windowGesture: gesture)
+                try self.prepareMeasuredDrag(windowGesture: gesture)
+            } catch {
+                log("window drag preparation failed: \(error)")
+                return
+            }
+            guard self.windowSequence.isCurrent(gesture), self.shouldContinueMotion(nil) else { return }
             self.windowDragging = true
             // Position through the absolute collection, then press on the
             // relative collection: iOS synthesizes the touch there.
@@ -521,7 +559,7 @@ extension DeviceInput {
     }
 
     func release(x: Double, y: Double) {
-        discardPendingMotion()
+        advanceMotionSequence()
         queue.async {
             guard self.windowDragging else { return }
             self.dragMove(x, y, sequence: nil)
@@ -569,6 +607,7 @@ extension DeviceInput {
     }
 
     private func discardPendingMotion() {
+        windowSequence.advance()
         advanceMotionSequence()
     }
 
@@ -728,8 +767,11 @@ extension DeviceInput {
         }
     }
 
-    fileprivate func moveAbsolutePointer(_ x: Double, _ y: Double, sequence: UInt64?) {
+    fileprivate func moveAbsolutePointer(_ x: Double, _ y: Double, sequence: UInt64?, raw: Bool = false) {
         guard shouldContinueMotion(sequence) else { return }
+        let point = raw ? CGPoint(x: x, y: y) : pointerTurn.rawPoint(for: CGPoint(x: x, y: y))
+        let x = point.x
+        let y = point.y
         let max = Double(HIDReportMap.absoluteMax)
         let px = UInt16(Swift.max(0, Swift.min(max, (x * max).rounded())))
         let py = UInt16(Swift.max(0, Swift.min(max, (y * max).rounded())))
@@ -750,19 +792,78 @@ extension DeviceInput {
         }
     }
 
-    private func prepareMeasuredDrag() throws {
+    /// Refresh after idle time or a capture-size change, including rotation
+    /// while iOS keeps a portrait-only app on screen. Never press during proof.
+    private func prepareOrientation(windowGesture: UInt64? = nil) throws {
+        guard calibration == nil, let orientationFrame else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if orientationSize == screenSize?(), now - orientationCheckedAt < 10 { return }
+        let activity = backgroundSequence.current
+        func ready() throws {
+            if let windowGesture, !windowSequence.isCurrent(windowGesture) {
+                throw InputError.pointerProbe("orientation", "cancelled")
+            }
+            try requireProbe(
+                stage: "orientation",
+                sequence: windowGesture == nil ? activity : backgroundSequence.current,
+                isReady: { self.isPointerReady })
+        }
+        var detected: PointerTurn?
+        for targets in [PointerScreenMatcher.gutterProbeTargets, PointerScreenMatcher.fallbackProbeTargets] {
+            var frames: [[UInt8]] = []
+            // As in pairingProbe, make A a changed absolute report even if the
+            // previous proof returned to A and iOS subsequently hid the cursor.
+            try ready()
+            moveAbsolutePointer(targets[2].x, targets[2].y, sequence: nil, raw: true)
+            pause(0.15)
+            for point in targets + [targets[0]] {
+                try ready()
+                moveAbsolutePointer(point.x, point.y, sequence: nil, raw: true)
+                pause(0.6)
+                guard let frame = orientationFrame() else {
+                    throw InputError.pointerProbe("orientation", "fresh-frame-unavailable")
+                }
+                frames.append(frame)
+            }
+            try ready()
+            if let turn = PointerScreenMatcher.pointerTurn(frames, targets: targets) {
+                detected = turn
+                break
+            }
+        }
+        guard let turn = detected else {
+            throw InputError.pointerProbe("orientation", "ambiguous-trajectory")
+        }
+        if pointerTurn != turn || orientationSize != screenSize?() {
+            measuredDragCurve = nil
+            clearPointerEstimate()
+        }
+        pointerTurn = turn
+        orientationSize = screenSize?()
+        orientationCheckedAt = ProcessInfo.processInfo.systemUptime
+        diagnosticLock.withLock { preparationInfo["rotationDegrees"] = turn.rawValue * 90 }
+    }
+
+    private func prepareMeasuredDrag(windowGesture: UInt64? = nil) throws {
         guard calibration == nil, let pointerFrame, let size = screenSize?() else { return }
         if measuredDragCurve != nil, measuredDragSize == size { return }
         let activity = backgroundSequence.current
         func ready() throws {
-            try requireProbe(stage: "drag-calibration", sequence: activity, isReady: { self.isPointerReady })
+            let sequence = windowGesture == nil ? activity : backgroundSequence.current
+            try requireProbe(
+                stage: "drag-calibration", sequence: sequence,
+                isReady: {
+                    self.isPointerReady && (windowGesture.map(self.windowSequence.isCurrent) ?? true)
+                })
         }
+        let started = ProcessInfo.processInfo.systemUptime
+        var verticalScale = 1.0
         let curve = try DragPointerCalibration.measure(
             size: size,
             position: { x, y in
                 try ready()
                 self.moveAbsolutePointer(x, y, sequence: nil)
-                self.pause(0.15)
+                self.pause(self.step)
             },
             send: { dx, dy in
                 try ready()
@@ -770,16 +871,24 @@ extension DeviceInput {
                 self.pause(self.step)
             },
             capture: {
-                self.pause(0.4)
+                self.pause(0.3)
                 try ready()
                 guard let frame = pointerFrame() else {
                     throw InputError.pointerProbe("drag-calibration", "fresh-frame-unavailable")
                 }
                 try ready()
                 return frame
-            })
+            }, verticalScale: { verticalScale = $0 })
+        measuredDragVerticalScale = verticalScale
         measuredDragCurve = curve
         measuredDragSize = size
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        diagnosticLock.withLock {
+            preparationInfo["dragCalibrationSeconds"] = elapsed
+            preparationInfo["dragDistances"] = curve
+            preparationInfo["dragVerticalScale"] = verticalScale
+        }
+        log("drag calibration completed in \(elapsed)s")
     }
 
     /// Anchors the uncalibrated drag estimate at the press position.
@@ -848,12 +957,15 @@ extension DeviceInput {
                 guard abs(error) > tolerance else { continue }
                 // Largest count whose predicted distance still fits the error,
                 // so the estimate never overshoots its own prediction.
+                let axisScale = scale * (axis == 1 && curve != nil ? measuredDragVerticalScale : 1)
                 var count = 1
                 for candidate in 1..<distances.count
-                where distances[candidate] * scale <= abs(error) + tolerance {
+                where distances[candidate] * axisScale <= abs(error) + tolerance {
                     count = candidate
                 }
-                let distance = distances[count] * scale
+                let distance =
+                    distances[count] * scale
+                    * (axis == 1 && curve != nil ? measuredDragVerticalScale : 1)
                 if axis == 0 {
                     report.dx = error < 0 ? -count : count
                     position.x = max(0, min(size.width - 1, position.x + (error < 0 ? -distance : distance)))
@@ -872,9 +984,10 @@ extension DeviceInput {
         // Keep the absolute bookkeeping where the phone most likely shows the
         // pointer, so a later hover or cancellation does not jump it.
         let unit = Double(HIDReportMap.absoluteMax)
+        let raw = pointerTurn.rawPoint(for: CGPoint(x: position.x / size.width, y: position.y / size.height))
         absolutePointerPosition = (
-            UInt16(max(0, min(unit, (position.x / size.width * unit).rounded()))),
-            UInt16(max(0, min(unit, (position.y / size.height * unit).rounded())))
+            UInt16(max(0, min(unit, (raw.x * unit).rounded()))),
+            UInt16(max(0, min(unit, (raw.y * unit).rounded())))
         )
     }
 
@@ -915,7 +1028,8 @@ extension DeviceInput {
     }
 
     fileprivate func relative(_ dx: Int, _ dy: Int) {
-        send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: buttons, dx: dx, dy: dy))
+        let delta = calibration == nil ? pointerTurn.rawDelta(dx: dx, dy: dy) : (dx, dy)
+        send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: buttons, dx: delta.0, dy: delta.1))
     }
 
     fileprivate func button(down: Bool) {
