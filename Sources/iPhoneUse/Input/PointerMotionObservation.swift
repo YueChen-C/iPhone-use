@@ -9,6 +9,21 @@ enum PointerMotionObservation {
         let height: Int
         let pixels: [UInt8]
 
+        func cropped(to rect: CGRect) -> (frame: Frame, origin: CGPoint)? {
+            guard isValid, [rect.minX, rect.minY, rect.maxX, rect.maxY].allSatisfy({ $0.isFinite }) else { return nil }
+            let rect = rect.intersection(CGRect(x: 0, y: 0, width: width, height: height))
+            guard !rect.isNull, !rect.isEmpty else { return nil }
+            let left = max(0, Int(rect.minX.rounded(.down)))
+            let top = max(0, Int(rect.minY.rounded(.down)))
+            let right = min(width, Int(rect.maxX.rounded(.up)))
+            let bottom = min(height, Int(rect.maxY.rounded(.up)))
+            guard right > left, bottom > top else { return nil }
+            var result: [UInt8] = []
+            result.reserveCapacity((right - left) * (bottom - top))
+            for row in top..<bottom { result.append(contentsOf: pixels[(row * width + left)..<(row * width + right)]) }
+            return (Frame(width: right - left, height: bottom - top, pixels: result), CGPoint(x: left, y: top))
+        }
+
         var isValid: Bool {
             width > 0 && height > 0 && width <= 4096 && height <= 4096
                 && pixels.count == width * height
@@ -63,7 +78,9 @@ enum PointerMotionObservation {
         return edges.last?.to
     }
 
-    static func motion(from a: Frame, to b: Frame, direction: CGPoint) -> Motion? {
+    static func motion(
+        from a: Frame, to b: Frame, direction: CGPoint, pressedPointer: Bool = false
+    ) -> Motion? {
         guard a.isValid, b.isValid, a.width == b.width, a.height == b.height,
             direction.x.isFinite, direction.y.isFinite, hypot(direction.x, direction.y) > 0
         else { return nil }
@@ -114,9 +131,9 @@ enum PointerMotionObservation {
             guard blobs.count <= 2 else { return nil }
         }
         guard blobs.count == 2, blobs.allSatisfy(\.isPointer),
-            abs(blobs[0].bounds.width - blobs[1].bounds.width) <= 1,
-            abs(blobs[0].bounds.height - blobs[1].bounds.height) <= 1,
-            Double(min(blobs[0].area, blobs[1].area)) / Double(max(blobs[0].area, blobs[1].area)) >= 0.85,
+            abs(blobs[0].bounds.width - blobs[1].bounds.width) <= (pressedPointer ? 4 : 1),
+            abs(blobs[0].bounds.height - blobs[1].bounds.height) <= (pressedPointer ? 4 : 1),
+            Double(min(blobs[0].area, blobs[1].area)) / Double(max(blobs[0].area, blobs[1].area)) >= (pressedPointer ? 0.75 : 0.85),
             !blobs[0].bounds.insetBy(dx: -3, dy: -3).intersects(blobs[1].bounds.insetBy(dx: -3, dy: -3))
         else { return nil }
         let ordered = blobs.sorted {

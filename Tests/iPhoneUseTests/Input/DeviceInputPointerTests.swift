@@ -9,6 +9,37 @@ private func curveStep(_ byte: UInt8) -> Double {
 }
 
 final class DeviceInputPointerTests: XCTestCase {
+    func testRepeatedSwipeOriginRearmsAbsoluteAfterRelativeMovement() throws {
+        var position = CGPoint.zero
+        var lastAbsolute: [UInt8] = []
+        var presses: [CGPoint] = []
+        var held = false
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), screenSize: { CGSize(width: 375, height: 667) },
+            sleep: { _ in }, reportSender: { id, bytes in
+                if id == .absolutePointer {
+                    let coordinate = Array(bytes[1...4])
+                    if coordinate != lastAbsolute {
+                        position = CGPoint(
+                            x: Double(Int(bytes[1]) | Int(bytes[2]) << 8) / 32767 * 375,
+                            y: Double(Int(bytes[3]) | Int(bytes[4]) << 8) / 32767 * 667)
+                    }
+                    lastAbsolute = coordinate
+                } else if id == .relativeMouse {
+                    if bytes[0] == 1 && !held { presses.append(position) }
+                    held = bytes[0] == 1
+                    position.x += Double(Int8(bitPattern: bytes[1]))
+                    position.y += Double(Int8(bitPattern: bytes[2]))
+                }
+            }, reportReadiness: { _, _, _ in true })
+        for _ in 0..<2 { try input.swipe(points: [(0.2, 0.5), (0.6, 0.5)], duration: 0.1) }
+        XCTAssertEqual(presses.count, 2)
+        for point in presses {
+            XCTAssertEqual(point.x, 75, accuracy: 0.1)
+            XCTAssertEqual(point.y, 333.5, accuracy: 0.1)
+        }
+    }
+
     func testCaptureRecheckRetainsBluetoothReadinessButBlocksInputUntilConfirmed() throws {
         var allowed = true
         var reports: [(ReportID, [UInt8])] = []

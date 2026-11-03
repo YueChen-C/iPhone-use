@@ -71,12 +71,21 @@ enum DragPointerCalibration {
         }
         var verticalRatios: [Double] = []
         for count in [4, 8] {
-            let actual = try sample(count, reports(curve[count]), vertical: true)
-            verticalRatios.append(actual / curve[count])
+            var actual = try sample(count, reports(curve[count]), vertical: true)
+            // Retry only a mismatched pair, keeping the same acceptance bound.
+            // A transient sample must not force the other seven counts to repeat.
+            for _ in 0..<2 where abs(actual - curve[count]) > max(0.15, curve[count] * 0.05) {
+                curve[count] = try sample(count, reports(curve[count]))
+                actual = try sample(count, reports(curve[count]), vertical: true)
+            }
             guard abs(actual - curve[count]) <= max(0.15, curve[count] * 0.05) else {
                 throw DeviceError(
                     "drag calibration: y count \(count) actual=\(actual) expected=\(curve[count]); no drag sent")
             }
+            verticalRatios.append(actual / curve[count])
+        }
+        guard zip(curve, curve.dropFirst()).allSatisfy({ $0 < $1 }) else {
+            throw DeviceError("drag calibration: inconsistent repeated curve; no drag sent")
         }
         verticalScale(verticalRatios.reduce(0, +) / Double(verticalRatios.count))
         return curve

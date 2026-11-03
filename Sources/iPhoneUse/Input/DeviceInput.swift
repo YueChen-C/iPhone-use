@@ -48,6 +48,7 @@ final class DeviceInput {
     private var buttons: UInt8 = 0
     private let reportSender: (ReportID, [UInt8]) -> Void
     private let sleep: (TimeInterval) -> Void
+    private let monotonicTime: () -> TimeInterval
     private var windowDragging = false
     private let windowSequence = PointerMotionSequence()
     private var pointerTurn: PointerTurn = .none
@@ -71,6 +72,8 @@ final class DeviceInput {
     }
     let calibration: RelativePointerCalibration?
     private var absolutePointerPosition: (x: UInt16, y: UInt16)?
+    private var lastAbsoluteReport: (x: UInt16, y: UInt16)?
+    private var relativeSinceAbsolute = false
     private var estimatedPosition: CGPoint?
     /// Queue-confined progress lets fresh hover targets share one homing path.
     /// Cancelling the interaction or invalidating its mapping starts a new path.
@@ -80,6 +83,9 @@ final class DeviceInput {
     /// drag runs on the relative collection. Nil outside a drag.
     private var measuredDragCurve: [Double]?
     private var measuredDragSize: CGSize?
+    private var dragStartFrame: PointerMotionObservation.Frame?
+    private var dragStartPoint: CGPoint?
+    private var dragWindowSequence: UInt64?
     private var measuredDragVerticalScale = 1.0
     private let pointerFrame: (() -> PointerMotionObservation.Frame?)?
     private var dragPosition: CGPoint?
@@ -158,6 +164,7 @@ final class DeviceInput {
         pointerFrame: (() -> PointerMotionObservation.Frame?)? = nil,
         orientationFrame: (() -> [UInt8]?)? = nil,
         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
+        monotonicTime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         reportSender: ((ReportID, [UInt8]) -> Void)? = nil,
         reportReadiness: ((ReportID, UUID, UUID?) -> Bool)? = nil
     ) {
@@ -171,6 +178,7 @@ final class DeviceInput {
         self.pointerFrame = pointerFrame
         self.orientationFrame = orientationFrame
         self.sleep = sleep
+        self.monotonicTime = monotonicTime
         self.reportReadiness =
             reportReadiness ?? {
                 HIDPeripheral.shared.isReady(report: $0, host: $1, session: $2)
@@ -234,6 +242,10 @@ extension DeviceInput {
             pointer(points[0].0, points[0].1)
             pause(step * 2)
             beginEstimatedDrag(x: points[0].0, y: points[0].1)
+            guard shouldContinueMotion(nil), dragWindowSequence.map(windowSequence.isCurrent) ?? true else {
+                endEstimatedDrag()
+                throw InputError.pointerProbe("drag-start", "cancelled")
+            }
             button(down: true)
             pause(step)
             for (index, segmentDuration) in durations.enumerated() {
@@ -243,10 +255,17 @@ extension DeviceInput {
                 let steps = max(2, Int(segmentDuration / step))
                 for i in 1...steps {
                     let t = Double(i) / Double(steps)
+                    let started = monotonicTime()
                     dragMove(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t, sequence: nil)
-                    pause(segmentDuration / Double(steps))
+                    // Measured relative reports already wait at the calibration cadence.
+                    // Count that time toward this path interval, rather than
+                    // slowing reports a second time and changing iOS acceleration.
+                    let spent = measuredDragCurve == nil ? 0 : monotonicTime() - started
+                    let remaining = segmentDuration / Double(steps) - spent
+                    if remaining > 0 { pause(remaining) }
                 }
             }
+            if let last = points.last { refineDragEndpoint(x: last.0, y: last.1) }
             button(down: false)
             pause(step)
             endEstimatedDrag()
@@ -544,6 +563,11 @@ extension DeviceInput {
             // Use the same positioning interval as the coordinate tap API.
             self.pause(self.step * 2)
             self.beginEstimatedDrag(x: x, y: y)
+            guard self.windowSequence.isCurrent(gesture), self.shouldContinueMotion(nil) else {
+                self.windowDragging = false
+                self.endEstimatedDrag()
+                return
+            }
             self.button(down: true)
         }
     }
@@ -563,6 +587,7 @@ extension DeviceInput {
         queue.async {
             guard self.windowDragging else { return }
             self.dragMove(x, y, sequence: nil)
+            self.refineDragEndpoint(x: x, y: y)
             self.button(down: false)
             self.windowDragging = false
             self.endEstimatedDrag()
@@ -775,6 +800,15 @@ extension DeviceInput {
         let max = Double(HIDReportMap.absoluteMax)
         let px = UInt16(Swift.max(0, Swift.min(max, (x * max).rounded())))
         let py = UInt16(Swift.max(0, Swift.min(max, (y * max).rounded())))
+        // iOS ignores an unchanged absolute report even after relative movement.
+        // Re-arm it with a nearby hover report before repeating a drag origin.
+        if buttons == 0, relativeSinceAbsolute, lastAbsoluteReport?.x == px, lastAbsoluteReport?.y == py {
+            let nearby = px < HIDReportMap.absoluteMax - 32 ? px + 32 : px - 32
+            absolutePointerPosition = (nearby, py)
+            send(.absolutePointer, HIDReportPayload.absolutePointer(buttons: 0, x: nearby, y: py))
+            pause(step)
+            guard shouldContinueMotion(sequence) else { return }
+        }
         absolutePointerPosition = (px, py)
         send(.absolutePointer, HIDReportPayload.absolutePointer(buttons: buttons, x: px, y: py))
     }
@@ -871,13 +905,7 @@ extension DeviceInput {
                 self.pause(self.step)
             },
             capture: {
-                self.pause(0.3)
-                try ready()
-                guard let frame = pointerFrame() else {
-                    throw InputError.pointerProbe("drag-calibration", "fresh-frame-unavailable")
-                }
-                try ready()
-                return frame
+                try self.settledPointerFrame(stage: "drag-calibration", ready: ready)
             }, verticalScale: { verticalScale = $0 })
         measuredDragVerticalScale = verticalScale
         measuredDragCurve = curve
@@ -891,14 +919,100 @@ extension DeviceInput {
         log("drag calibration completed in \(elapsed)s")
     }
 
+    private func settledPointerFrame(
+        stage: String, ready: () throws -> Void
+    ) throws -> PointerMotionObservation.Frame {
+        guard let pointerFrame else { throw InputError.pointerProbe(stage, "frame-unavailable") }
+        pause(0.3)
+        try ready()
+        guard var frame = pointerFrame() else { throw InputError.pointerProbe(stage, "frame-unavailable") }
+        // A fresh USB frame can still contain queued pointer movement.
+        for _ in 0..<5 {
+            pause(0.1)
+            try ready()
+            guard let next = pointerFrame() else { throw InputError.pointerProbe(stage, "frame-unavailable") }
+            try ready()
+            if let changed = PointerMotionObservation.changedPixels(frame, next), changed <= 64 { return next }
+            frame = next
+        }
+        throw InputError.pointerProbe(stage, "frame-not-settled")
+    }
+
     /// Anchors the uncalibrated drag estimate at the press position.
     fileprivate func beginEstimatedDrag(x: Double, y: Double) {
         guard calibration == nil, let size = screenSize?() else { return }
         dragPosition = CGPoint(x: x * size.width, y: y * size.height)
         lastEstimatedMovement = nil
+        dragStartPoint = dragPosition
+        dragWindowSequence = windowSequence.current
+        if measuredDragCurve != nil, let pointerFrame {
+            pause(0.15)
+            dragStartFrame = pointerFrame()
+        }
+    }
+
+    /// Refine only a visibly stationary path corridor. A scroll, morph, stale capture,
+    /// cancellation, or unrelated moving object must never steer a held touch.
+    private func refineDragEndpoint(x: Double, y: Double) {
+        func stage(_ value: String) { diagnosticLock.withLock { preparationInfo["dragEndpointObservation"] = value } }
+        diagnosticLock.withLock { _ = preparationInfo.removeValue(forKey: "dragEndpointErrorPixels") }
+        stage("unavailable")
+        guard let baseline = dragStartFrame, let start = dragStartPoint,
+            let size = screenSize?(), measuredDragSize == size,
+            pointerFrame != nil, let gesture = dragWindowSequence
+        else { return }
+        let sx = size.width / Double(baseline.width)
+        let sy = size.height / Double(baseline.height)
+        let target = CGPoint(x: x * size.width, y: y * size.height)
+        let direction = CGPoint(x: (target.x - start.x) / sx, y: (target.y - start.y) / sy)
+        let path = hypot(direction.x, direction.y)
+        stage("short-path")
+        guard path >= 40 else { return }
+        let margin = max(20, path * 0.15) + 55
+        let region = CGRect(
+            x: min(start.x, target.x) / sx - margin,
+            y: min(start.y, target.y) / sy - margin,
+            width: abs(target.x - start.x) / sx + margin * 2,
+            height: abs(target.y - start.y) / sy + margin * 2)
+        guard let initial = baseline.cropped(to: region) else { return }
+        for _ in 0..<3 {
+            stage("cancelled")
+            guard windowSequence.isCurrent(gesture), shouldContinueMotion(nil), buttons != 0 else { return }
+            stage("frame-unavailable")
+            guard let frame = try? settledPointerFrame(stage: "drag-endpoint", ready: {
+                guard self.windowSequence.isCurrent(gesture), self.shouldContinueMotion(nil) else {
+                    throw InputError.pointerProbe("drag-endpoint", "cancelled")
+                }
+            }) else { return }
+            stage("unmatched")
+            guard frame.width == baseline.width, frame.height == baseline.height,
+                windowSequence.isCurrent(gesture), shouldContinueMotion(nil),
+                let current = frame.cropped(to: region), current.origin == initial.origin,
+                let localMotion = PointerMotionObservation.motion(
+                    from: initial.frame, to: current.frame, direction: direction, pressedPointer: true)
+            else { return }
+            let origin = initial.origin
+            let motion = PointerMotionObservation.Motion(
+                from: CGPoint(x: localMotion.from.x + origin.x, y: localMotion.from.y + origin.y),
+                to: CGPoint(x: localMotion.to.x + origin.x, y: localMotion.to.y + origin.y))
+            stage("start-mismatch")
+            guard hypot(motion.from.x - start.x / sx, motion.from.y - start.y / sy) <= 5 else { return }
+            let error = hypot(motion.to.x - target.x / sx, motion.to.y - target.y / sy)
+            stage("out-of-range")
+            guard error <= max(20, path * 0.15) else { return }
+            dragPosition = CGPoint(x: motion.to.x * sx, y: motion.to.y * sy)
+            diagnosticLock.withLock { preparationInfo["dragEndpointErrorPixels"] = error }
+            if error <= 2 { stage("verified"); return }
+            stage("correcting")
+            moveEstimatedDragPointer(x, y, sequence: nil)
+        }
+        stage("correction-limit")
     }
 
     fileprivate func endEstimatedDrag() {
+        dragStartFrame = nil
+        dragStartPoint = nil
+        dragWindowSequence = nil
         dragPosition = nil
         lastEstimatedMovement = nil
     }
@@ -1086,6 +1200,12 @@ extension DeviceInput {
         // A capture can be invalidated while an input is queued. Stop stale
         // movement and presses, while still releasing any held button or key.
         guard inputIsAllowed() || (id != .absolutePointer && bytes.allSatisfy { $0 == 0 }) else { return }
+        if id == .absolutePointer, bytes.count >= 5 {
+            lastAbsoluteReport = (UInt16(bytes[1]) | UInt16(bytes[2]) << 8, UInt16(bytes[3]) | UInt16(bytes[4]) << 8)
+            relativeSinceAbsolute = false
+        } else if id == .relativeMouse, bytes.count >= 3, bytes[1] != 0 || bytes[2] != 0 {
+            relativeSinceAbsolute = true
+        }
         reportSender(id, bytes)
     }
 

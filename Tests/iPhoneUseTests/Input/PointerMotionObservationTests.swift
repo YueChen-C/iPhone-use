@@ -47,6 +47,24 @@ final class PointerMotionObservationTests: XCTestCase {
         PointerMotionObservation.motion(from: frames.0, to: frames.1, direction: CGPoint(x: 1, y: 0))
     }
 
+    func testPressedPointerAllowsObservedFourPixelRasterShrinkOnlyWhenRequested() throws {
+        func frame(center: Double, radius: Double) -> PointerMotionObservation.Frame {
+            var pixels = [UInt8](repeating: 255, count: 320 * 160)
+            for y in 0..<160 {
+                for x in 0..<320 where hypot(Double(x) - center, Double(y) - 80.5) <= radius {
+                    pixels[y * 320 + x] = 100
+                }
+            }
+            return .init(width: 320, height: 160, pixels: pixels)
+        }
+        let before = frame(center: 80.5, radius: 12.6)
+        let after = frame(center: 200.5, radius: 11.4)
+        let direction = CGPoint(x: 1, y: 0)
+        XCTAssertNil(PointerMotionObservation.motion(from: before, to: after, direction: direction))
+        XCTAssertNotNil(PointerMotionObservation.motion(
+            from: before, to: after, direction: direction, pressedPointer: true))
+    }
+
     func testTwentyFourPixelTextEdgeAndSparseNoisePreservePointerObservation() throws {
         // Reproduce the observed component geometry without storing phone frames:
         // one 1 x 24 text edge plus 111 isolated changed pixels, away from disks.
