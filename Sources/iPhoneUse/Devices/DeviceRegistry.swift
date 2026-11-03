@@ -274,6 +274,14 @@ final class DeviceRegistry {
                 let manager = ScreenCaptureManager.shared
                 guard let screen else { return screenID == nil && manager.permitsPointerAssociation }
                 return manager.permitsPointerAssociation(for: screen)
+            },
+            pointerFrame: { [weak screen] in
+                guard let screen, let size = screen.size,
+                    let pixels = screen.probeThumbnail(
+                        width: Int(size.width), height: Int(size.height),
+                        isReady: { ScreenCaptureManager.shared.permitsPointerAssociation(for: screen) })
+                else { return nil }
+                return .init(width: Int(size.width), height: Int(size.height), pixels: pixels)
             })
         return input
     }

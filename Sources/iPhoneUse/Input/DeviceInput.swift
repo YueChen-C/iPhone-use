@@ -58,6 +58,9 @@ final class DeviceInput {
     private var lastTrackingMovement: RelativePointerCalibration.Movement?
     /// Predicted pointer position in physical pixels while an uncalibrated
     /// drag runs on the relative collection. Nil outside a drag.
+    private var measuredDragCurve: [Double]?
+    private var measuredDragSize: CGSize?
+    private let pointerFrame: (() -> PointerMotionObservation.Frame?)?
     private var dragPosition: CGPoint?
     private var lastEstimatedMovement: RelativePointerCalibration.Movement?
     private let motionSequence = PointerMotionSequence()
@@ -130,6 +133,7 @@ final class DeviceInput {
         calibrationFilePresent: Bool? = nil,
         screenSize: (() -> CGSize?)? = nil,
         inputIsAllowed: @escaping () -> Bool = { true },
+        pointerFrame: (() -> PointerMotionObservation.Frame?)? = nil,
         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
         reportSender: ((ReportID, [UInt8]) -> Void)? = nil,
         reportReadiness: ((ReportID, UUID, UUID?) -> Bool)? = nil
@@ -141,6 +145,7 @@ final class DeviceInput {
         self.calibrationFilePresent = calibrationFilePresent ?? calibrationRequired
         self.screenSize = screenSize
         self.inputIsAllowed = inputIsAllowed
+        self.pointerFrame = pointerFrame
         self.sleep = sleep
         self.reportReadiness =
             reportReadiness ?? {
@@ -194,6 +199,7 @@ extension DeviceInput {
                 reportCount.isFinite, reportCount < Double(Int.max)
             else { throw InputError.invalidSwipe(table.swipeReasonReportCount) }
 
+            try prepareMeasuredDrag()
             let durations = swipeSegmentDurations(points: points, duration: duration)
             // iOS synthesizes the touch on the relative collection only, and
             // absolute movement cannot move a held touch. Uncalibrated hosts
@@ -744,6 +750,38 @@ extension DeviceInput {
         }
     }
 
+    private func prepareMeasuredDrag() throws {
+        guard calibration == nil, let pointerFrame, let size = screenSize?() else { return }
+        if measuredDragCurve != nil, measuredDragSize == size { return }
+        let activity = backgroundSequence.current
+        func ready() throws {
+            try requireProbe(stage: "drag-calibration", sequence: activity, isReady: { self.isPointerReady })
+        }
+        let curve = try DragPointerCalibration.measure(
+            size: size,
+            position: { x, y in
+                try ready()
+                self.moveAbsolutePointer(x, y, sequence: nil)
+                self.pause(0.15)
+            },
+            send: { dx, dy in
+                try ready()
+                self.relative(dx, dy)
+                self.pause(self.step)
+            },
+            capture: {
+                self.pause(0.4)
+                try ready()
+                guard let frame = pointerFrame() else {
+                    throw InputError.pointerProbe("drag-calibration", "fresh-frame-unavailable")
+                }
+                try ready()
+                return frame
+            })
+        measuredDragCurve = curve
+        measuredDragSize = size
+    }
+
     /// Anchors the uncalibrated drag estimate at the press position.
     fileprivate func beginEstimatedDrag(x: Double, y: Double) {
         guard calibration == nil, let size = screenSize?() else { return }
@@ -790,8 +828,10 @@ extension DeviceInput {
         let target = CGPoint(
             x: max(0, min(size.width - 1, x * size.width)),
             y: max(0, min(size.height - 1, y * size.height)))
-        let scale = size.width / Self.estimatedDragReferenceWidth
-        let tolerance = Self.estimatedDragCurve[1] * scale / 2
+        let curve = measuredDragSize == size ? measuredDragCurve : nil
+        let distances = curve ?? Self.estimatedDragCurve
+        let scale = curve == nil ? size.width / Self.estimatedDragReferenceWidth : 1
+        let tolerance = distances[1] * scale / 2
         while shouldContinueMotion(sequence) {
             let remainingX = target.x - position.x
             let remainingY = target.y - position.y
@@ -809,11 +849,11 @@ extension DeviceInput {
                 // Largest count whose predicted distance still fits the error,
                 // so the estimate never overshoots its own prediction.
                 var count = 1
-                for candidate in 1...Self.estimatedDragMaxCount
-                where Self.estimatedDragCurve[candidate] * scale <= abs(error) + tolerance {
+                for candidate in 1..<distances.count
+                where distances[candidate] * scale <= abs(error) + tolerance {
                     count = candidate
                 }
-                let distance = Self.estimatedDragCurve[count] * scale
+                let distance = distances[count] * scale
                 if axis == 0 {
                     report.dx = error < 0 ? -count : count
                     position.x = max(0, min(size.width - 1, position.x + (error < 0 ? -distance : distance)))

@@ -89,6 +89,16 @@ final class DeviceInputPointerTests: XCTestCase {
         XCTAssertEqual(Array(reports.dropFirst()), expected)
     }
 
+    func testUnobservableDragCalibrationNeverPressesOrFallsBackToGuessedDrag() {
+        var reports: [(ReportID, [UInt8])] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), screenSize: { CGSize(width: 1320, height: 2868) },
+            pointerFrame: { nil }, sleep: { _ in },
+            reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+        XCTAssertThrowsError(try input.swipe(points: [(0.5, 0.8), (0.5, 0.3)], duration: 0.4))
+        XCTAssertFalse(reports.contains { $0.0 == .relativeMouse && $0.1[0] != 0 })
+    }
+
     func testAutomaticMeasurementReportsSessionAndCancellationSeparately() {
         let missing = DeviceInput(host: UUID(), session: nil, sleep: { _ in }, reportSender: { _, _ in })
         XCTAssertThrowsError(
