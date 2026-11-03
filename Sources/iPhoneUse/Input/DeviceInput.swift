@@ -59,7 +59,6 @@ final class DeviceInput {
     /// Predicted pointer position in physical pixels while an uncalibrated
     /// drag runs on the relative collection. Nil outside a drag.
     private var dragPosition: CGPoint?
-    private var lastEstimatedMovement: RelativePointerCalibration.Movement?
     private let motionSequence = PointerMotionSequence()
     // Background cancellation must not supersede a foreground hover already
     // submitted by the timer for the same AppKit mouse event.
@@ -174,7 +173,8 @@ extension DeviceInput {
     }
 
     /// Follow a polyline with one press and release. `duration` is the total
-    /// movement wait; positioning, button pacing and calibrated HID reports
+    /// movement wait; estimated report pacing counts toward it. Positioning,
+    /// button pacing and calibrated HID reports
     /// retain their own intervals. Segment waits follow physical screen distance.
     func swipe(points: [(Double, Double)], duration: TimeInterval) throws {
         try performCoordinateGesture {
@@ -211,8 +211,16 @@ extension DeviceInput {
                 let steps = max(2, Int(segmentDuration / step))
                 for i in 1...steps {
                     let t = Double(i) / Double(steps)
-                    dragMove(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t, sequence: nil)
-                    pause(segmentDuration / Double(steps))
+                    let x = from.0 + (to.0 - from.0) * t
+                    let y = from.1 + (to.1 - from.1) * t
+                    let interval = segmentDuration / Double(steps)
+                    if calibration != nil {
+                        dragMove(x, y, sequence: nil)
+                        pause(interval)
+                    } else {
+                        let movementWait = moveEstimatedDragPointer(x, y, sequence: nil)
+                        if interval > movementWait { pause(interval - movementWait) }
+                    }
                 }
             }
             button(down: false)
@@ -741,12 +749,10 @@ extension DeviceInput {
     fileprivate func beginEstimatedDrag(x: Double, y: Double) {
         guard calibration == nil, let size = screenSize?() else { return }
         dragPosition = CGPoint(x: x * size.width, y: y * size.height)
-        lastEstimatedMovement = nil
     }
 
     fileprivate func endEstimatedDrag() {
         dragPosition = nil
-        lastEstimatedMovement = nil
     }
 
     /// Built-in acceleration prior for drags without a measured curve:
@@ -770,33 +776,28 @@ extension DeviceInput {
     /// value in the built-in curve.
     static let estimatedDragMaxCount = 32
 
-    /// Follows the drag target with relative reports, one axis per report like
-    /// unverified calibrated profiles. Each report picks the count whose
+    /// Follows the drag target with combined relative X/Y reports. Each axis picks the count whose
     /// curve-predicted distance best covers the remaining error, so slow and
     /// fast drags track the mouse at the same fidelity; each new target
     /// corrects whatever the real curve did differently.
-    fileprivate func moveEstimatedDragPointer(_ x: Double, _ y: Double, sequence: UInt64?) {
+    @discardableResult
+    fileprivate func moveEstimatedDragPointer(_ x: Double, _ y: Double, sequence: UInt64?) -> TimeInterval {
         guard shouldContinueMotion(sequence),
             let size = screenSize?(),
             var position = dragPosition
-        else { return }
+        else { return 0 }
         let target = CGPoint(
             x: max(0, min(size.width - 1, x * size.width)),
             y: max(0, min(size.height - 1, y * size.height)))
         let scale = size.width / Self.estimatedDragReferenceWidth
         let tolerance = Self.estimatedDragCurve[1] * scale / 2
+        var movementWait: TimeInterval = 0
         while shouldContinueMotion(sequence) {
             let remainingX = target.x - position.x
             let remainingY = target.y - position.y
             guard abs(remainingX) > tolerance || abs(remainingY) > tolerance else { break }
-            let preferredAxis: Int
-            if let last = lastEstimatedMovement {
-                preferredAxis = last.dx != 0 ? 1 : 0
-            } else {
-                preferredAxis = abs(remainingX) >= abs(remainingY) ? 0 : 1
-            }
             var report = (dx: 0, dy: 0)
-            for axis in [preferredAxis, 1 - preferredAxis] {
+            for axis in 0...1 {
                 let error = axis == 0 ? remainingX : remainingY
                 guard abs(error) > tolerance else { continue }
                 // Largest count whose predicted distance still fits the error,
@@ -814,12 +815,11 @@ extension DeviceInput {
                     report.dy = error < 0 ? -count : count
                     position.y = max(0, min(size.height - 1, position.y + (error < 0 ? -distance : distance)))
                 }
-                break
             }
             guard report.dx != 0 || report.dy != 0 else { break }
             relative(report.dx, report.dy)
-            lastEstimatedMovement = RelativePointerCalibration.Movement(dx: report.dx, dy: report.dy)
             pause(step)
+            movementWait += step
         }
         dragPosition = position
         // Keep the absolute bookkeeping where the phone most likely shows the
@@ -829,6 +829,7 @@ extension DeviceInput {
             UInt16(max(0, min(unit, (position.x / size.width * unit).rounded()))),
             UInt16(max(0, min(unit, (position.y / size.height * unit).rounded())))
         )
+        return movementWait
     }
 
     fileprivate func shouldContinueMotion(_ sequence: UInt64?) -> Bool {
@@ -895,7 +896,6 @@ extension DeviceInput {
         relativeHomingReportIndex = 0
         lastTrackingMovement = nil
         dragPosition = nil
-        lastEstimatedMovement = nil
     }
 
     fileprivate func requireIdlePointer() throws {

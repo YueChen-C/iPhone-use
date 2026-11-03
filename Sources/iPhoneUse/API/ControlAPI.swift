@@ -25,9 +25,17 @@ enum ControlAPI {
     }
 
     static func handle(_ request: HTTPRequest) -> HTTPResponse {
+        handle(request, ocrCapture: captureTextScreen, ocrTap: tapTextPoint)
+    }
+
+    static func handle(
+        _ request: HTTPRequest,
+        ocrCapture: (String?, Int?) throws -> (String, Data),
+        ocrTap: (String, Double, Double, Double) throws -> Void = tapTextPoint
+    ) -> HTTPResponse {
         let body = request.body
         // A body selector takes precedence over the query-string selector.
-        let deviceQuery = (body["device"] as? String) ?? request.query["device"]
+        let deviceQuery = deviceSelector(body: body, query: request.query)
         do {
             switch (request.method, request.path) {
             case ("GET", "/viewer"), ("GET", "/viewer/"):
@@ -54,6 +62,25 @@ enum ControlAPI {
                         device, retry: true, verifyOnly: (body["verifyOnly"] as? Bool) ?? false)
                 }
                 return status()
+            case ("GET", "/ocr"), ("POST", "/ocr"):
+                var options: [String: Any] = request.query
+                if let raw = request.query["maxEdge"] {
+                    guard let value = Int(raw), value > 0 else {
+                        throw DeviceError(StringsAPI.current.ocrParameterInvalid("maxEdge"))
+                    }
+                    options["maxEdge"] = value
+                }
+                options.merge(body) { _, value in value }
+                let (id, data) = try ocrCapture(deviceQuery, OCRRequest.maxEdge(options))
+                return .json(ScreenOCR.recognize(data).json(device: id))
+            case ("POST", "/tap_text"):
+                let tap = try TextTapRequest(body)
+                let (id, data) = try ocrCapture(deviceQuery, OCRRequest.maxEdge(body))
+                let result = ScreenOCR.recognize(data)
+                let match = try tap.match(result)
+                try ocrTap(
+                    id, Double(match.x) / Double(result.width), Double(match.y) / Double(result.height), tap.hold)
+                return .json(["ok": true, "device": id, "text": match.text, "x": match.x, "y": match.y])
             case ("GET", "/screenshot"):
                 return try screenshot(request.query, deviceQuery: deviceQuery)
             default:
@@ -67,6 +94,11 @@ enum ControlAPI {
         } catch {
             return .error("\(error)")
         }
+    }
+
+    /// Body selectors retain precedence; the original name wins within each source.
+    static func deviceSelector(body: [String: Any], query: [String: String]) -> String? {
+        (body["device"] as? String) ?? (body["device_id"] as? String) ?? query["device"] ?? query["device_id"]
     }
 
     /// The viewer follows the app's language unless ?lang=zh|en pins one. Invalid
@@ -172,6 +204,28 @@ enum ControlAPI {
             body: data)
     }
 
+    private static func captureTextScreen(_ query: String?, _ maxEdge: Int?) throws -> (String, Data) {
+        let device = try DeviceRegistry.shared.find(query)
+        guard let data = device.screen.snapshot(png: true, maxEdge: maxEdge) else {
+            if let error = device.screen.captureError {
+                throw DeviceError(StringsAPI.current.captureFailedFromDevice(device.screen.name, error))
+            }
+            throw DeviceError(StringsAPI.current.noFrameFromDevice(device.screen.name))
+        }
+        return (device.id, data)
+    }
+
+    private static func tapTextPoint(_ id: String, _ x: Double, _ y: Double, _ hold: Double) throws {
+        let device = try DeviceRegistry.shared.find(id)
+        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+        let input = try DeviceRegistry.shared.input(for: device)
+        guard input.isPointerReady else {
+            input.invalidatePointerEstimate()
+            throw DeviceError(StringsAPI.current.pointerNotReady)
+        }
+        try input.tap(x: x, y: y, hold: hold)
+    }
+
     private static func perform(
         _ action: Action, body: [String: Any], deviceQuery: String?
     ) throws -> HTTPResponse {
@@ -204,7 +258,9 @@ enum ControlAPI {
                 click: (body["click"] as? Bool) ?? false)
         case .type:
             guard let text = body["text"] as? String else { return .error(StringsAPI.current.textRequired) }
-            try input.type(text)
+            var parameters = body
+            parameters["text"] = text
+            try TypeTextRequest(parameters, language: AppLanguageStore.shared.language).perform(on: input)
         case .key:
             guard let key = body["key"] as? String else { return .error(StringsAPI.current.keyRequired) }
             try input.key(key, modifiers: (body["modifiers"] as? [String]) ?? [])
@@ -326,5 +382,111 @@ enum RequestCoordinates {
 
     private static func number(_ value: Any?) -> Double? {
         (value as? NSNumber)?.doubleValue
+    }
+}
+
+/// Validate OCR dimensions before the capture pipeline converts them to integers.
+enum OCRRequest {
+    static func number(_ raw: Any?) -> Double? {
+        guard let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+            value.doubleValue.isFinite
+        else { return nil }
+        return value.doubleValue
+    }
+
+    static func maxEdge(_ body: [String: Any], table: StringsAPI = .current) throws -> Int? {
+        guard let raw = body["maxEdge"] else { return nil }
+        guard let value = number(raw), value >= 1, value < Double(Int.max), value.rounded() == value else {
+            throw DeviceError(table.ocrParameterInvalid("maxEdge"))
+        }
+        return Int(value)
+    }
+}
+
+struct TextTapRequest {
+    let text: String
+    let exact: Bool
+    let index: Int
+    let hold: Double
+
+    init(_ body: [String: Any], table: StringsAPI = .current) throws {
+        guard let text = body["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DeviceError(table.ocrParameterInvalid("text"))
+        }
+        self.text = text
+        if let raw = body["exact"] {
+            guard let value = raw as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else {
+                throw DeviceError(table.ocrParameterInvalid("exact"))
+            }
+            exact = value.boolValue
+        } else {
+            exact = false
+        }
+        if let raw = body["index"] {
+            guard let value = OCRRequest.number(raw), value >= 0, value < Double(Int.max), value.rounded() == value
+            else {
+                throw DeviceError(table.ocrParameterInvalid("index"))
+            }
+            index = Int(value)
+        } else {
+            index = 0
+        }
+        if let raw = body["hold"] {
+            guard let value = OCRRequest.number(raw), value >= 0, value <= 60 else {
+                throw DeviceError(table.ocrParameterInvalid("hold"))
+            }
+            hold = value
+        } else {
+            hold = 0.08
+        }
+    }
+
+    func match(_ result: ScreenOCR.Result) throws -> ScreenOCR.Item {
+        let matches = result.items.filter {
+            exact ? $0.text == text : $0.text.range(of: text, options: .caseInsensitive) != nil
+        }
+        guard result.width > 0, result.height > 0, index < matches.count else {
+            throw DeviceError(StringsAPI.current.ocrTextNotFound)
+        }
+        return matches[index]
+    }
+}
+
+/// One HTTP request validates all options and text before clearing the focused field.
+struct TypeTextRequest {
+    let actions: [MCPToolRequest]
+
+    init(_ body: [String: Any], language: AppLanguage = .en) throws {
+        let table = StringsMCP(language: language)
+        guard let text = body["text"] as? String else { throw DeviceError(table.parameterRequired("text")) }
+        for option in MCPKeyboardSequence.textOptions where body[option] != nil {
+            guard MCPKeyboardSequence.isBoolean(body[option]) else {
+                throw DeviceError(table.booleanRequired(option))
+            }
+        }
+        guard text.allSatisfy({ KeyboardMap.stroke(for: $0) != nil }) else {
+            throw DeviceError(table.typeAscii)
+        }
+        var actions: [MCPToolRequest] = []
+        func key(_ name: String, _ modifiers: [String] = []) -> MCPToolRequest {
+            MCPToolRequest(path: "/key", body: ["key": name, "modifiers": modifiers])
+        }
+        if body["clear_before"] as? Bool == true {
+            actions += [key("a", ["command"]), key("backspace")]
+        }
+        actions.append(MCPToolRequest(path: "/type", body: ["text": text]))
+        if body["commit_ime"] as? Bool == true { actions.append(key("space")) }
+        if body["press_enter"] as? Bool == true { actions.append(key("enter")) }
+        self.actions = actions
+    }
+
+    func perform(on input: DeviceInput) throws {
+        for action in actions {
+            if action.path == "/type" {
+                try input.type(action.body["text"] as! String)
+            } else {
+                try input.key(action.body["key"] as! String, modifiers: action.body["modifiers"] as! [String])
+            }
+        }
     }
 }

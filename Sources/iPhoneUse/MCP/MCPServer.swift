@@ -4,7 +4,7 @@ import Foundation
 /// Screenshots are scaled so the long edge is at most `longEdge`; tap and swipe
 /// coordinates are read in that scaled image's pixels.
 enum MCPServer {
-    static let longEdge = 1200
+    static let longEdge = 1000
     static var base = URL(string: "http://127.0.0.1:7390")!
 
     /// This process's language, fetched from the app's /config because the stdio
@@ -83,7 +83,16 @@ enum MCPServer {
     private static func call(_ name: String, _ arguments: [String: Any]) -> [String: Any] {
         let table = StringsMCP(language: language)
         do {
-            let actions: [MCPToolRequest]
+            let includeImage: Bool
+            if let raw = arguments["include_image"] {
+                guard let value = raw as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else {
+                    throw MCPError(StringsAPI(language: language).ocrParameterInvalid("include_image"))
+                }
+                includeImage = value.boolValue
+            } else {
+                includeImage = true
+            }
+            let actions: [MCPKeyboardAction]
             if name == "keyboard_sequence" {
                 actions = try MCPKeyboardSequence.actions(arguments: arguments, language: language)
             } else {
@@ -92,20 +101,32 @@ enum MCPServer {
                 guard name == "list_devices" || name == "screenshot" || action != nil else {
                     return failure(table.unknownTool(name))
                 }
-                actions = action.map { [$0] } ?? []
+                actions = action.map { [.request($0)] } ?? []
             }
             return try MCPAccess.withService(port: base.port ?? 7390, language: language) {
                 let (data, _) = try client.get("/devices")
                 if name == "list_devices" {
                     return ["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]]]
                 }
-                let device = try resolveDevice(arguments["device"] as? String, data: data)
+                let device = try resolveDevice(
+                    (arguments["device"] as? String) ?? (arguments["device_id"] as? String), data: data)
                 return try MCPAccess.withDevice(port: base.port ?? 7390, id: device, language: language) {
-                    for (index, action) in actions.enumerated() {
+                    if name == "ocr_screen", case .request(let action) = actions.first {
                         var body = action.body
                         body["device"] = device
+                        let data = try client.post(action.path, body)
+                        return ["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]]]
+                    }
+                    for (index, action) in actions.enumerated() {
                         do {
-                            try client.post(action.path, body)
+                            switch action {
+                            case .delay(let seconds):
+                                Thread.sleep(forTimeInterval: seconds)
+                            case .request(let request):
+                                var body = request.body
+                                body["device"] = device
+                                try client.post(request.path, body)
+                            }
                         } catch {
                             guard name == "keyboard_sequence" else { throw error }
                             throw MCPError(
@@ -121,7 +142,10 @@ enum MCPServer {
                         // chat's input cannot replace this action's result screenshot.
                         Thread.sleep(forTimeInterval: 0.6)
                     }
-                    return try screenshot(device)
+                    if name == "keyboard_sequence", arguments["include_image"] as? Bool == false {
+                        return ["content": [["type": "text", "text": "{\"ok\":true}"]]]
+                    }
+                    return try screenshot(device, includeImage: includeImage)
                 }
             }
         } catch {
@@ -153,7 +177,7 @@ enum MCPServer {
         return id
     }
 
-    private static func screenshot(_ device: String?) throws -> [String: Any] {
+    private static func screenshot(_ device: String?, includeImage: Bool) throws -> [String: Any] {
         var path = "/screenshot?maxEdge=\(longEdge)"
         if let device, let encoded = device.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
             path += "&device=\(encoded)"
@@ -162,15 +186,23 @@ enum MCPServer {
         let width = response.value(forHTTPHeaderField: "X-Image-Width") ?? "?"
         let height = response.value(forHTTPHeaderField: "X-Image-Height") ?? "?"
         let id = response.value(forHTTPHeaderField: "X-Device") ?? ""
-        return [
-            "content": [
-                ["type": "image", "data": image.base64EncodedString(), "mimeType": "image/jpeg"],
-                [
-                    "type": "text",
-                    "text": StringsMCP(language: language).screenshotCaption(id, width, height),
-                ],
-            ]
-        ]
+        return screenshotContent(
+            image: image, device: id, width: width, height: height,
+            includeImage: includeImage, ocr: ScreenOCR.recognize(image))
+    }
+
+    /// Shared by image and text-only screenshots; OCR describes these exact bytes.
+    static func screenshotContent(
+        image: Data, device: String, width: String, height: String,
+        includeImage: Bool, ocr: ScreenOCR.Result
+    ) -> [String: Any] {
+        var content: [[String: Any]] = []
+        if includeImage {
+            content.append(["type": "image", "data": image.base64EncodedString(), "mimeType": "image/jpeg"])
+        }
+        let caption = StringsMCP(language: language).screenshotCaption(device, width, height)
+        content.append(["type": "text", "text": caption + (ocr.items.isEmpty ? "" : ocr.summary)])
+        return ["content": content]
     }
 
     private static func write(_ object: [String: Any]) {

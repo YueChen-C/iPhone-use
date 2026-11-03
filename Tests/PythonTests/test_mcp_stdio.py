@@ -36,7 +36,7 @@ class MockApp(BaseHTTPRequestHandler):
                 self.server.before_screenshot(self.path)
             self.send(200, IMAGE, {
                 "Content-Type": "image/jpeg", "X-Device": parse_qs(urlsplit(self.path).query)["device"][0],
-                "X-Image-Width": "600", "X-Image-Height": "1200",
+                "X-Image-Width": "500", "X-Image-Height": "1000",
             })
         else:
             self.send(404, b'{"error":"not found"}')
@@ -46,6 +46,10 @@ class MockApp(BaseHTTPRequestHandler):
         self.server.events.append(("POST", self.path, body))
         if self.server.before_post:
             self.server.before_post(body)
+        if self.path == "/ocr":
+            self.send(200, json.dumps({"device": body["device"], "width": 600, "height": 1200,
+                                       "items": [{"text": "设置", "x": 120, "y": 400}]}).encode())
+            return
         if self.server.fail_actions:
             self.send(503, b'{"error":"pointer is not ready"}')
         else:
@@ -111,7 +115,7 @@ class MCPStdioTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=15,
             )
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertIn("12 tools", process.stdout)
+        self.assertIn("14 tools", process.stdout)
         # The checker's initialize fetches /config; tools/list reuses the value.
         self.assertEqual(self.server.events, [("GET", "/config")])
 
@@ -124,14 +128,54 @@ class MCPStdioTests(unittest.TestCase):
         self.assertEqual(tapped["content"][0], {
             "type": "image", "data": base64.b64encode(IMAGE).decode(), "mimeType": "image/jpeg",
         })
-        self.assertIn("600x1200 px", tapped["content"][1]["text"])
+        self.assertIn("500x1000 px", tapped["content"][1]["text"])
         self.assertEqual(self.server.events, [
             ("GET", "/config"),
             ("GET", "/devices"),
             ("GET", "/devices"),
-            ("POST", "/tap", {"x": 120.5, "y": 400, "device": "phone-1", "maxEdge": 1200}),
-            ("GET", "/screenshot?maxEdge=1200&device=phone-1"),
+            ("POST", "/tap", {"x": 120.5, "y": 400, "device": "phone-1", "maxEdge": 1000}),
+            ("GET", "/screenshot?maxEdge=1000&device=phone-1"),
         ])
+
+    def test_ocr_screen_returns_only_text_and_preserves_dimensions_and_device(self):
+        result = self.exchange([("ocr_screen", {"device": "First", "maxEdge": 800})])[0]
+        self.assertNotIn("isError", result)
+        self.assertEqual(len(result["content"]), 1)
+        self.assertEqual(result["content"][0]["type"], "text")
+        self.assertEqual(json.loads(result["content"][0]["text"]), {
+            "device": "phone-1", "width": 600, "height": 1200,
+            "items": [{"text": "设置", "x": 120, "y": 400}],
+        })
+        self.assertEqual(self.server.events, [
+            ("GET", "/config"), ("GET", "/devices"),
+            ("POST", "/ocr", {"device": "phone-1", "maxEdge": 800}),
+        ])
+
+    def test_text_only_screenshot_and_tap_text_have_no_base64_image(self):
+        screenshot, tapped = self.exchange([
+            ("screenshot", {"device": "First", "include_image": False}),
+            ("tap_text", {"text": "设置", "exact": True, "index": 1, "hold": 0.2,
+                          "maxEdge": 800, "device": "phone-1", "include_image": False}),
+        ])
+        for result in (screenshot, tapped):
+            self.assertNotIn("isError", result)
+            self.assertEqual([block["type"] for block in result["content"]], ["text"])
+            self.assertNotIn("data", result["content"][0])
+            self.assertIn("500x1000 px", result["content"][0]["text"])
+        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+            ("POST", "/tap_text", {"device": "phone-1", "text": "设置", "exact": True,
+                                   "index": 1, "hold": 0.2, "maxEdge": 800}),
+        ])
+        self.assertEqual(sum(event[1].startswith("/screenshot?") for event in self.server.events), 2)
+
+    def test_invalid_ocr_arguments_never_query_devices_or_send_input(self):
+        calls = [("tap_text", {}), ("tap_text", {"text": " "}),
+                 ("tap_text", {"text": "x", "index": -1}),
+                 ("ocr_screen", {"maxEdge": 0}),
+                 ("screenshot", {"include_image": "false"})]
+        for name, arguments in calls:
+            self.assertTrue(self.exchange([(name, arguments)])[0]["isError"])
+        self.assertEqual(self.server.events, [("GET", "/config")] * len(calls))
 
     def test_failed_action_and_unknown_tool_return_errors_without_a_screenshot(self):
         self.server.fail_actions = True
@@ -145,6 +189,25 @@ class MCPStdioTests(unittest.TestCase):
         self.assertEqual(len(self.server.events), 3)
         self.assertEqual(self.server.events[2][:2], ("POST", "/tap"))
 
+    def test_normalized_tools_forward_screen_fractions_and_capture_at_1000(self):
+        results = self.exchange([
+            ("move_pointer", {"x": 250, "y": 750, "normalized": True}),
+            ("tap", {"x": 0, "y": 1000, "normalized": True}),
+            ("long_press", {"x": 500, "y": 500, "seconds": 2, "normalized": True}),
+            ("swipe", {"points": [{"x": 0, "y": 1000}, {"x": 500, "y": 0}],
+                       "duration": 0.4, "normalized": True}),
+        ])
+        self.assertTrue(all("isError" not in result for result in results))
+        common = {"fraction": True, "maxEdge": 1000, "device": "phone-1"}
+        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+            ("POST", "/move", dict(common, x=0.25, y=0.75)),
+            ("POST", "/tap", dict(common, x=0, y=1)),
+            ("POST", "/tap", dict(common, x=0.5, y=0.5, hold=2)),
+            ("POST", "/swipe", dict(common, points=[{"x": 0, "y": 1}, {"x": 0.5, "y": 0}], duration=0.4)),
+        ])
+        self.assertEqual([event for event in self.server.events if event[1].startswith("/screenshot")],
+                         [("GET", "/screenshot?maxEdge=1000&device=phone-1")] * 4)
+
     def test_pointer_inspection_does_not_click_and_click_does_not_reposition(self):
         results = self.exchange([
             ("move_pointer", {"x": 100, "y": 200, "device": "First"}),
@@ -155,7 +218,7 @@ class MCPStdioTests(unittest.TestCase):
             self.assertNotIn("isError", result)
             self.assertEqual(result["content"][0]["type"], "image")
         self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
-            ("POST", "/move", {"x": 100, "y": 200, "maxEdge": 1200, "device": "phone-1"}),
+            ("POST", "/move", {"x": 100, "y": 200, "maxEdge": 1000, "device": "phone-1"}),
             ("POST", "/nudge", {"dx": -2, "dy": 3, "click": False, "device": "phone-1"}),
             ("POST", "/nudge", {"dx": 0, "dy": 0, "click": True, "device": "phone-1"}),
         ])
@@ -182,8 +245,77 @@ class MCPStdioTests(unittest.TestCase):
             ("POST", "/key", {"key": "l", "modifiers": ["cmd"], "device": "phone-1"}),
             ("POST", "/type", {"text": "https://www.baidu.com", "device": "phone-1"}),
             ("POST", "/key", {"key": "enter", "modifiers": [], "device": "phone-1"}),
-            ("GET", "/screenshot?maxEdge=1200&device=phone-1"),
+            ("GET", "/screenshot?maxEdge=1000&device=phone-1"),
         ])
+
+    def test_device_id_routes_screenshot_and_actions_with_original_precedence(self):
+        self.server.devices.append({"id": "phone-2", "name": "Second"})
+        results = self.exchange([
+            ("screenshot", {"device_id": "Second"}),
+            ("type_text", {"text": "nihao", "device_id": "Second", "clear_before": True,
+                           "commit_ime": True, "press_enter": True}),
+            ("home", {"device": "First", "device_id": "Second"}),
+        ])
+        self.assertTrue(all("isError" not in result for result in results))
+        posts = [event for event in self.server.events if event[0] == "POST"]
+        self.assertEqual(posts, [
+            ("POST", "/type", {"text": "nihao", "device": "phone-2", "clear_before": True,
+                               "commit_ime": True, "press_enter": True}),
+            ("POST", "/home", {"device": "phone-1"}),
+        ])
+        self.assertIn(("GET", "/screenshot?maxEdge=1000&device=phone-2"), self.server.events)
+
+    def test_ocr_and_tap_text_aliases_default_to_1000(self):
+        self.server.devices.append({"id": "phone-2", "name": "Second"})
+        results = self.exchange([
+            ("ocr_screen", {"device_id": "Second", "include_image": False}),
+            ("tap_text", {"text": "Confirm", "device_id": "Second", "include_image": False}),
+        ])
+        self.assertTrue(all("isError" not in result for result in results))
+        self.assertTrue(all(block["type"] == "text" for result in results for block in result["content"]))
+        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+            ("POST", "/ocr", {"device": "phone-2", "maxEdge": 1000}),
+            ("POST", "/tap_text", {"device": "phone-2", "text": "Confirm", "maxEdge": 1000}),
+        ])
+        self.assertIn(("GET", "/screenshot?maxEdge=1000&device=phone-2"), self.server.events)
+
+    def test_actions_typed_steps_and_delays_preserve_atomic_order(self):
+        result = self.exchange([("keyboard_sequence", {"device_id": "First", "actions": [
+            {"type": "text", "text": "nihao", "clear_before": True,
+             "commit_ime": True, "press_enter": True},
+            {"delay": 0}, {"wait": 0}, {"type": "delay", "seconds": 0.01},
+            {"type": "wait", "seconds": 0}, {"type": "key", "key": "tab"},
+        ]})])[0]
+        self.assertNotIn("isError", result)
+        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+            ("POST", "/key", {"key": "a", "modifiers": ["command"], "device": "phone-1"}),
+            ("POST", "/key", {"key": "backspace", "modifiers": [], "device": "phone-1"}),
+            ("POST", "/type", {"text": "nihao", "device": "phone-1"}),
+            ("POST", "/key", {"key": "space", "modifiers": [], "device": "phone-1"}),
+            ("POST", "/key", {"key": "enter", "modifiers": [], "device": "phone-1"}),
+            ("POST", "/key", {"key": "tab", "modifiers": [], "device": "phone-1"}),
+        ])
+        self.assertEqual(sum(event[1].startswith("/screenshot") for event in self.server.events), 1)
+
+    def test_new_invalid_forms_fail_before_device_lookup(self):
+        invalid = [
+            {"actions": [{"delay": True}]}, {"actions": [{"wait": 5.1}]},
+            {"actions": [{"type": "delay", "seconds": -1}]},
+            {"actions": [{"type": "key", "text": "x"}]},
+            {"actions": [{"text": "x", "commit_ime": 1}]},
+            {"steps": [{"text": "x"}], "actions": [{"text": "y"}]},
+        ]
+        for arguments in invalid:
+            self.assertTrue(self.exchange([("keyboard_sequence", arguments)])[0]["isError"])
+        self.assertTrue(self.exchange([("type_text", {"text": "a", "press_enter": 1})])[0]["isError"])
+        self.assertEqual(self.server.events, [("GET", "/config")] * (len(invalid) + 1))
+
+    def test_sequence_can_omit_confirmation_image(self):
+        result = self.exchange([("keyboard_sequence", {
+            "actions": [{"wait": 0}], "include_image": False,
+        })])[0]
+        self.assertNotIn("isError", result)
+        self.assertEqual(self.server.events, [("GET", "/config"), ("GET", "/devices")])
 
     def test_invalid_later_keyboard_step_prevents_all_input_and_device_queries(self):
         bad_steps = [
@@ -252,8 +384,8 @@ class MCPStdioTests(unittest.TestCase):
         changes = [event for event in self.server.events if event[0] == "POST" or event[1].startswith("/screenshot")]
         self.assertEqual([event[:2] for event in changes], [
             ("POST", "/key"), ("POST", "/type"), ("POST", "/key"),
-            ("GET", "/screenshot?maxEdge=1200&device=phone-1"),
-            ("POST", "/key"), ("GET", "/screenshot?maxEdge=1200&device=phone-1"),
+            ("GET", "/screenshot?maxEdge=1000&device=phone-1"),
+            ("POST", "/key"), ("GET", "/screenshot?maxEdge=1000&device=phone-1"),
         ])
 
     def test_same_phone_aliases_queue_action_and_confirmation_across_processes(self):
@@ -337,7 +469,7 @@ class MCPStdioTests(unittest.TestCase):
         self.assertIn("控制真实 iPhone", replies[0]["result"]["instructions"])
         tools = replies[1]["result"]["tools"]
         # Tool and parameter names are the client contract and stay English.
-        self.assertEqual(len(tools), 12)
+        self.assertEqual(len(tools), 14)
         home = next(tool for tool in tools if tool["name"] == "home")
         self.assertEqual(home["description"], "回到主屏幕。")
         error = replies[2]["result"]["content"][0]["text"]

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 
@@ -83,6 +84,10 @@ final class RequestCoordinatesTests: XCTestCase {
     }
 
     func testScreenshotDimensionsRoundAndNeverUpscale() {
+        let mcpPortrait = RequestCoordinates.imageSize(
+            CGSize(width: 1179, height: 2556), maxWidth: nil, maxEdge: MCPServer.longEdge)
+        XCTAssertEqual(mcpPortrait.0, 461)
+        XCTAssertEqual(mcpPortrait.1, 1000)
         let portrait = RequestCoordinates.imageSize(CGSize(width: 750, height: 1334), maxWidth: nil, maxEdge: 1200)
         XCTAssertEqual(portrait.0, 675)
         XCTAssertEqual(portrait.1, 1200)
@@ -170,9 +175,9 @@ final class SwipeRequestTests: XCTestCase {
             MCPToolRequest.action(
                 named: "swipe",
                 arguments: [
-                    "points": [["x": 0, "y": 1200], ["x": 600, "y": 600], ["x": 0, "y": 0]],
+                    "points": [["x": 0, "y": 1000], ["x": 500, "y": 500], ["x": 0, "y": 0]],
                     "duration": 0.12, "device": "phone",
-                ], longEdge: 1200))
+                ], longEdge: MCPServer.longEdge))
         let json = try JSONSerialization.data(withJSONObject: action.body)
         let header = Data("POST \(action.path) HTTP/1.1\r\nContent-Length: \(json.count)\r\n\r\n".utf8)
         let request = try XCTUnwrap(HTTPRequest.parse(header + json))
@@ -237,6 +242,31 @@ final class SwipeRequestTests: XCTestCase {
         XCTAssertEqual(swipe.points.map { $0.0 }, [0.2, 0.7])
         XCTAssertEqual(swipe.points.map { $0.1 }, [0.8, 0.3])
         XCTAssertEqual(swipe.duration, 0.3)
+    }
+
+    func testNormalizedMCPToolsSurviveJSONAndUseScreenFractionsWithoutAFrame() throws {
+        for name in ["move_pointer", "tap", "long_press", "swipe"] {
+            let action = try XCTUnwrap(
+                MCPToolRequest.action(
+                    named: name,
+                    arguments: [
+                        "normalized": true, "x": 500, "y": 1000,
+                        "points": [["x": 0, "y": 1000], ["x": 500, "y": 0]],
+                    ],
+                    longEdge: MCPServer.longEdge))
+            let json = try JSONSerialization.data(withJSONObject: action.body)
+            let header = Data("POST \(action.path) HTTP/1.1\r\nContent-Length: \(json.count)\r\n\r\n".utf8)
+            let request = try XCTUnwrap(HTTPRequest.parse(header + json))
+            if name == "swipe" {
+                let swipe = try SwipeRequest(request.body, screenSize: nil, screenName: "phone")
+                XCTAssertEqual(swipe.points.map { $0.0 }, [0, 0.5])
+                XCTAssertEqual(swipe.points.map { $0.1 }, [1, 0])
+            } else {
+                let point = try RequestCoordinates.point(request.body, "x", "y", screenSize: nil, screenName: "phone")
+                XCTAssertEqual(point.0, 0.5)
+                XCTAssertEqual(point.1, 1)
+            }
+        }
     }
 
     func testPointLocalFieldsCannotOverridePathCoordinateSpace() throws {
@@ -315,5 +345,228 @@ final class SwipeRequestTests: XCTestCase {
         }
         XCTAssertThrowsError(try SwipeRequest(body, screenSize: nil, screenName: "phone"))
         XCTAssertThrowsError(try SwipeRequest(body, screenSize: .zero, screenName: "phone"))
+    }
+}
+
+/// Synthetic pixels exercise native Vision without capture, Bluetooth, or a display.
+final class ScreenOCRTests: XCTestCase {
+    private func image(withText: Bool = true) throws -> Data {
+        let context = try XCTUnwrap(
+            CGContext(
+                data: nil, width: 800, height: 600, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 800, height: 600))
+        if withText {
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 48), .foregroundColor: NSColor.black,
+            ]
+            NSAttributedString(string: "Hello OCR", attributes: attributes).draw(at: CGPoint(x: 80, y: 450))
+            NSAttributedString(string: "Confirm", attributes: attributes).draw(at: CGPoint(x: 420, y: 100))
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        let bitmap = NSBitmapImageRep(cgImage: try XCTUnwrap(context.makeImage()))
+        return try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+    }
+
+    private func request(_ method: String, _ path: String, _ body: [String: Any] = [:]) throws -> HTTPRequest {
+        let data = try JSONSerialization.data(withJSONObject: body)
+        return try XCTUnwrap(
+            HTTPRequest.parse(
+                Data("\(method) \(path) HTTP/1.1\r\nContent-Length: \(data.count)\r\n\r\n".utf8) + data))
+    }
+
+    func testNativeRecognitionReportsTopLeftPixelsInReadingOrder() throws {
+        let result = ScreenOCR.recognize(try image())
+        XCTAssertEqual(result.width, 800)
+        XCTAssertEqual(result.height, 600)
+        XCTAssertEqual(result.items.map(\.text), ["Hello OCR", "Confirm"])
+        let hello = try XCTUnwrap(result.items.first)
+        XCTAssertEqual(hello.x, 195, accuracy: 35)
+        XCTAssertEqual(hello.y, 120, accuracy: 25)
+        let confirm = try XCTUnwrap(result.items.last)
+        XCTAssertEqual(confirm.x, 510, accuracy: 35)
+        XCTAssertEqual(confirm.y, 470, accuracy: 25)
+    }
+
+    func testBoundingBoxesFlipYAndSortTwelvePixelRowsLeftToRight() {
+        let upperRight = ScreenOCR.Item(
+            text: "right", box: CGRect(x: 0.7, y: 0.8, width: 0.2, height: 0.1), width: 1000, height: 1000)
+        let upperLeft = ScreenOCR.Item(
+            text: "left", box: CGRect(x: 0.1, y: 0.795, width: 0.2, height: 0.1), width: 1000, height: 1000)
+        let bottom = ScreenOCR.Item(
+            text: "bottom", box: CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.1), width: 1000, height: 1000)
+        XCTAssertEqual(upperRight.x, 800)
+        XCTAssertEqual(upperRight.y, 150)
+        XCTAssertEqual(ScreenOCR.sorted([bottom, upperRight, upperLeft]).map(\.text), ["left", "right", "bottom"])
+    }
+
+    func testBadDataAndBlankScreenSafelyReturnEmptyItems() throws {
+        let invalid = ScreenOCR.recognize(Data("invalid".utf8))
+        XCTAssertTrue(invalid.items.isEmpty)
+        XCTAssertEqual(invalid.width, 0)
+        let blank = ScreenOCR.recognize(try image(withText: false))
+        XCTAssertTrue(blank.items.isEmpty)
+        XCTAssertEqual(blank.width, 800)
+        XCTAssertEqual(blank.height, 600)
+    }
+
+    func testGETAndPOSTOCRUseSelectorsAndReturnDecodedImageDimensions() throws {
+        let data = try image()
+        for (method, path, body) in [
+            ("GET", "/ocr?device=query&maxEdge=900", [:]),
+            ("POST", "/ocr?device=query", ["device": "body", "maxEdge": 900]),
+            ("GET", "/ocr?device_id=query&maxEdge=900", [:]),
+            ("POST", "/ocr?device=query", ["device_id": "body", "maxEdge": 900]),
+        ] as [(String, String, [String: Any])] {
+            var captures = 0
+            let response = ControlAPI.handle(
+                try request(method, path, body),
+                ocrCapture: { selector, edge in
+                    captures += 1
+                    XCTAssertEqual(selector, method == "GET" ? "query" : "body")
+                    XCTAssertEqual(edge, 900)
+                    return ("resolved", data)
+                }, ocrTap: { _, _, _, _ in XCTFail("OCR must not tap") })
+            XCTAssertEqual(response.status, 200)
+            XCTAssertEqual(captures, 1)
+            let result = try XCTUnwrap(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+            XCTAssertEqual(result["device"] as? String, "resolved")
+            XCTAssertEqual(result["width"] as? Int, 800)
+            XCTAssertEqual(result["height"] as? Int, 600)
+            let items = try XCTUnwrap(result["items"] as? [[String: Any]])
+            XCTAssertEqual(items.map { $0["text"] as? String }, ["Hello OCR", "Confirm"])
+        }
+    }
+
+    func testTapTextResolvesFreshOCRAndNormalizesTheSelectedPixels() throws {
+        let data = try image()
+        var taps = 0
+        let response = ControlAPI.handle(
+            try request("POST", "/tap_text", ["text": "confirm", "hold": 0.2, "maxEdge": 1000, "device_id": "phone"]),
+            ocrCapture: { selector, edge in
+                XCTAssertEqual(selector, "phone")
+                XCTAssertEqual(edge, 1000)
+                return ("phone", data)
+            },
+            ocrTap: { id, x, y, hold in
+                taps += 1
+                XCTAssertEqual(id, "phone")
+                XCTAssertEqual(x, 510.0 / 800, accuracy: 0.05)
+                XCTAssertEqual(y, 470.0 / 600, accuracy: 0.05)
+                XCTAssertEqual(hold, 0.2)
+            })
+        XCTAssertEqual(taps, 1)
+        XCTAssertEqual(response.status, 200)
+        let result = try XCTUnwrap(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        XCTAssertEqual(result["ok"] as? Bool, true)
+        XCTAssertEqual(result["text"] as? String, "Confirm")
+        XCTAssertNotNil(result["x"] as? Int)
+        XCTAssertNotNil(result["y"] as? Int)
+    }
+
+    func testInvalidOCRParametersAndMissingMatchesNeverSendInput() throws {
+        let invalid: [[String: Any]] = [
+            [:], ["text": " "], ["text": "x", "exact": 1], ["text": "x", "index": -1],
+            ["text": "x", "index": 0.5], ["text": "x", "index": true],
+            ["text": "x", "hold": -1], ["text": "x", "hold": 61],
+            ["text": "x", "maxEdge": 0], ["text": "x", "maxEdge": 0.5],
+            ["text": "x", "maxEdge": true], ["text": "x", "maxEdge": "1200"],
+        ]
+        for body in invalid {
+            let response = ControlAPI.handle(
+                try request("POST", "/tap_text", body),
+                ocrCapture: { _, _ in
+                    XCTFail("invalid arguments must not capture")
+                    return ("phone", Data())
+                }, ocrTap: { _, _, _, _ in XCTFail("invalid arguments must not tap") })
+            XCTAssertNotEqual(response.status, 200)
+        }
+        let response = ControlAPI.handle(
+            try request("POST", "/tap_text", ["text": "missing"]),
+            ocrCapture: { _, _ in
+                ("phone", Data())
+            }, ocrTap: { _, _, _, _ in XCTFail("failed OCR must not tap") })
+        XCTAssertNotEqual(response.status, 200)
+        for path in ["/ocr?maxEdge=0", "/ocr?maxEdge=oops"] {
+            XCTAssertNotEqual(
+                ControlAPI.handle(
+                    try request("GET", path),
+                    ocrCapture: { _, _ in
+                        XCTFail("invalid dimensions must not capture")
+                        return ("phone", Data())
+                    }
+                ).status, 200)
+        }
+    }
+
+    func testMatchingSupportsExactSubstringAndZeroBasedDuplicateIndex() throws {
+        let items = ["Settings", "Settings detail", "Settings"].map {
+            ScreenOCR.Item(text: $0, box: CGRect(x: 0.1, y: 0.4, width: 0.2, height: 0.1), width: 400, height: 800)
+        }
+        let result = ScreenOCR.Result(width: 400, height: 800, items: items)
+        XCTAssertEqual(try TextTapRequest(["text": "settings", "index": 1]).match(result).text, "Settings detail")
+        XCTAssertEqual(
+            try TextTapRequest(["text": "Settings", "exact": true, "index": 1]).match(result).text, "Settings")
+        XCTAssertThrowsError(try TextTapRequest(["text": "settings", "exact": true]).match(result))
+        XCTAssertThrowsError(try TextTapRequest(["text": "Settings", "index": 3]).match(result))
+    }
+}
+
+final class TypeTextRequestTests: XCTestCase {
+    func testHTTPDeviceSelectorsPreserveBodyAndOriginalPrecedence() throws {
+        let json = #"{"device_id":"body-alias"}"#
+        let wire = Data(
+            "POST /type?device=query&device_id=query-alias HTTP/1.1\r\nContent-Length: \(json.utf8.count)\r\n\r\n\(json)"
+                .utf8)
+        let request = try XCTUnwrap(HTTPRequest.parse(wire))
+        XCTAssertEqual(ControlAPI.deviceSelector(body: request.body, query: request.query), "body-alias")
+        XCTAssertEqual(
+            ControlAPI.deviceSelector(body: ["device": "body", "device_id": "alias"], query: request.query), "body")
+        XCTAssertEqual(ControlAPI.deviceSelector(body: [:], query: request.query), "query")
+        XCTAssertEqual(ControlAPI.deviceSelector(body: [:], query: ["device_id": "query-alias"]), "query-alias")
+    }
+
+    func testAllAtomicOptionCombinationsEmitOrderedKeyboardReports() throws {
+        for mask in 0..<8 {
+            var reports: [[UInt8]] = []
+            let input = DeviceInput(
+                host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
+                reportSender: { _, bytes in reports.append(bytes) })
+            let body: [String: Any] = [
+                "text": "a", "clear_before": mask & 1 != 0, "commit_ime": mask & 2 != 0, "press_enter": mask & 4 != 0,
+            ]
+            try TypeTextRequest(body).perform(on: input)
+            // Modifier-only reports bracket cmd+a; inspect actual key-down usages separately.
+            let pressed = reports.filter { $0.dropFirst(2).contains(where: { $0 != 0 }) }
+            var expected: [UInt8] = []
+            if mask & 1 != 0 { expected += [4, 42] }
+            expected.append(4)
+            if mask & 2 != 0 { expected.append(44) }
+            if mask & 4 != 0 { expected.append(40) }
+            XCTAssertEqual(pressed.map { $0[2] }, expected, "mask=\(mask)")
+            if mask & 1 != 0 { XCTAssertEqual(pressed.first?[0], 8) }
+            XCTAssertEqual(reports.count, expected.count * 2 + (mask & 1 != 0 ? 2 : 0))
+            XCTAssertTrue(reports.last?.allSatisfy { $0 == 0 } == true)
+        }
+    }
+
+    func testInvalidTextAndOptionsCannotClearTheField() {
+        var reports = 0
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
+            reportSender: { _, _ in reports += 1 })
+        var invalid: [[String: Any]] = [["clear_before": true], ["text": "你好", "clear_before": true]]
+        for option in MCPKeyboardSequence.textOptions {
+            for value: Any in [0, 1, "true", NSNull()] {
+                var body: [String: Any] = ["text": "a", "clear_before": true]
+                body[option] = value
+                invalid.append(body)
+            }
+        }
+        for body in invalid { XCTAssertThrowsError(try TypeTextRequest(body).perform(on: input)) }
+        XCTAssertEqual(reports, 0)
     }
 }

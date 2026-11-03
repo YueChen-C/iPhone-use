@@ -10,6 +10,8 @@ struct StringsAPI: LocalizedTable {
     let pointerNotReady: String
     let textRequired: String
     let keyRequired: String
+    let ocrParameterInvalid: (String) -> String
+    let ocrTextNotFound: String
 
     // SwipeRequest validation (ControlAPI.swift)
     let swipePointsMin: String
@@ -57,6 +59,8 @@ struct StringsAPI: LocalizedTable {
         pointerNotReady: "指针未就绪：请等待蓝牙鼠标订阅与有效校准",
         textRequired: "缺少 text",
         keyRequired: "缺少 key",
+        ocrParameterInvalid: { "无效的 OCR 参数：\($0)" },
+        ocrTextNotFound: "未找到指定序号的匹配文字",
         swipePointsMin: "points 必须包含至少两个带数值 x、y 的对象",
         swipePointFinite: { "points[\($0)].x 与 points[\($0)].y 必须是有限数值" },
         swipeDurationInvalid: "duration 必须是大于零的有限数值",
@@ -94,6 +98,8 @@ struct StringsAPI: LocalizedTable {
         pointerNotReady: "pointer is not ready: wait for Bluetooth mouse subscription and a valid calibration",
         textRequired: "text is required",
         keyRequired: "key is required",
+        ocrParameterInvalid: { "invalid OCR parameter: \($0)" },
+        ocrTextNotFound: "no matching text at the requested index",
         swipePointsMin: "points must contain at least two objects with numeric x and y",
         swipePointFinite: { "points[\($0)].x and points[\($0)].y must be finite numbers" },
         swipeDurationInvalid: "duration must be a finite number greater than zero",
