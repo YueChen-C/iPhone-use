@@ -23,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMenus()
+        QuietModeActivityController.shared.start()
         windows.start()
         if AppRunModeStore.shared.mode == .desktop {
             NSApp.activate(ignoringOtherApps: true)
@@ -56,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         languageObserver = nil
         if let runModeObserver { NotificationCenter.default.removeObserver(runModeObserver) }
         runModeObserver = nil
+        QuietModeActivityController.shared.stop()
         windows.stop()
         let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Application.shutdownWaitTimeout)
         if !stopResult.isClean {

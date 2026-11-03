@@ -253,6 +253,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             runStartupReconciliationAttempt(generation: generation)
         } else {
             enableCaptureDiscoveryIfNeeded(generation: generation)
+            refresh()
         }
 
         // CoreMediaIO can publish the iPhone capture device shortly after USB trust,
@@ -397,6 +398,13 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         }
     }
 
+    func mintUSBDemandRevision() -> UInt64 {
+        lock.withLock {
+            usbDemandRevision &+= 1
+            return usbDemandRevision
+        }
+    }
+
     var identityState: ScreenCaptureIdentityState { lock.withLock { verificationState } }
 
     var permitsPointerAssociation: Bool {
@@ -445,7 +453,8 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     }
 
     private func refresh() {
-        guard !lock.withLock({ isStopped }) else { return }
+        let generation = lock.withLock { isStopped ? nil : lifecycleGeneration }
+        guard let generation else { return }
         let devices = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.external], mediaType: .muxed, position: .unspecified
         ).devices.filter { $0.modelID.contains("iOS") && $0.isConnected }
@@ -472,7 +481,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         var refreshLifecycle: UInt64 = 0
         var job: (UInt64, [String: ScreenCaptureSource])?
         let didRun = lock.withLock { () -> Bool in
-            guard !isStopped else { return false }
+            guard !isStopped, lifecycleGeneration == generation else { return false }
             refreshLifecycle = lifecycleGeneration
             var newlyClaimedSwitches: [CaptureValeriaRecoveryTracker.ScheduledPostSwitchCheck] = []
             for (id, source) in sources where !present.contains(id) {

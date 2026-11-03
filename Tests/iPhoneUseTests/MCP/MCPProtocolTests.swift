@@ -150,7 +150,8 @@ final class MCPProtocolTests: XCTestCase {
         XCTAssertEqual(schema["required"] as? [String], ["points"])
         let properties = try XCTUnwrap(schema["properties"] as? [String: [String: Any]])
         XCTAssertEqual(
-            Set(properties.keys), ["points", "duration", "normalized", "device", "device_id", "include_image"])
+            Set(properties.keys),
+            ["points", "duration", "normalized", "device", "device_id", "include_image", "observe"])
         let points = try XCTUnwrap(properties["points"])
         XCTAssertEqual(points["type"] as? String, "array")
         XCTAssertEqual(points["minItems"] as? Int, 2)
@@ -294,7 +295,7 @@ final class MCPOCRTests: XCTestCase {
 final class MCPKeyboardAliasTests: XCTestCase {
     func testEveryToolAdvertisesDeviceAliasAndOriginalWins() throws {
         let tools = MCPToolCatalog.tools(for: .en)
-        XCTAssertEqual(tools.count, 14)
+        XCTAssertEqual(tools.count, 15)
         for tool in tools {
             let schema = try XCTUnwrap(tool["inputSchema"] as? [String: Any])
             let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
@@ -346,6 +347,19 @@ final class MCPKeyboardAliasTests: XCTestCase {
         XCTAssertThrowsError(try MCPKeyboardSequence.actions(arguments: ["steps": steps, "actions": [["wait": 0]]]))
     }
 
+    func testChineseSequenceForwardsTextAndIMEOption() throws {
+        let actions = try MCPKeyboardSequence.actions(arguments: [
+            "steps": [
+                ["text": "蓝牙", "ensure_chinese_ime": false]
+            ]
+        ])
+        guard case .request(let request) = try XCTUnwrap(actions.first) else { return XCTFail("expected request") }
+        XCTAssertEqual(request.path, "/type")
+        XCTAssertEqual(request.body["text"] as? String, "蓝牙")
+        XCTAssertEqual(request.body["ensure_chinese_ime"] as? Bool, false)
+        XCTAssertEqual(try TypeTextRequest(request.body).actions.first?.body["text"] as? String, "蓝牙")
+    }
+
     func testInvalidSequenceFormsAreRejectedBeforeExecution() {
         let invalid: [[String: Any]] = [
             ["type": "key", "text": "x"], ["type": "text", "key": "enter"],
@@ -372,7 +386,8 @@ final class MCPKeyboardAliasTests: XCTestCase {
 
     func testTypeTextForwardsStrictBooleanOptions() throws {
         let arguments: [String: Any] = [
-            "text": "nihao", "clear_before": true, "commit_ime": true, "press_enter": false, "device_id": "phone",
+            "text": "nihao", "clear_before": true, "commit_ime": true, "press_enter": false,
+            "ensure_chinese_ime": true, "device_id": "phone",
         ]
         let request = try XCTUnwrap(MCPToolRequest.action(named: "type_text", arguments: arguments, longEdge: 1200))
         XCTAssertEqual(request.body["device"] as? String, "phone")

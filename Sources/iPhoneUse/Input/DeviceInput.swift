@@ -630,10 +630,11 @@ extension DeviceInput {
     }
 
     func type(_ text: String) throws {
-        let strokes = try text.map { character -> KeyboardMap.Stroke in
-            guard let stroke = KeyboardMap.stroke(for: character) else { throw InputError.untypeable(character) }
-            return stroke
+        guard let keyboardText = KeyboardMap.keyboardText(for: text) else {
+            let invalid = text.first { KeyboardMap.stroke(for: $0) == nil } ?? "?"
+            throw InputError.untypeable(invalid)
         }
+        let strokes = keyboardText.compactMap { KeyboardMap.stroke(for: $0) }
         if !strokes.isEmpty { discardPendingMotion() }
         queue.sync {
             for stroke in strokes {

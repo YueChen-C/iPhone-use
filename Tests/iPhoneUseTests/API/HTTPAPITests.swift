@@ -553,12 +553,55 @@ final class TypeTextRequestTests: XCTestCase {
         }
     }
 
+    func testHanziReportsAndIMEHeuristic() throws {
+        XCTAssertEqual(KeyboardMap.keyboardText(for: "蓝牙"), "lanya ")
+        XCTAssertEqual(KeyboardMap.keyboardText(for: "快捷指令"), "kuaijiezhiling ")
+        XCTAssertEqual(KeyboardMap.keyboardText(for: "A蓝牙!快捷指令"), "Alanya !kuaijiezhiling ")
+        XCTAssertNil(KeyboardMap.keyboardText(for: "蓝牙🙂"))
+        XCTAssertEqual(KeyboardMap.code(for: "capslock"), 0x39)
+        XCTAssertEqual(KeyboardMap.code(for: "caps_lock"), 0x39)
+        var reports: [[UInt8]] = []
+        var delays: [TimeInterval] = []
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
+            reportSender: { _, bytes in reports.append(bytes) })
+        func result(_ labels: [String]) -> ScreenOCR.Result {
+            ScreenOCR.Result(
+                width: 100, height: 100,
+                items: labels.map {
+                    ScreenOCR.Item(
+                        text: $0, box: CGRect(x: 0.1, y: 0.1, width: 0.1, height: 0.1), width: 100, height: 100)
+                })
+        }
+        try TypeTextRequest(["text": "蓝牙"]).perform(
+            on: input, ocr: { result(["return"]) }, sleep: { delays.append($0) })
+        let pressed = reports.filter { $0.dropFirst(2).contains(where: { $0 != 0 }) }
+        XCTAssertEqual(pressed.map { $0[2] }, [44, 15, 4, 17, 28, 4, 44])
+        XCTAssertEqual(pressed.first?[0], 1)
+        XCTAssertEqual(delays, [0.25])
+        reports.removeAll()
+        try TypeTextRequest(["text": "蓝牙", "ensure_chinese_ime": false]).perform(
+            on: input,
+            ocr: {
+                XCTFail("OCR must be skipped")
+                return nil
+            })
+        XCTAssertEqual(
+            reports.filter { $0.dropFirst(2).contains(where: { $0 != 0 }) }.map { $0[2] },
+            [15, 4, 17, 28, 4, 44])
+        XCTAssertTrue(ChineseIMEHeuristic.isEnglish(result(["q", "w", "e"])))
+        XCTAssertFalse(ChineseIMEHeuristic.isEnglish(result(["q", "w", "e", "完成"])))
+        XCTAssertFalse(ChineseIMEHeuristic.isEnglish(result([])))
+        XCTAssertTrue(try TypeTextRequest(["text": "abc", "ensure_chinese_ime": true]).ensureChineseIME)
+        XCTAssertFalse(try TypeTextRequest(["text": "abc"]).ensureChineseIME)
+    }
+
     func testInvalidTextAndOptionsCannotClearTheField() {
         var reports = 0
         let input = DeviceInput(
             host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
             reportSender: { _, _ in reports += 1 })
-        var invalid: [[String: Any]] = [["clear_before": true], ["text": "你好", "clear_before": true]]
+        var invalid: [[String: Any]] = [["clear_before": true], ["text": "🙂", "clear_before": true]]
         for option in MCPKeyboardSequence.textOptions {
             for value: Any in [0, 1, "true", NSNull()] {
                 var body: [String: Any] = ["text": "a", "clear_before": true]

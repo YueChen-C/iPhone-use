@@ -8,7 +8,7 @@ enum MCPKeyboardAction {
 
 /// Validate the complete sequence before the server acquires locks or sends input.
 enum MCPKeyboardSequence {
-    static let textOptions = ["clear_before", "commit_ime", "press_enter"]
+    static let textOptions = TextEntry.textOptions
 
     static let schema: [String: Any] = {
         let seconds: [String: Any] = ["type": "number", "minimum": 0, "maximum": 5]
@@ -43,7 +43,8 @@ enum MCPKeyboardSequence {
 
     static func actions(arguments: [String: Any], language: AppLanguage = .en) throws -> [MCPKeyboardAction] {
         let table = StringsMCP(language: language)
-        guard Set(arguments.keys).isSubset(of: ["steps", "actions", "device", "device_id", "include_image"]),
+        guard
+            Set(arguments.keys).isSubset(of: ["steps", "actions", "device", "device_id", "include_image", "observe"]),
             ["device", "device_id"].allSatisfy({ arguments[$0] == nil || arguments[$0] is String }),
             arguments["include_image"] == nil || isBoolean(arguments["include_image"]),
             let steps = (arguments["steps"] ?? arguments["actions"]) as? [[String: Any]],
@@ -64,10 +65,10 @@ enum MCPKeyboardSequence {
             {
                 textCount += text.count
                 guard !text.isEmpty, textCount <= 256,
-                    text.allSatisfy({ KeyboardMap.stroke(for: $0) != nil })
+                    step["use_clipboard"] as? Bool == true || KeyboardMap.keyboardText(for: text) != nil
                 else { throw MCPServer.MCPError(table.kbAscii(label)) }
                 let request = try TypeTextRequest(step, language: language)
-                return request.actions.map { .request($0) }
+                return request.actions.map { .request(MCPToolRequest(path: $0.path, body: $0.body)) }
             }
             if let key = step["key"] as? String,
                 Set(step.keys).isSubset(of: ["type", "key", "modifiers"]),
@@ -103,7 +104,6 @@ enum MCPKeyboardSequence {
     }
 
     static func isBoolean(_ value: Any?) -> Bool {
-        guard let number = value as? NSNumber else { return false }
-        return CFGetTypeID(number) == CFBooleanGetTypeID()
+        TextEntry.isBoolean(value)
     }
 }

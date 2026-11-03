@@ -46,10 +46,6 @@ struct StringsAPI: LocalizedTable {
     let swipeReasonDuration: String
     let swipeReasonReportCount: String
 
-    // ClipboardQRCode errors
-    let qrTextTooLong: String
-    let qrGenerationFailed: String
-
     static var current: StringsAPI { StringsAPI(language: AppLanguageStore.shared.language) }
 
     static let zh = StringsAPI(
@@ -87,9 +83,7 @@ struct StringsAPI: LocalizedTable {
         pairingProbeUnavailable: "蓝牙指针探测不可用",
         swipeReasonPoints: "points 必须包含至少两个 0...1 内的有限坐标",
         swipeReasonDuration: "duration 必须是有限的正数",
-        swipeReasonReportCount: "duration 与上报间隔产生了无效的上报次数",
-        qrTextTooLong: "文字超过单个二维码容量（约 2.8 KB），请分段发送",
-        qrGenerationFailed: "无法生成文字二维码，请重试")
+        swipeReasonReportCount: "duration 与上报间隔产生了无效的上报次数")
 
     static let en = StringsAPI(
         pairHostRequired: "host is required (a UUID from unmatchedHosts)",
@@ -131,7 +125,5 @@ struct StringsAPI: LocalizedTable {
         pairingProbeUnavailable: "Bluetooth pointer probe is unavailable",
         swipeReasonPoints: "points must contain at least two finite coordinates in 0...1",
         swipeReasonDuration: "duration must be a finite positive number",
-        swipeReasonReportCount: "duration and report interval produce an invalid report count",
-        qrTextTooLong: "Text exceeds a single QR code's capacity (about 2.8 KB); send it in chunks",
-        qrGenerationFailed: "Could not generate a text QR code; try again")
+        swipeReasonReportCount: "duration and report interval produce an invalid report count")
 }

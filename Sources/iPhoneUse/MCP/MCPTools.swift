@@ -78,7 +78,8 @@ enum MCPToolCatalog {
                 [
                     "text": ["type": "string"], "device": device,
                     "clear_before": ["type": "boolean"], "commit_ime": ["type": "boolean"],
-                    "press_enter": ["type": "boolean"],
+                    "press_enter": ["type": "boolean"], "ensure_chinese_ime": ["type": "boolean"],
+                    "use_clipboard": ["type": "boolean"],
                 ], required: ["text"]),
             tool(
                 "press_key",
@@ -96,6 +97,63 @@ enum MCPToolCatalog {
                     "device": device, "include_image": ["type": "boolean"],
                 ]),
             tool("home", table.toolHome, ["device": device]),
+            tool(
+                "act",
+                language == .zh
+                    ? "顺序执行点击、文字点击、滑动、输入、按键、主屏幕、延时与等待文字；失败立即停止。"
+                    : "Execute ordered tap, tap_text, swipe, type, key, home, delay and wait_text steps; stop on failure.",
+                [
+                    "steps": actSteps,
+                    "device": device,
+                ], required: ["steps"]),
+        ]
+    }
+
+    private static var actSteps: [String: Any] {
+        let number: [String: Any] = ["type": "number"]
+        let boolean: [String: Any] = ["type": "boolean"]
+        let text: [String: Any] = ["type": "string", "minLength": 1]
+        let edge: [String: Any] = ["type": "integer", "minimum": 1, "default": MCPServer.longEdge]
+        func step(_ type: String, _ properties: [String: Any], _ required: [String] = []) -> [String: Any] {
+            var properties = properties
+            properties["type"] = ["type": "string", "enum": [type]]
+            return [
+                "type": "object", "additionalProperties": false, "properties": properties,
+                "required": ["type"] + required,
+            ]
+        }
+        var typing: [String: Any] = ["text": text]
+        for option in TextEntry.textOptions { typing[option] = boolean }
+        let matching: [String: Any] = [
+            "text": text, "exact": boolean, "index": ["type": "integer", "minimum": 0], "maxEdge": edge,
+        ]
+        var tapText = matching
+        tapText["hold"] = ["type": "number", "minimum": 0, "maximum": 60]
+        var waiting = matching
+        waiting["timeout"] = ["type": "number", "minimum": 0, "maximum": 6, "default": 6]
+        return [
+            "type": "array", "minItems": 1, "maxItems": 16,
+            "items": [
+                "oneOf": [
+                    step("tap", ["x": number, "y": number, "normalized": boolean, "hold": number], ["x", "y"]),
+                    step("tap_text", tapText, ["text"]),
+                    step(
+                        "swipe",
+                        [
+                            "points": [
+                                "type": "array", "minItems": 2,
+                                "items": [
+                                    "type": "object", "properties": ["x": number, "y": number], "required": ["x", "y"],
+                                ],
+                            ], "duration": number, "normalized": boolean,
+                        ], ["points"]),
+                    step("type", typing, ["text"]),
+                    step("key", ["key": text, "modifiers": ["type": "array", "items": text]], ["key"]),
+                    step("home", [:]),
+                    step("delay", ["seconds": ["type": "number", "minimum": 0, "maximum": 6]], ["seconds"]),
+                    step("wait_text", waiting, ["text"]),
+                ]
+            ],
         ]
     }
 
@@ -109,6 +167,9 @@ enum MCPToolCatalog {
         properties["include_image"] = [
             "type": "boolean", "default": true, "description": StringsMCP(language: .en).includeImage,
         ]
+        if !readOnly {
+            properties["observe"] = ["type": "string", "enum": ["full", "ocr_diff", "none"], "default": "full"]
+        }
         var schema: [String: Any] = ["type": "object", "properties": properties, "required": required]
         if name == "keyboard_sequence" {
             schema["anyOf"] = [["required": ["steps"]], ["required": ["actions"]]]
@@ -137,6 +198,22 @@ struct MCPToolRequest {
     ) throws -> MCPToolRequest? {
         let device = (arguments["device"] as? String) ?? (arguments["device_id"] as? String)
         switch name {
+        case "act":
+            let batch = try ActRequest(arguments)
+            let steps = try batch.steps.map { step -> [String: Any] in
+                let type = step["type"] as! String
+                if ["tap", "swipe", "tap_text"].contains(type) {
+                    var translated = try action(named: type, arguments: step, longEdge: longEdge, language: language)!
+                        .body
+                    translated["type"] = type
+                    if type == "tap", let hold = step["hold"] { translated["hold"] = hold }
+                    return translated
+                }
+                var translated = step
+                if type == "wait_text", translated["maxEdge"] == nil { translated["maxEdge"] = longEdge }
+                return translated
+            }
+            return MCPToolRequest(path: "/act", body: withDevice(["steps": steps], device))
         case "ocr_screen", "tap_text":
             let table = StringsAPI(language: language)
             let edge = try OCRRequest.maxEdge(arguments, table: table) ?? longEdge
@@ -181,9 +258,9 @@ struct MCPToolRequest {
             return MCPToolRequest(path: "/swipe", body: body)
         case "type_text":
             var body: [String: Any] = ["text": arguments["text"] ?? ""]
-            for option in MCPKeyboardSequence.textOptions {
+            for option in TextEntry.textOptions {
                 if let value = arguments[option] {
-                    guard MCPKeyboardSequence.isBoolean(value) else {
+                    guard TextEntry.isBoolean(value) else {
                         throw MCPServer.MCPError(StringsMCP(language: language).booleanRequired(option))
                     }
                     body[option] = value

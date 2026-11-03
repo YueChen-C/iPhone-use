@@ -92,11 +92,12 @@ struct StringsMCP: LocalizedTable {
         toolTap: "点按 iPhone 屏幕上的一个点。默认使用最新截图像素；normalized=true 时每轴使用 0...1000。",
         toolLongPress: "长按某个点，例如打开上下文菜单。",
         toolSwipe: "沿至少两个点的有序路径持续拖动，直到最后一个点才抬起。默认使用最新截图像素；normalized=true 时每轴使用 0...1000。",
-        toolTypeText: "通过蓝牙键盘输入文字（美式布局，仅 ASCII）。clear_before 先全选清空；commit_ime 在文字后按空格提交输入法候选词；press_enter 最后按回车。",
+        toolTypeText:
+            "通过蓝牙键盘输入 ASCII 或中文（中文转拼音并以空格选择首个候选词）。clear_before 先全选清空；commit_ime 在文字后按空格提交输入法候选词；press_enter 最后按回车；ensure_chinese_ime 使用屏幕 OCR 尝试切换中文输入法。",
         toolPressKey:
             "按下按键，可带修饰键。按键：enter、escape、backspace、tab、space、up、down、left、right 或单个字符。修饰键：cmd、shift、alt、ctrl。cmd+space 打开聚焦搜索。",
         toolKeyboardSequence:
-            "在当前应用中执行一段简短、已知的键盘序列，最后返回一张截图。所有步骤在输入前完成校验；同一手机的 MCP 锁覆盖整个序列。出错即停止且不会重放。需要查看中间画面时请拆分为多次调用。支持 steps/actions 别名、可选 type 字段及 0...5 秒的 delay/wait 步骤。文字步骤支持 clear_before、commit_ime、press_enter。最多 16 步、文字总量 256 字符；仅支持美式键盘 ASCII。",
+            "在当前应用中执行一段简短、已知的键盘序列，最后返回一张截图。所有步骤在输入前完成校验；同一手机的 MCP 锁覆盖整个序列。出错即停止且不会重放。需要查看中间画面时请拆分为多次调用。支持 steps/actions 别名、可选 type 字段及 0...5 秒的 delay/wait 步骤。文字步骤支持 clear_before、commit_ime、press_enter、ensure_chinese_ime。最多 16 步、文字总量 256 字符；中文转拼音并选择首个候选词。",
         toolHome: "回到主屏幕。",
         unknownTool: { "未知工具 \($0)" },
         coordinateFinite: { "\($0) 必须是有限且非负的截图坐标" },
@@ -104,11 +105,11 @@ struct StringsMCP: LocalizedTable {
         parameterRequired: { "缺少 \($0)" },
         keyboardSequenceRange: "keyboard_sequence 需要 1...16 个 steps/actions 步骤和可选的 device/device_id；同时提供的步骤数组必须相同",
         kbStepLabel: { "keyboard_sequence 第 \($0) 步" },
-        kbAscii: { "\($0)：文字必须使用美式 ASCII 键盘；文字总量上限 256" },
+        kbAscii: { "\($0)：文字必须可转换为美式 ASCII 按键或中文拼音；文字总量上限 256" },
         kbExpected: { "\($0)：需要文字、受支持的按键（可带修饰键）或 delay/wait 延时" },
         kbDelay: { "\($0)：延时必须是 0...5 秒内的非布尔有限数值" },
         booleanRequired: { "\($0) 必须是布尔值" },
-        typeAscii: "文字必须使用美式 ASCII 键盘；中文输入法请传入拼音并使用 commit_ime",
+        typeAscii: "文字必须可转换为美式 ASCII 按键或中文拼音",
         kbUnknownModifier: { "\($0)：未知的修饰键" },
         invalidDeviceList: "应用返回的设备列表无效",
         expectedOneMatch: { "期望匹配到一台 iPhone，实际 \($0) 台。请调用 list_devices 并传入完整 device ID。" },
@@ -158,11 +159,11 @@ struct StringsMCP: LocalizedTable {
         toolSwipe:
             "Drag continuously through an ordered path of at least two points, keeping contact until the last point. Coordinates default to pixels of the latest screenshot; normalized=true uses 0...1000 per axis.",
         toolTypeText:
-            "Type text with the Bluetooth keyboard (US layout, ASCII only). clear_before selects all and deletes first; commit_ime presses space after text; press_enter presses enter last.",
+            "Type ASCII or Chinese with the Bluetooth keyboard (Hanzi becomes pinyin and selects the first candidate). clear_before selects all and deletes first; commit_ime presses space after text; press_enter presses enter last; ensure_chinese_ime uses screen OCR to attempt switching to a Chinese IME.",
         toolPressKey:
             "Press a key, optionally with modifiers. Keys: enter, escape, backspace, tab, space, up, down, left, right, or a character. Modifiers: cmd, shift, alt, ctrl. cmd+space opens Spotlight.",
         toolKeyboardSequence:
-            "Run a short, known keyboard sequence in the current app with one final screenshot. All steps are validated before input; the same-phone MCP lock covers the whole sequence. Stops on error without replay. Use separate calls when an intermediate screen needs inspection. Accepts steps/actions aliases, optional type tags and delay/wait steps of 0...5 seconds. Text steps accept clear_before, commit_ime and press_enter. Up to 16 steps and 256 total text characters; US keyboard ASCII only.",
+            "Run a short, known keyboard sequence in the current app with one final screenshot. All steps are validated before input; the same-phone MCP lock covers the whole sequence. Stops on error without replay. Use separate calls when an intermediate screen needs inspection. Accepts steps/actions aliases, optional type tags and delay/wait steps of 0...5 seconds. Text steps accept clear_before, commit_ime, press_enter and ensure_chinese_ime. Up to 16 steps and 256 total characters; Hanzi becomes pinyin and selects the first candidate.",
         toolHome: "Go to the Home Screen.",
         unknownTool: { "unknown tool \($0)" },
         coordinateFinite: { "\($0) must be a finite, nonnegative screenshot coordinate" },
@@ -171,11 +172,11 @@ struct StringsMCP: LocalizedTable {
         keyboardSequenceRange:
             "keyboard_sequence requires 1...16 steps/actions and optional device/device_id; both arrays must match when supplied",
         kbStepLabel: { "keyboard_sequence step \($0)" },
-        kbAscii: { "\($0): text must use the US ASCII keyboard; total text limit is 256" },
+        kbAscii: { "\($0): text must be representable as US ASCII keys or Chinese pinyin; total text limit is 256" },
         kbExpected: { "\($0): expected text, a supported key with optional modifiers, or delay/wait" },
         kbDelay: { "\($0): delay must be a finite, non-boolean number in 0...5 seconds" },
         booleanRequired: { "\($0) must be a boolean" },
-        typeAscii: "Text must use the US ASCII keyboard; for a Chinese IME, send pinyin and use commit_ime",
+        typeAscii: "Text must be representable as US ASCII keys or Chinese pinyin",
         kbUnknownModifier: { "\($0): unknown keyboard modifier" },
         invalidDeviceList: "Invalid device list from the app",
         expectedOneMatch: {

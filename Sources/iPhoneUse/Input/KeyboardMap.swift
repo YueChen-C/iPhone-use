@@ -1,3 +1,5 @@
+import Foundation
+
 /// US keyboard layout, HID usage page 0x07.
 enum KeyboardMap {
     /// A key usage together with the modifier bits that must stay held while
@@ -19,6 +21,7 @@ enum KeyboardMap {
     static let named: [String: UInt8] = [
         "enter": 0x28, "return": 0x28, "escape": 0x29, "esc": 0x29,
         "backspace": 0x2A, "delete": 0x2A, "tab": 0x2B, "space": 0x2C,
+        "capslock": 0x39, "caps_lock": 0x39,
         "right": 0x4F, "left": 0x50, "down": 0x51, "up": 0x52,
         "forwarddelete": 0x4C, "home": 0x4A, "end": 0x4D, "pageup": 0x4B, "pagedown": 0x4E,
     ]
@@ -62,6 +65,40 @@ enum KeyboardMap {
             mask |= bit
         }
         return mask
+    }
+
+    private static let hanPattern = try! NSRegularExpression(pattern: "\\p{Han}")
+
+    static func containsHanzi(_ text: String) -> Bool {
+        hanPattern.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+    }
+
+    /// Preflight the whole input before sending reports. Han runs become pinyin
+    /// followed by a space to select the IME's current first candidate.
+    static func keyboardText(for text: String) -> String? {
+        var output = ""
+        var han = ""
+        func flush() -> Bool {
+            guard !han.isEmpty else { return true }
+            guard
+                let latin = han.applyingTransform(.toLatin, reverse: false)?
+                    .applyingTransform(.stripCombiningMarks, reverse: false)
+            else { return false }
+            let pinyin = latin.lowercased().filter { !$0.isWhitespace }
+            guard !pinyin.isEmpty, pinyin.allSatisfy({ $0 >= "a" && $0 <= "z" }) else { return false }
+            output += pinyin + " "
+            han = ""
+            return true
+        }
+        for character in text {
+            if containsHanzi(String(character)) {
+                han.append(character)
+            } else {
+                guard flush(), stroke(for: character) != nil else { return nil }
+                output.append(character)
+            }
+        }
+        return flush() ? output : nil
     }
 
     static func stroke(for character: Character) -> Stroke? {
