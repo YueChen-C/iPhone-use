@@ -6,6 +6,7 @@ import VideoToolbox
 /// CVPixelBuffer and mouse events are sent to the phone's HID input queue.
 final class PhoneControlView: NSView {
     private var binding: ControlDeviceBinding
+    private let bluetoothDemandToken = UUID()
     private var timer: Timer?
     private var tracking: NSTrackingArea?
     private var device: Device?
@@ -57,6 +58,7 @@ final class PhoneControlView: NSView {
 
     func start() {
         guard timer == nil else { return }
+        HIDPeripheral.shared.beginWindowDemand(bluetoothDemandToken)
         binding.start()
         let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             self?.refreshDevice()
@@ -70,6 +72,7 @@ final class PhoneControlView: NSView {
     }
 
     func stop() {
+        HIDPeripheral.shared.endWindowDemand(bluetoothDemandToken)
         timer?.invalidate()
         timer = nil
         binding.stop()
@@ -84,7 +87,10 @@ final class PhoneControlView: NSView {
         lastShortcutState = nil
     }
 
-    deinit { timer?.invalidate() }
+    deinit {
+        HIDPeripheral.shared.endWindowDemand(bluetoothDemandToken)
+        timer?.invalidate()
+    }
 
     override func updateTrackingAreas() {
         if let tracking { removeTrackingArea(tracking) }

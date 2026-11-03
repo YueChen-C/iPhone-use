@@ -127,6 +127,10 @@ final class LocalizationTests: XCTestCase {
         ) { error in
             XCTAssertEqual(String(describing: error), StringsAPI.zh.coordinatesRequired("x", "y"))
         }
+        let zhCaptureError = StringsAPI.zh.captureFailedFromDevice("iPhone", "cannot open (-11800)")
+        let enCaptureError = StringsAPI.en.captureFailedFromDevice("iPhone", "cannot open (-11800)")
+        XCTAssertTrue(zhCaptureError.contains("iPhone") && zhCaptureError.contains("-11800"))
+        XCTAssertTrue(enCaptureError.contains("iPhone") && enCaptureError.contains("-11800"))
     }
 
     // MARK: MCP catalog

@@ -1,9 +1,10 @@
 import CoreBluetooth
+import CoreGraphics
 import Foundation
 
 /// The Mac as a BLE keyboard + pointer (HID over GATT). Classic Bluetooth HID is out:
 /// bluetoothd owns L2CAP PSM 17 and 19 on current macOS.
-final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
+final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManagerDelegate {
     static let shared = HIDPeripheral()
 
     let localName = "iPhone Use"
@@ -11,17 +12,22 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     /// Owns the GATT database, subscriptions, connection tokens and pending reports.
     /// Public readers synchronize here; all delegate callbacks already run here.
     private let queue = DispatchQueue(label: "iphone-use.bluetooth")
-    private var manager: CBPeripheralManager!
+    private var manager: CBPeripheralManager?
+    private var centralManager: CBCentralManager?
+    private var lifecyclePolicy = HIDLifecyclePolicy()
+    private var reconnectTracker = HIDReconnectTracker()
+    private var reconnectingPeripherals: [UUID: CBPeripheral] = [:]
+    private let reconnectTimeout: TimeInterval = 12
     private var servicesToAdd: [CBMutableService] = []
     private var serviceBeingAdded: CBMutableService?
     private var published = false
 
     private var inputs: [ReportID: CBMutableCharacteristic] = [:]
-    private var keyboardOutput: CBMutableCharacteristic!
-    private var controlPoint: CBMutableCharacteristic!
-    private var protocolMode: CBMutableCharacteristic!
-    private var batteryLevel: CBMutableCharacteristic!
-    private var serviceChanged: CBMutableCharacteristic!
+    private var keyboardOutput: CBMutableCharacteristic?
+    private var controlPoint: CBMutableCharacteristic?
+    private var protocolMode: CBMutableCharacteristic?
+    private var batteryLevel: CBMutableCharacteristic?
+    private var serviceChanged: CBMutableCharacteristic?
 
     private var centrals: [UUID: CBCentral] = [:]
     private var connections = HIDConnectionState()
@@ -35,16 +41,292 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
 
     /// Called on the Bluetooth queue when a phone starts or stops listening for input.
     var onHostsChanged: (() -> Void)?
+    private let queryOnlineDisplayState: () -> HIDOnlineDisplayState = HIDPeripheral.onlineDisplayState
 
-    func start() {
-        queue.async {
-            self.manager = CBPeripheralManager(delegate: self, queue: self.queue)
+    /// Classifies online displays via CoreGraphics, explicitly separating query errors
+    /// (`.unknown`) from confirmed zero-display headless Macs (`.noOnlineDisplays`),
+    /// clamshell/DarkWake sleep (`.allAsleep`), and active displays (`.atLeastOneAwake`).
+    static func onlineDisplayState() -> HIDOnlineDisplayState {
+        var reportedCount: UInt32 = 0
+        let countStatus = CGGetOnlineDisplayList(0, nil, &reportedCount)
+        guard countStatus == .success, reportedCount > 0 else {
+            return HIDOnlineDisplayState.classify(
+                countQueryError: countStatus,
+                reportedCount: reportedCount)
         }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(reportedCount))
+        var resolvedCount = reportedCount
+        let listStatus = CGGetOnlineDisplayList(reportedCount, &displays, &resolvedCount)
+        guard listStatus == .success, resolvedCount > 0 else {
+            return HIDOnlineDisplayState.classify(
+                countQueryError: countStatus,
+                reportedCount: reportedCount,
+                listQueryError: listStatus,
+                resolvedCount: resolvedCount)
+        }
+        let count = min(Int(resolvedCount), displays.count)
+        let asleepFlags = displays.prefix(count).map { CGDisplayIsAsleep($0) != 0 }
+        return HIDOnlineDisplayState.classify(
+            countQueryError: countStatus,
+            reportedCount: reportedCount,
+            listQueryError: listStatus,
+            resolvedCount: UInt32(count),
+            asleepFlags: asleepFlags)
+    }
+
+    func start(initialDisplayState: HIDOnlineDisplayState = .atLeastOneAwake) {
+        queue.async {
+            self.lifecyclePolicy.start(initialDisplayState: initialDisplayState)
+            if self.applyCoreBluetoothLifecycleOnQueue() {
+                self.onHostsChanged?()
+            }
+            self.scheduleUnknownDisplayRetryIfNeededOnQueue()
+        }
+    }
+
+    func stop() {
+        let callback: (() -> Void)? = queue.sync {
+            self.lifecyclePolicy.stop()
+            return self.applyCoreBluetoothLifecycleOnQueue(clearTargetsOnStop: true)
+                ? self.onHostsChanged : nil
+        }
+        callback?()
+    }
+
+    /// Synchronously unregisters CoreBluetooth managers before AppKit acknowledges
+    /// `NSWorkspace.willSleepNotification`, removing `ai.new-wave.iphone-use` from
+    /// `bluetoothd`'s session map so bonded BLE traffic cannot wake the sleeping Mac.
+    func systemWillSleep() {
+        let callback: (() -> Void)? = queue.sync {
+            self.lifecyclePolicy.systemWillSleep()
+            return self.applyCoreBluetoothLifecycleOnQueue() ? self.onHostsChanged : nil
+        }
+        callback?()
+    }
+
+    func systemDidWake(displayState: HIDOnlineDisplayState) {
+        queue.async {
+            self.lifecyclePolicy.systemDidWake(displayState: displayState)
+            if self.applyCoreBluetoothLifecycleOnQueue() {
+                self.onHostsChanged?()
+            }
+            self.scheduleUnknownDisplayRetryIfNeededOnQueue()
+        }
+    }
+
+    func screensDidSleep() {
+        queue.async {
+            self.lifecyclePolicy.screensDidSleep()
+            if self.applyCoreBluetoothLifecycleOnQueue() {
+                self.onHostsChanged?()
+            }
+        }
+    }
+
+    func screensDidWake() {
+        queue.async {
+            self.lifecyclePolicy.screensDidWake()
+            if self.applyCoreBluetoothLifecycleOnQueue() {
+                self.onHostsChanged?()
+            }
+        }
+    }
+
+    func setUSBScreenDemand(_ hasScreens: Bool, revision: UInt64) {
+        queue.async {
+            guard self.lifecyclePolicy.setUSBScreenDemand(hasScreens, revision: revision) else {
+                return
+            }
+            if hasScreens {
+                self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
+            }
+            if self.applyCoreBluetoothLifecycleOnQueue() {
+                self.onHostsChanged?()
+            }
+        }
+    }
+
+    func beginWindowDemand(_ token: UUID) {
+        queue.async {
+            self.lifecyclePolicy.beginWindowDemand(token)
+            self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
+            if self.applyCoreBluetoothLifecycleOnQueue() {
+                self.onHostsChanged?()
+            }
+        }
+    }
+
+    func endWindowDemand(_ token: UUID) {
+        queue.async {
+            self.lifecyclePolicy.endWindowDemand(token)
+            if self.applyCoreBluetoothLifecycleOnQueue() {
+                self.onHostsChanged?()
+            }
+        }
+    }
+
+    func refreshDisplayStateIfNeeded() {
+        queue.async {
+            guard self.lifecyclePolicy.hasUnresolvedDisplayQuery else { return }
+            self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
+            if self.applyCoreBluetoothLifecycleOnQueue() {
+                self.onHostsChanged?()
+            }
+        }
+    }
+
+    private func refreshUnresolvedDisplayQueryIfNeededOnQueue() {
+        guard lifecyclePolicy.hasUnresolvedDisplayQuery else { return }
+        let generation = lifecyclePolicy.displayQueryGeneration
+        let state = queryOnlineDisplayState()
+        if lifecyclePolicy.resolveUnknownDisplayQuery(state, generation: generation) {
+            log("resolved deferred display state on demand (\(state))")
+        }
+    }
+
+    private func scheduleUnknownDisplayRetryIfNeededOnQueue() {
+        guard let retry = lifecyclePolicy.nextUnknownDisplayRetry() else { return }
+        queue.asyncAfter(deadline: .now() + retry.delay) { [weak self] in
+            guard let self else { return }
+            guard self.lifecyclePolicy.hasUnresolvedDisplayQuery,
+                self.lifecyclePolicy.displayQueryGeneration == retry.generation
+            else {
+                return
+            }
+            let state = self.queryOnlineDisplayState()
+            if self.lifecyclePolicy.resolveUnknownDisplayQuery(state, generation: retry.generation) {
+                log("resolved deferred display state (\(state))")
+                if self.applyCoreBluetoothLifecycleOnQueue() {
+                    self.onHostsChanged?()
+                }
+            } else {
+                self.scheduleUnknownDisplayRetryIfNeededOnQueue()
+            }
+        }
+    }
+
+    /// Starts or unregisters `CBPeripheralManager` and `CBCentralManager` to match
+    /// `lifecyclePolicy.shouldRunCoreBluetooth`. Returns `true` when live sessions
+    /// or managers were torn down and observers should refresh host state.
+    @discardableResult
+    private func applyCoreBluetoothLifecycleOnQueue(clearTargetsOnStop: Bool = false) -> Bool {
+        if lifecyclePolicy.shouldRunCoreBluetooth {
+            guard manager == nil || centralManager == nil else { return false }
+            reconnectTracker.resetForCentralPowerOff()
+            reconnectingPeripherals.removeAll()
+            stateDescription = "starting"
+            log(
+                "bluetooth session starting (usb=\(lifecyclePolicy.hasPresentUSBScreens), windows=\(lifecyclePolicy.hasOpenControlWindows))"
+            )
+            if manager == nil {
+                manager = CBPeripheralManager(delegate: self, queue: queue)
+            }
+            if centralManager == nil {
+                centralManager = CBCentralManager(delegate: self, queue: queue)
+            }
+            return false
+        }
+
+        let hadActiveManagers = manager != nil || centralManager != nil
+        let hadSessions = !connections.sessions.isEmpty
+        if manager?.isAdvertising == true {
+            manager?.stopAdvertising()
+        }
+        let hostsToCancel =
+            clearTargetsOnStop
+            ? reconnectTracker.cancelAllForStop()
+            : reconnectTracker.suspendForLifecycleTeardown()
+        for host in hostsToCancel {
+            if let peripheral = reconnectingPeripherals[host] {
+                centralManager?.cancelPeripheralConnection(peripheral)
+            }
+        }
+        reconnectingPeripherals.removeAll()
+        centralManager?.delegate = nil
+        centralManager = nil
+        manager?.delegate = nil
+        manager = nil
+        resetConnectionState()
+        keyboardOutput = nil
+        controlPoint = nil
+        protocolMode = nil
+        batteryLevel = nil
+        serviceChanged = nil
+        let nextDescription = lifecyclePolicy.inactiveReason?.stateDescription ?? "stopped"
+        if hadActiveManagers {
+            log("bluetooth session unregistered (\(nextDescription))")
+        }
+        stateDescription = nextDescription
+        return hadActiveManagers || hadSessions
+    }
+
+    /// Initiates a bounded BLE link to saved bonded iPhones whose USB screens are
+    /// present, waking their HOGP client without requiring manual Settings > Bluetooth taps.
+    func reconnectKnownHosts(_ hosts: Set<UUID>, resetExhausted: Bool = true) {
+        queue.async {
+            if !hosts.isEmpty {
+                self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
+                if self.applyCoreBluetoothLifecycleOnQueue() {
+                    self.onHostsChanged?()
+                }
+            }
+            let activeSessions = Set(self.connections.sessions.keys)
+            let toCancel = self.reconnectTracker.updateTargets(
+                hosts, activeSessions: activeSessions, resetExhausted: resetExhausted)
+            for host in toCancel {
+                if let peripheral = self.reconnectingPeripherals[host] {
+                    self.centralManager?.cancelPeripheralConnection(peripheral)
+                } else {
+                    _ = self.reconnectTracker.handleTermination(
+                        host: host, hasActiveSession: activeSessions.contains(host))
+                }
+            }
+            self.attemptReconnections()
+        }
+    }
+
+    /// Selects saved BLE hosts that should be woken for currently present, unmatched USB screens.
+    static func hostsToReconnect(
+        pairings: [String: UUID],
+        presentScreenIDs: Set<String>,
+        matchedScreenIDs: Set<String>,
+        connectedHosts: Set<UUID>
+    ) -> Set<UUID> {
+        let unmatchedScreens = presentScreenIDs.subtracting(matchedScreenIDs)
+        guard !unmatchedScreens.isEmpty else { return [] }
+        let matchedHosts = Set(matchedScreenIDs.compactMap { pairings[$0] })
+        var candidates = Set(unmatchedScreens.compactMap { pairings[$0] })
+        if unmatchedScreens.contains(where: { pairings[$0] == nil }) {
+            candidates.formUnion(Set(pairings.values).subtracting(matchedHosts))
+        }
+        return candidates.subtracting(connectedHosts)
     }
 
     /// Phones subscribed to at least one input report.
     var connectedHosts: [UUID] {
         queue.sync { hostsWithInput }
+    }
+
+    /// Saved hosts with an active or queued bounded BLE link attempt that have
+    /// not yet subscribed to any HID input report.
+    var reconnectingHosts: Set<UUID> {
+        queue.sync {
+            guard manager != nil else { return [] }
+            return reconnectTracker.reconnectingHosts(activeSessions: Set(connections.sessions.keys))
+        }
+    }
+
+    /// Pointer report characteristics currently subscribed for the host's live session.
+    func subscribedPointerReports(for host: UUID, session: UUID?) -> Set<ReportID> {
+        queue.sync {
+            guard manager?.state == .poweredOn, published else { return [] }
+            var reports: Set<ReportID> = []
+            for report in [ReportID.absolutePointer, .relativeMouse]
+            where connections.isReady(report: report, host: host, session: session) {
+                reports.insert(report)
+            }
+            return reports
+        }
     }
 
     private var hostsWithInput: [UUID] {
@@ -122,10 +404,11 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     private func makeGenericAttributeService() -> CBMutableService {
-        serviceChanged = CBMutableCharacteristic(
+        let characteristic = CBMutableCharacteristic(
             type: CBUUID(string: "2A05"), properties: [.indicate], value: nil, permissions: [.readable])
+        serviceChanged = characteristic
         let gatt = CBMutableService(type: Self.sig("1801"), primary: true)
-        gatt.characteristics = [serviceChanged]
+        gatt.characteristics = [characteristic]
         return gatt
     }
 
@@ -136,14 +419,16 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
         let reportMap = CBMutableCharacteristic(
             type: CBUUID(string: "2A4B"), properties: [.read],
             value: Data(HIDReportMap.descriptor), permissions: [.readEncryptionRequired])
-        controlPoint = CBMutableCharacteristic(
+        let control = CBMutableCharacteristic(
             type: CBUUID(string: "2A4C"), properties: [.writeWithoutResponse],
             value: nil, permissions: [.writeEncryptionRequired])
-        protocolMode = CBMutableCharacteristic(
+        controlPoint = control
+        let mode = CBMutableCharacteristic(
             type: CBUUID(string: "2A4E"), properties: [.read, .writeWithoutResponse],
             value: nil, permissions: [.readable, .writeable])
+        protocolMode = mode
 
-        var characteristics: [CBMutableCharacteristic] = [info, reportMap, controlPoint, protocolMode]
+        var characteristics: [CBMutableCharacteristic] = [info, reportMap, control, mode]
         for id in [ReportID.keyboard, .absolutePointer, .relativeMouse, .consumer] {
             let report = CBMutableCharacteristic(
                 type: CBUUID(string: "2A4D"), properties: [.read, .notify],
@@ -152,13 +437,14 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
             inputs[id] = report
             characteristics.append(report)
         }
-        keyboardOutput = CBMutableCharacteristic(
+        let output = CBMutableCharacteristic(
             type: CBUUID(string: "2A4D"), properties: [.read, .write, .writeWithoutResponse],
             value: nil, permissions: [.readEncryptionRequired, .writeEncryptionRequired])
-        keyboardOutput.descriptors = [
+        output.descriptors = [
             CBMutableDescriptor(type: CBUUID(string: "2908"), value: Data([ReportID.keyboard.rawValue, 2]))
         ]
-        characteristics.append(keyboardOutput)
+        keyboardOutput = output
+        characteristics.append(output)
 
         let hid = CBMutableService(type: Self.sig("1812"), primary: true)
         hid.characteristics = characteristics
@@ -179,18 +465,20 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     private func makeBatteryService() -> CBMutableService {
-        batteryLevel = CBMutableCharacteristic(
+        let level = CBMutableCharacteristic(
             type: CBUUID(string: "2A19"), properties: [.read, .notify], value: nil, permissions: [.readable])
+        batteryLevel = level
         let battery = CBMutableService(type: Self.sig("180F"), primary: true)
-        battery.characteristics = [batteryLevel]
+        battery.characteristics = [level]
         return battery
     }
 
     private func addNextService() {
-        guard manager.state == .poweredOn else { return }
+        guard let manager, manager.state == .poweredOn else { return }
         guard !servicesToAdd.isEmpty else {
             published = true
             advertise()
+            attemptReconnections()
             return
         }
         let service = servicesToAdd.removeFirst()
@@ -199,7 +487,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     private func advertise() {
-        guard manager.state == .poweredOn, published, !manager.isAdvertising else { return }
+        guard let manager, manager.state == .poweredOn, published, !manager.isAdvertising else { return }
         manager.startAdvertising([
             CBAdvertisementDataLocalNameKey: localName,
             CBAdvertisementDataServiceUUIDsKey: [CBUUID(string: "1812")],
@@ -209,6 +497,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     // MARK: CBPeripheralManagerDelegate
 
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
+        guard peripheral === manager else { return }
         log("bluetooth state \(peripheral.state.rawValue) auth \(CBManager.authorization.rawValue)")
         resetConnectionState()
         switch peripheral.state {
@@ -230,7 +519,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
         // A callback from a database invalidated by a reset must not advance the
         // publication of its replacement database.
-        guard peripheral.state == .poweredOn, service === serviceBeingAdded else { return }
+        guard peripheral === manager, peripheral.state == .poweredOn, service === serviceBeingAdded else { return }
         serviceBeingAdded = nil
         if let error {
             stateDescription = "failed to add \(service.uuid): \(error.localizedDescription)"
@@ -242,7 +531,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
-        guard peripheral.state == .poweredOn, published else { return }
+        guard peripheral === manager, peripheral.state == .poweredOn, published else { return }
         if let error, (error as? CBError)?.code != .alreadyAdvertising {
             stateDescription = "advertising failed: \(error.localizedDescription)"
         } else {
@@ -252,6 +541,10 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
+        guard peripheral === manager else {
+            peripheral.respond(to: request, withResult: .unlikelyError)
+            return
+        }
         let value: Data
         switch request.characteristic.uuid {
         case CBUUID(string: "2A4E"): value = Data([0x01])
@@ -270,13 +563,13 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
-        guard peripheral.state == .poweredOn, published else {
+        guard peripheral === manager, peripheral.state == .poweredOn, published else {
             if let first = requests.first { peripheral.respond(to: first, withResult: .unlikelyError) }
             return
         }
         for request in requests {
             remember(request.central)
-            if request.characteristic.uuid == controlPoint.uuid {
+            if request.characteristic.uuid == controlPoint?.uuid {
                 log("control point write \(request.value.map { [UInt8]($0) } ?? []) from \(request.central.identifier)")
                 recoverStaleCacheIfNeeded(request.central)
             }
@@ -286,18 +579,36 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
         }
     }
 
+    /// Records a GATT characteristic subscription without enqueuing unsolicited
+    /// input notifications. Initial idle report values are served on demand via
+    /// GATT Read (`didReceiveRead`); pushing zeroed pointer reports on CCCD
+    /// subscription moves `absolutePointer` to `(0, 0)` and wakes AssistiveTouch's
+    /// on-screen cursor whenever an unplugged iPhone reconnects over BLE.
+    @discardableResult
+    static func recordSubscription(
+        _ channel: HIDConnectionState.Channel,
+        host: UUID,
+        connections: inout HIDConnectionState,
+        reconnectTracker: inout HIDReconnectTracker
+    ) -> Bool {
+        connections.subscribe(channel, host: host)
+        guard channel.isInput else { return false }
+        reconnectTracker.noteSessionEstablished(host)
+        return true
+    }
+
     func peripheralManager(
         _ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic
     ) {
-        guard published, peripheral.state == .poweredOn, let channel = channel(for: characteristic) else { return }
+        guard peripheral === manager, published, peripheral.state == .poweredOn,
+            let channel = channel(for: characteristic)
+        else { return }
         remember(central)
-        connections.subscribe(channel, host: central.identifier)
+        let establishedInput = Self.recordSubscription(
+            channel, host: central.identifier,
+            connections: &connections, reconnectTracker: &reconnectTracker)
         log("subscribe \(characteristic.uuid) \(describe(characteristic)) from \(central.identifier)")
-        if case .report(let id) = channel {
-            connections.enqueue(
-                channel, data: Data(count: Self.length(id)), host: central.identifier,
-                session: connections.sessions[central.identifier])
-            drain()
+        if establishedInput {
             hostsChanged()
         }
     }
@@ -305,7 +616,9 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     func peripheralManager(
         _ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic
     ) {
-        guard peripheral.state == .poweredOn, published, let channel = channel(for: characteristic) else { return }
+        guard peripheral === manager, peripheral.state == .poweredOn, published,
+            let channel = channel(for: characteristic)
+        else { return }
         connections.unsubscribe(channel, host: central.identifier)
         if connections.subscriptions[central.identifier] == nil {
             centrals[central.identifier] = nil
@@ -316,6 +629,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        guard peripheral === manager else { return }
         drain()
     }
 
@@ -329,6 +643,13 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
         serviceBeingAdded = nil
         inputs.removeAll()
         published = false
+        for host in reconnectTracker.cancelEstablishedOnPeripheralReset() {
+            if let peripheral = reconnectingPeripherals[host] {
+                centralManager?.cancelPeripheralConnection(peripheral)
+            } else {
+                _ = reconnectTracker.handleTermination(host: host, hasActiveSession: false)
+            }
+        }
     }
 
     // MARK: Helpers
@@ -346,13 +667,15 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
             count == 0 ? "advertising as \(localName)" : "\(count) connected, advertising as \(localName)"
     }
 
-    /// Stop at the first rejected notification. CoreBluetooth resumes this FIFO
-    /// through peripheralManagerIsReady; removing it early would lose input.
+    /// Stop a host at its first rejected notification so per-host FIFO order is
+    /// preserved, while continuing to drain other subscribed centrals so a
+    /// stalled or suspended peer cannot head-of-line block active phones.
     private func drain() {
-        guard manager?.state == .poweredOn, published else { return }
-        while let report = connections.nextPendingReport() {
+        guard let manager, manager.state == .poweredOn, published else { return }
+        var blockedHosts: Set<UUID> = []
+        while let (index, report) = connections.nextPendingReportIndex(excludingHosts: blockedHosts) {
             guard let characteristic = characteristic(for: report.channel), let central = centrals[report.host] else {
-                connections.removeFirst()
+                connections.removePending(at: index)
                 continue
             }
             let sent = manager.updateValue(report.data, for: characteristic, onSubscribedCentrals: [central])
@@ -364,15 +687,18 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
                     "pointer notify channel=\(report.channel) \([UInt8](report.data)) accepted=\(sent) host=\(report.host)"
                 )
             }
-            guard sent else { return }
-            connections.removeFirst()
+            guard sent else {
+                blockedHosts.insert(report.host)
+                continue
+            }
+            connections.removePending(at: index)
         }
     }
 
     private func channel(for characteristic: CBCharacteristic) -> HIDConnectionState.Channel? {
         if let id = inputs.first(where: { $0.value === characteristic })?.key { return .report(id) }
-        if characteristic === serviceChanged { return .serviceChanged }
-        if characteristic === batteryLevel { return .battery }
+        if let serviceChanged, characteristic === serviceChanged { return .serviceChanged }
+        if let batteryLevel, characteristic === batteryLevel { return .battery }
         return nil
     }
 
@@ -402,7 +728,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     private func reportLength(_ characteristic: CBCharacteristic) -> Int {
-        if characteristic === keyboardOutput { return 1 }
+        if let keyboardOutput, characteristic === keyboardOutput { return 1 }
         if let id = inputs.first(where: { $0.value === characteristic })?.key { return Self.length(id) }
         return 0
     }
@@ -419,5 +745,105 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     private func describe(_ characteristic: CBCharacteristic) -> String {
         if let id = inputs.first(where: { $0.value === characteristic })?.key { return "(\(id))" }
         return ""
+    }
+
+    // MARK: Bonded host BLE link initiation
+
+    private func redactedHost(_ host: UUID) -> String {
+        tracePointer ? host.uuidString : "\(host.uuidString.prefix(8))…"
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        guard central === centralManager else { return }
+        if central.state == .poweredOn {
+            attemptReconnections()
+        } else {
+            reconnectTracker.resetForCentralPowerOff()
+            reconnectingPeripherals.removeAll()
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard central === centralManager else { return }
+        log("BLE link connected to saved host \(redactedHost(peripheral.identifier))")
+    }
+
+    func centralManager(
+        _ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?
+    ) {
+        guard central === centralManager else { return }
+        handleCentralTermination(for: peripheral.identifier)
+    }
+
+    func centralManager(
+        _ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?
+    ) {
+        guard central === centralManager else { return }
+        handleCentralTermination(for: peripheral.identifier)
+    }
+
+    private func handleCentralTermination(for host: UUID) {
+        reconnectingPeripherals[host] = nil
+        let hasSession = connections.sessions[host] != nil
+        switch reconnectTracker.handleTermination(host: host, hasActiveSession: hasSession) {
+        case .none:
+            break
+        case .retryNow:
+            attemptReconnections()
+        case .scheduleBackoff(let token, let delay):
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                let active = self.connections.sessions[host] != nil
+                if self.reconnectTracker.completeBackoff(
+                    host: host, token: token, hasActiveSession: active)
+                {
+                    self.attemptReconnections()
+                }
+            }
+        case .notifyChanged:
+            onHostsChanged?()
+        }
+    }
+
+    private func attemptReconnections() {
+        guard let manager, manager.state == .poweredOn, published,
+            let centralManager, centralManager.state == .poweredOn
+        else { return }
+        let activeSessions = Set(connections.sessions.keys)
+        let missing = reconnectTracker.connectableHosts(activeSessions: activeSessions)
+        guard !missing.isEmpty else { return }
+        let peripherals = centralManager.retrievePeripherals(withIdentifiers: Array(missing))
+        let retrievedIDs = Set(peripherals.map(\.identifier))
+        var missingUnretrievable = false
+        for unretrievable in missing.subtracting(retrievedIDs) {
+            reconnectTracker.markUnretrievable(unretrievable)
+            missingUnretrievable = true
+        }
+        for peripheral in peripherals {
+            let host = peripheral.identifier
+            reconnectingPeripherals[host] = peripheral
+            let attempt = reconnectTracker.beginConnecting(host)
+            log("initiating BLE link to saved host \(redactedHost(host))")
+            centralManager.connect(peripheral, options: nil)
+            queue.asyncAfter(deadline: .now() + reconnectTimeout) { [weak self] in
+                guard let self else { return }
+                let hasSession = self.connections.sessions[host] != nil
+                guard
+                    self.reconnectTracker.markTimedOut(
+                        host: host, attempt: attempt, hasActiveSession: hasSession)
+                else { return }
+                if let active = self.reconnectingPeripherals[host] {
+                    self.centralManager?.cancelPeripheralConnection(active)
+                } else {
+                    self.handleCentralTermination(for: host)
+                }
+                if (self.reconnectTracker.attemptsUsed[host] ?? 0) >= HIDReconnectTracker.maxAutomaticAttempts {
+                    self.onHostsChanged?()
+                }
+            }
+        }
+        if missingUnretrievable {
+            onHostsChanged?()
+        }
     }
 }

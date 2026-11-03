@@ -57,6 +57,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let runModeObserver { NotificationCenter.default.removeObserver(runModeObserver) }
         runModeObserver = nil
         windows.stop()
+        let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Application.shutdownWaitTimeout)
+        if !stopResult.isClean {
+            log(
+                "capture shutdown incomplete: captureDrained=\(stopResult.captureDrained), usbRestored=\(stopResult.usbRestored)"
+            )
+        }
+        HIDPeripheral.shared.stop()
     }
 
     @objc private func showAllDevices(_ sender: Any?) { windows.showAllDevices() }
@@ -161,6 +168,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// Owns the startup sequence shared by SwiftPM and the packaged application.
 /// MCP mode bypasses this path entirely and never starts AppKit or hardware.
 enum Application {
+    static let shutdownWaitTimeout: TimeInterval = 3.0
+
+    static func terminationExitCode(for stopResult: ScreenCaptureStopResult) -> Int32 {
+        stopResult.isClean ? 0 : 1
+    }
+
     static func run() {
         let port = UInt16(ProcessInfo.processInfo.environment["IPHONE_USE_PORT"] ?? "") ?? 7390
 
@@ -177,7 +190,8 @@ enum Application {
         app.delegate = appDelegate
 
         DeviceRegistry.shared.start()
-        HIDPeripheral.shared.start()
+        HIDPeripheral.shared.start(initialDisplayState: HIDPeripheral.onlineDisplayState())
+        let powerObservers = installPowerObservers()
         ScreenCaptureManager.shared.start()
         let server = HTTPServer(port: port, handler: ControlAPI.handle)
         do {
@@ -188,10 +202,62 @@ enum Application {
             exit(1)
         }
 
-        // NSApplication's delegate is weak. Retain both process-owned services until
-        // the run loop exits, even when this entry point is optimized in release builds.
-        withExtendedLifetime((appDelegate, server)) {
+        // NSApplication's delegate is weak. Retain process-owned services and
+        // observers until the run loop exits, even when optimized in release builds.
+        let signalSources = installTerminationSignals(server: server)
+        withExtendedLifetime((appDelegate, server, signalSources, powerObservers)) {
             app.run()
+        }
+    }
+
+    private static func installPowerObservers() -> [NSObjectProtocol] {
+        let center = NSWorkspace.shared.notificationCenter
+        return [
+            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { _ in
+                log("system will sleep; unregistering Bluetooth sessions")
+                HIDPeripheral.shared.systemWillSleep()
+            },
+            center.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil, queue: nil) { _ in
+                HIDPeripheral.shared.systemWillSleep()
+            },
+            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { _ in
+                let displayState = HIDPeripheral.onlineDisplayState()
+                log("system did wake (displayState=\(displayState))")
+                HIDPeripheral.shared.systemDidWake(displayState: displayState)
+            },
+            center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: nil) { _ in
+                log("displays did sleep")
+                HIDPeripheral.shared.screensDidSleep()
+            },
+            center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: nil) { _ in
+                log("displays did wake")
+                HIDPeripheral.shared.screensDidWake()
+            },
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification, object: nil, queue: nil
+            ) { _ in
+                HIDPeripheral.shared.refreshDisplayStateIfNeeded()
+            },
+        ]
+    }
+
+    private static func installTerminationSignals(server: HTTPServer) -> [DispatchSourceSignal] {
+        [SIGINT, SIGTERM].map { sig in
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler {
+                server.stop()
+                let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Self.shutdownWaitTimeout)
+                if !stopResult.isClean {
+                    log(
+                        "capture shutdown incomplete: captureDrained=\(stopResult.captureDrained), usbRestored=\(stopResult.usbRestored)"
+                    )
+                }
+                HIDPeripheral.shared.stop()
+                exit(Self.terminationExitCode(for: stopResult))
+            }
+            source.resume()
+            return source
         }
     }
 }
