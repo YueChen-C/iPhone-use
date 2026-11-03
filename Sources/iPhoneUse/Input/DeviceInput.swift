@@ -266,16 +266,12 @@ extension DeviceInput {
         let sequence = backgroundSequence.current
         return try queue.sync {
             try requireIdlePointer()
-            guard session != nil, !isRetired, isReady(), backgroundSequence.isCurrent(sequence) else {
-                throw InputError.pairingProbeUnavailable
-            }
+            try requireProbe(stage: "relative-start", sequence: sequence, isReady: isReady)
             clearPointerEstimate()
             defer { clearPointerEstimate() }
             func move(_ dx: Int, _ dy: Int, times: Int) throws {
                 for _ in 0..<times {
-                    guard isReady(), backgroundSequence.isCurrent(sequence) else {
-                        throw InputError.pairingProbeUnavailable
-                    }
+                    try requireProbe(stage: "relative-move", sequence: sequence, isReady: isReady)
                     relative(dx, dy)
                     pause(step)
                 }
@@ -297,12 +293,11 @@ extension DeviceInput {
             for (dx, dy) in [(0, 0), (8, 0), (0, 8), (-8, 0), (0, -8)] {
                 try move(dx, dy, times: dx == 0 && dy == 0 ? 0 : 4)
                 pause(0.6)
-                guard isReady(), backgroundSequence.isCurrent(sequence) else {
-                    throw InputError.pairingProbeUnavailable
-                }
+                try requireProbe(stage: "relative-capture", sequence: sequence, isReady: isReady)
                 let images = capture()
                 guard !images.isEmpty, images.allSatisfy({ $0 != nil }) else {
-                    throw InputError.pairingProbeUnavailable
+                    try requireProbe(stage: "relative-capture", sequence: sequence, isReady: isReady)
+                    throw InputError.pointerProbe("relative-capture", "fresh-frame-unavailable")
                 }
                 frames.append(images.map { $0! })
             }
@@ -342,18 +337,17 @@ extension DeviceInput {
         let sequence = backgroundSequence.current
         return try queue.sync {
             try requireIdlePointer()
+            try requireProbe(stage: "calibration-start", sequence: sequence, isReady: isReady)
             guard size.width.isFinite, size.height.isFinite,
                 (200...4096).contains(size.width), (300...4096).contains(size.height),
                 buttons == 0, session != nil, !isRetired, isReady()
             else {
-                throw InputError.pairingProbeUnavailable
+                throw InputError.pointerProbe("calibration-start", "invalid-frame-size-or-buttons-held")
             }
             clearPointerEstimate()
             defer { clearPointerEstimate() }
             func requireCurrent() throws {
-                guard !self.isRetired, isReady(), self.backgroundSequence.isCurrent(sequence) else {
-                    throw InputError.pairingProbeUnavailable
-                }
+                try self.requireProbe(stage: "calibration", sequence: sequence, isReady: isReady)
             }
             let measurement = AutomaticPointerCalibration(
                 host: host, screenID: screenID, width: Int(size.width), height: Int(size.height),
@@ -365,7 +359,11 @@ extension DeviceInput {
                 capture: {
                     self.pause(0.4)
                     try requireCurrent()
-                    guard let pixels = capture() else { throw InputError.pairingProbeUnavailable }
+                    guard let pixels = capture() else {
+                        try requireCurrent()
+                        throw InputError.pointerProbe("calibration-capture", "fresh-frame-unavailable")
+                    }
+                    try requireCurrent()
                     return PointerMotionObservation.Frame(
                         width: Int(size.width), height: Int(size.height), pixels: pixels)
                 }, progress: progress)
@@ -389,6 +387,13 @@ extension DeviceInput {
         let sequence = motionSequence.current
         let activity = backgroundSequence.current
         func probeIsReady() -> Bool { isReady() && backgroundSequence.isCurrent(activity) }
+        func fail(_ stage: String, _ reason: String) throws -> Never {
+            try requireProbe(stage: stage, sequence: activity, isReady: isReady)
+            guard motionSequence.isCurrent(sequence) else {
+                throw InputError.pointerProbe(stage, "motion-superseded")
+            }
+            throw InputError.pointerProbe(stage, reason)
+        }
         return try queue.sync {
             guard !windowDragging, buttons == 0 else { throw InputError.pointerBusy }
             guard session != nil, probeIsReady(), motionSequence.isCurrent(sequence),
@@ -397,11 +402,11 @@ extension DeviceInput {
                     + (thirdPoint.map { [$0.x, $0.y] } ?? [])).allSatisfy({
                         $0.isFinite && (0...1).contains($0)
                     })
-            else { throw InputError.pairingProbeUnavailable }
+            else { try fail("absolute-start", "invalid-probe-parameters") }
 
             if let calibration {
                 guard calibration.host == host, (try? calibration.validate()) != nil else {
-                    throw InputError.pairingProbeUnavailable
+                    try fail("absolute-profile", "invalid-profile")
                 }
             }
 
@@ -416,41 +421,43 @@ extension DeviceInput {
                 moveForPairingProbe(thirdPoint, calibration: nil, sequence: sequence, isReady: probeIsReady)
                 pause(wait)
                 guard probeIsReady(), motionSequence.isCurrent(sequence) else {
-                    throw InputError.pairingProbeUnavailable
+                    try fail("absolute-wake", "motion-superseded")
                 }
             }
             moveForPairingProbe(firstPoint, calibration: calibration, sequence: sequence, isReady: probeIsReady)
             pause(wait)
             guard probeIsReady(), motionSequence.isCurrent(sequence), let before = capture() else {
-                throw InputError.pairingProbeUnavailable
+                try fail("absolute-first", "fresh-frame-unavailable")
             }
-            guard probeIsReady(), motionSequence.isCurrent(sequence) else { throw InputError.pairingProbeUnavailable }
+            guard probeIsReady(), motionSequence.isCurrent(sequence) else {
+                try fail("absolute-before-second", "motion-superseded")
+            }
             moveForPairingProbe(secondPoint, calibration: calibration, sequence: sequence, isReady: probeIsReady)
             pause(wait)
             guard probeIsReady(), motionSequence.isCurrent(sequence), let after = capture() else {
-                throw InputError.pairingProbeUnavailable
+                try fail("absolute-second", "fresh-frame-unavailable")
             }
             var intermediate: [UInt8]?
             if let thirdPoint {
                 guard probeIsReady(), motionSequence.isCurrent(sequence) else {
-                    throw InputError.pairingProbeUnavailable
+                    try fail("absolute-before-third", "motion-superseded")
                 }
                 moveForPairingProbe(thirdPoint, calibration: calibration, sequence: sequence, isReady: probeIsReady)
                 pause(wait)
                 guard probeIsReady(), motionSequence.isCurrent(sequence), let pixels = capture() else {
-                    throw InputError.pairingProbeUnavailable
+                    try fail("absolute-third", "fresh-frame-unavailable")
                 }
                 intermediate = pixels
             }
             var returned: [UInt8]?
             if returnToStart {
                 guard probeIsReady(), motionSequence.isCurrent(sequence) else {
-                    throw InputError.pairingProbeUnavailable
+                    try fail("absolute-before-return", "motion-superseded")
                 }
                 moveForPairingProbe(firstPoint, calibration: calibration, sequence: sequence, isReady: probeIsReady)
                 pause(wait)
                 guard probeIsReady(), motionSequence.isCurrent(sequence), let pixels = capture() else {
-                    throw InputError.pairingProbeUnavailable
+                    try fail("absolute-return", "fresh-frame-unavailable")
                 }
                 returned = pixels
             }
@@ -898,6 +905,13 @@ extension DeviceInput {
         lastEstimatedMovement = nil
     }
 
+    private func requireProbe(stage: String, sequence: UInt64, isReady: () -> Bool) throws {
+        guard session != nil else { throw InputError.pointerProbe(stage, "session-missing") }
+        guard !isRetired else { throw InputError.pointerProbe(stage, "session-retired") }
+        guard backgroundSequence.isCurrent(sequence) else { throw InputError.pointerProbe(stage, "cancelled") }
+        guard isReady() else { throw InputError.pointerProbe(stage, "readiness-lost") }
+    }
+
     fileprivate func requireIdlePointer() throws {
         guard !windowDragging else { throw InputError.pointerBusy }
     }
@@ -931,6 +945,7 @@ extension DeviceInput {
         case calibrationMismatch
         case invalidSwipe(String)
         case pairingProbeUnavailable
+        case pointerProbe(String, String)
 
         var description: String {
             let table = StringsAPI.current
@@ -941,6 +956,7 @@ extension DeviceInput {
             case .calibrationMismatch: table.calibrationMismatch
             case .invalidSwipe(let reason): table.invalidSwipePrefix(reason)
             case .pairingProbeUnavailable: table.pairingProbeUnavailable
+            case .pointerProbe(let stage, let reason): "\(table.pairingProbeUnavailable) [\(stage): \(reason)]"
             }
         }
     }

@@ -338,10 +338,15 @@ final class DeviceRegistry {
                     && ScreenCaptureManager.shared.all.contains { $0 === device.screen }
                     && device.screen.size == size
             }
+            let activity = input.inputActivitySequence
             do {
                 let profile = try input.measureRelativePointer(
                     screenID: device.id, size: size, isReady: isReady,
-                    capture: { device.screen.thumbnail(width: Int(size.width), height: Int(size.height)) },
+                    capture: {
+                        device.screen.probeThumbnail(
+                            width: Int(size.width), height: Int(size.height),
+                            isReady: { isReady() && input.inputActivitySequence == activity })
+                    },
                     progress: { count in
                         self.lock.withLock { self.calibrationJobs.progress(identity, count: count) }
                     })
@@ -961,7 +966,9 @@ final class DeviceRegistry {
                     isReady: { isReady(.absolutePointer) },
                     capture: {
                         let frames = screens.map {
-                            $0.thumbnail(width: PointerScreenMatcher.width, height: PointerScreenMatcher.height)
+                            $0.probeThumbnail(
+                                width: PointerScreenMatcher.width, height: PointerScreenMatcher.height,
+                                isReady: { isReady(.absolutePointer) })
                         }
                         guard frames.allSatisfy({ $0 != nil }) else { return nil }
                         return frames.flatMap { $0! }
@@ -1033,13 +1040,15 @@ final class DeviceRegistry {
                     preparePosition: preparePosition, isReady: { isReady(.relativeMouse) },
                     capture: {
                         if let originScreen, let size = originScreen.size,
-                            let pixels = originScreen.thumbnail(width: Int(size.width), height: Int(size.height))
+                            let pixels = originScreen.probeThumbnail(
+                                width: Int(size.width), height: Int(size.height), isReady: { isReady(.relativeMouse) })
                         {
                             originFrames.append(.init(width: Int(size.width), height: Int(size.height), pixels: pixels))
                         }
                         return rankedScreens.map {
-                            $0.thumbnail(
-                                width: RelativePointerScreenMatcher.width, height: RelativePointerScreenMatcher.height)
+                            $0.probeThumbnail(
+                                width: RelativePointerScreenMatcher.width, height: RelativePointerScreenMatcher.height,
+                                isReady: { isReady(.relativeMouse) })
                         }
                     })
                 guard probingMayContinue(), input.inputActivitySequence == sequence,

@@ -89,6 +89,28 @@ final class DeviceInputPointerTests: XCTestCase {
         XCTAssertEqual(Array(reports.dropFirst()), expected)
     }
 
+    func testAutomaticMeasurementReportsSessionAndCancellationSeparately() {
+        let missing = DeviceInput(host: UUID(), session: nil, sleep: { _ in }, reportSender: { _, _ in })
+        XCTAssertThrowsError(
+            try missing.measureRelativePointer(
+                screenID: "phone", size: CGSize(width: 750, height: 1334),
+                isReady: { true }, capture: { nil })
+        ) { error in
+            XCTAssertTrue(String(describing: error).contains("session-missing"))
+        }
+        var input: DeviceInput!
+        input = DeviceInput(
+            host: UUID(), session: UUID(), sleep: { _ in },
+            reportSender: { _, _ in input.cancelBackgroundMotion() })
+        XCTAssertThrowsError(
+            try input.measureRelativePointer(
+                screenID: "phone", size: CGSize(width: 750, height: 1334),
+                isReady: { true }, capture: { nil })
+        ) { error in
+            XCTAssertTrue(String(describing: error).contains("cancelled"))
+        }
+    }
+
     func testAutomaticMeasurementStopsOnLostReadinessAndNeverClicks() {
         var reports: [(ReportID, [UInt8])] = []
         let input = DeviceInput(

@@ -764,6 +764,11 @@ final class ScreenCaptureSession {
     }
 
     func thumbnail(width: Int, height: Int) -> [UInt8]? { source.thumbnail(width: width, height: height) }
+
+    func probeThumbnail(width: Int, height: Int, isReady: () -> Bool) -> [UInt8]? {
+        source.probeThumbnail(width: width, height: height, isReady: isReady)
+    }
+
 }
 
 /// Keeps frame pixels and their freshness metadata under the same lock.
@@ -817,6 +822,28 @@ final class ScreenCaptureFrameStore {
     func snapshot() -> Snapshot? {
         lock.withLock { latest }
     }
+
+    /// Establish the barrier after the caller's HID settling interval. Never
+    /// reuse the pre-action buffer, even if capture is stalled. This runs on an
+    /// input worker, not the capture callback or the main thread.
+    func waitForFreshSnapshot(
+        timeout: TimeInterval = 1, isReady: () -> Bool,
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        sleep: (TimeInterval) -> Void = Thread.sleep(forTimeInterval:)
+    ) -> Snapshot? {
+        guard timeout.isFinite, timeout > 0 else { return nil }
+        let barrier = now()
+        let previous = snapshot()?.sequence ?? 0
+        let deadline = barrier + timeout
+        while isReady(), now() < deadline {
+            if let value = snapshot(), value.sequence > previous, value.receivedAt >= barrier {
+                return value
+            }
+            sleep(min(0.02, max(0, deadline - now())))
+        }
+        return nil
+    }
+
 }
 
 protocol CaptureRunningSession: AnyObject {
@@ -1185,6 +1212,11 @@ final class ScreenCaptureSource:
     func thumbnail(width: Int, height: Int) -> [UInt8]? {
         guard let buffer = frame() else { return nil }
         return Self.grayscale(buffer, width: width, height: height)
+    }
+
+    func probeThumbnail(width: Int, height: Int, isReady: () -> Bool) -> [UInt8]? {
+        guard let snapshot = frames.waitForFreshSnapshot(isReady: isReady) else { return nil }
+        return Self.grayscale(snapshot.buffer, width: width, height: height)
     }
 
     /// Render outside the frame-state lock. Retaining the snapshot keeps this

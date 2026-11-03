@@ -13,6 +13,43 @@ final class ScreenCaptureFrameStoreTests: XCTestCase {
         return try XCTUnwrap(value)
     }
 
+    func testProbeWaitsForFrameAfterBarrierInsteadOfReusingLatest() throws {
+        let store = ScreenCaptureFrameStore()
+        let old = try buffer(width: 8)
+        let fresh = try buffer(width: 16)
+        store.publish(old, receivedAt: 9)
+        var now = 10.0
+        var waits = 0
+        let result = store.waitForFreshSnapshot(
+            timeout: 1, isReady: { true }, now: { now },
+            sleep: { interval in
+                now += interval
+                waits += 1
+                if waits == 3 { store.publish(fresh, receivedAt: now) }
+            })
+        XCTAssertEqual(waits, 3)
+        XCTAssertEqual(CVPixelBufferGetWidth(try XCTUnwrap(result).buffer), 16)
+    }
+
+    func testProbeTimesOutOnFrozenFramesAndStopsWhenCancelled() throws {
+        let store = ScreenCaptureFrameStore()
+        store.publish(try buffer(), receivedAt: 9)
+        var now = 10.0
+        XCTAssertNil(
+            store.waitForFreshSnapshot(
+                timeout: 0.1, isReady: { true }, now: { now }, sleep: { now += $0 }))
+        XCTAssertLessThanOrEqual(now, 10.13)
+        var waits = 0
+        XCTAssertNil(
+            store.waitForFreshSnapshot(
+                timeout: 1, isReady: { waits < 1 }, now: { now },
+                sleep: {
+                    now += $0
+                    waits += 1
+                }))
+        XCTAssertEqual(waits, 1)
+    }
+
     func testSnapshotKeepsBufferSequenceAndTimestampTogether() throws {
         let store = ScreenCaptureFrameStore()
         XCTAssertNil(store.snapshot())
