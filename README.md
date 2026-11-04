@@ -189,6 +189,7 @@ curl -s http://127.0.0.1:7390/tap \
 | [架构说明](docs/architecture.md) | 模块职责、共享状态、队列与维护约束 |
 | [Agent 技能](codex/skills/iphone-use/SKILL.md) | 在 Codex 中复用手机操作流程 |
 | [发布指南](docs/releasing.md) | 自动发布 Releases、Universal 打包、版本与签名说明 |
+| [更新日志](CHANGELOG.md) | 各版本的新功能、修复与行为变化 |
 
 ## 开发
 

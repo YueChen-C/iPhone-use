@@ -169,6 +169,7 @@ When multiple phones are connected, specify the full device ID: use `?device=<id
 | [Architecture (中文)](docs/architecture.md) | Modules, shared state, queues, and maintenance constraints |
 | [Agent skill (中文)](codex/skills/iphone-use/SKILL.md) | Reusable phone workflows for Codex |
 | [Release guide (中文)](docs/releasing.md) | Automated GitHub Releases, universal packaging, versions, and signing |
+| [Changelog](CHANGELOG.md) | Features, fixes, and behavior changes in each release |
 
 ## Development
 
