@@ -553,6 +553,16 @@ final class TypeTextRequestTests: XCTestCase {
         }
     }
 
+    func testPinyinPreservesUmlautAsVBeforeStrippingTones() {
+        let cases = [
+            "女": "nv ", "吕": "lv ", "绿": "lv ", "绿色": "lvse ", "略": "lve ", "虐": "nve ",
+            "女儿": "nver ", "居去需雨": "juquxuyu ", "学": "xue ", "你好": "nihao ", "a女b": "anv b",
+        ]
+        for (text, expected) in cases {
+            XCTAssertEqual(KeyboardMap.keyboardText(for: text), expected, text)
+        }
+    }
+
     func testHanziReportsAndIMEHeuristic() throws {
         XCTAssertEqual(KeyboardMap.keyboardText(for: "蓝牙"), "lanya ")
         XCTAssertEqual(KeyboardMap.keyboardText(for: "快捷指令"), "kuaijiezhiling ")

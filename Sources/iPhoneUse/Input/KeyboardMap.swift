@@ -67,6 +67,11 @@ enum KeyboardMap {
         return mask
     }
 
+    private static let umlautU: [Character: Character] = [
+        "ü": "v", "ǖ": "v", "ǘ": "v", "ǚ": "v", "ǜ": "v",
+        "Ü": "V", "Ǖ": "V", "Ǘ": "V", "Ǚ": "V", "Ǜ": "V",
+    ]
+
     private static let hanPattern = try! NSRegularExpression(pattern: "\\p{Han}")
 
     static func containsHanzi(_ text: String) -> Bool {
@@ -81,7 +86,9 @@ enum KeyboardMap {
         func flush() -> Bool {
             guard !han.isEmpty else { return true }
             guard
-                let latin = han.applyingTransform(.toLatin, reverse: false)?
+                let toned = han.applyingTransform(.toLatin, reverse: false),
+                // Map ü before removing tones; ICU already emits plain u after j/q/x/y.
+                let latin = String(toned.precomposedStringWithCanonicalMapping.map { umlautU[$0] ?? $0 })
                     .applyingTransform(.stripCombiningMarks, reverse: false)
             else { return false }
             let pinyin = latin.lowercased().filter { !$0.isWhitespace }

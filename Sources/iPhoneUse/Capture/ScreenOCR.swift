@@ -88,7 +88,10 @@ enum ScreenOCR {
     }
 
     private static let lock = NSLock()
-    private static var cache: [(CacheKey, Result)] = []
+    private static var cache: [(CacheKey, Result, [UInt8])] = []
+    private static let maximumLumaDelta = 16
+    private static let significantLumaDelta = 6
+    private static let significantPixelRatio = 2000
     private static var recentSignatures: [FrameSignature] = []
     private static var previous: [String: Set<String>] = [:]
 
@@ -121,13 +124,54 @@ enum ScreenOCR {
 
     /// Hash decoded pixels with a 2-level L-infinity tolerance on an 8x8 luminance grid
     /// so USB H.264/YUV LSB quantization noise does not invalidate a static screen.
-    static func screenHash(_ data: Data) -> String {
+    static func stabilitySignature(_ data: Data) -> String {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
             let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
         else { return "" }
         lock.lock()
         defer { lock.unlock() }
         return frameHashLocked(image)
+    }
+
+    /// SHA-256 of dimensions and every decoded 8-bit luminance pixel, without tolerance.
+    static func screenHash(_ data: Data) -> String {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else { return "" }
+        return content(image)?.hash ?? ""
+    }
+
+    private static func content(_ image: CGImage) -> (hash: String, luma: [UInt8])? {
+        var pixels = [UInt8](repeating: 0, count: image.width * image.height)
+        let rendered = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard
+                let context = CGContext(
+                    data: buffer.baseAddress, width: image.width, height: image.height,
+                    bitsPerComponent: 8, bytesPerRow: image.width, space: CGColorSpaceCreateDeviceGray(),
+                    bitmapInfo: CGImageAlphaInfo.none.rawValue)
+            else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            return true
+        }
+        guard rendered else { return nil }
+        let hash = SHA256.hash(data: Data("\(image.width)x\(image.height):".utf8) + Data(pixels)).map {
+            String(format: "%02x", $0)
+        }.joined()
+        return (hash, pixels)
+    }
+
+    private static func canReuse(_ current: [UInt8], reference: [UInt8]) -> Bool {
+        guard current.count == reference.count, !current.isEmpty else { return false }
+        var significant = 0
+        for (pixel, old) in zip(current, reference) {
+            let delta = abs(Int(pixel) - Int(old))
+            guard delta <= maximumLumaDelta else { return false }
+            if delta > significantLumaDelta {
+                significant += 1
+                guard significant * significantPixelRatio <= current.count else { return false }
+            }
+        }
+        return true
     }
 
     private static func frameHashLocked(_ image: CGImage) -> String {
@@ -169,18 +213,31 @@ enum ScreenOCR {
         // Serialize recognition too: concurrent callers of the same frame share one Vision pass.
         lock.lock()
         defer { lock.unlock() }
-        let hash = frameHashLocked(image)
+        let pixels = content(image)
+        let hash = pixels?.hash ?? ""
         let key = CacheKey(device: device, width: image.width, height: image.height, hash: hash)
         if !hash.isEmpty, let index = cache.firstIndex(where: { $0.0 == key }) {
             let hit = cache.remove(at: index)
             cache.append(hit)
             return hit.1
         }
+        if let pixels,
+            let hit = cache.last(where: {
+                $0.0.device == device && $0.0.width == image.width && $0.0.height == image.height
+                    && canReuse(pixels.luma, reference: $0.2)
+            })
+        {
+            let result = Result(width: image.width, height: image.height, items: hit.1.items, screenHash: hash)
+            // Keep the original recognized pixels as the reference: noise must not drift cumulatively.
+            cache.append((key, result, hit.2))
+            if cache.count > 8 { cache.removeFirst() }
+            return result
+        }
         do {
             let items = try recognition(image)
             let result = Result(width: image.width, height: image.height, items: sorted(items), screenHash: hash)
-            if !hash.isEmpty {
-                cache.append((key, result))
+            if let pixels {
+                cache.append((key, result, pixels.luma))
                 if cache.count > 8 { cache.removeFirst() }
             }
             return result

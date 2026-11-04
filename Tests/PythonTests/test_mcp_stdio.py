@@ -56,6 +56,9 @@ class MockApp(BaseHTTPRequestHandler):
             self.send(200, json.dumps({"device": body["device"], "width": 600, "height": 1200,
                                        "items": [{"text": "设置", "x": 120, "y": 400}]}).encode())
             return
+        if self.path == "/act" and self.server.act_failure is not None:
+            self.send(400, json.dumps(self.server.act_failure).encode())
+            return
         if self.server.fail_actions:
             self.send(503, b'{"error":"pointer is not ready"}')
         else:
@@ -77,6 +80,7 @@ class MCPStdioTests(unittest.TestCase):
         self.server.events = []
         self.server.stability_events = []
         self.server.fail_actions = False
+        self.server.act_failure = None
         self.server.language = "en"
         self.server.devices = [{"id": "phone-1", "name": "First", "bluetooth": True}]
         self.server.devices_requested = threading.Event()
@@ -128,6 +132,29 @@ class MCPStdioTests(unittest.TestCase):
             ("POST", "/act", {"steps": steps, "device": "phone-1"}),
         ])
         self.assertEqual(self.server.stability_events, [])
+
+    def test_act_failure_preserves_progress_without_replaying(self):
+        self.server.act_failure = {"ok": False, "failed_step": 3, "completed": 2,
+                                   "error": "pointer is not ready"}
+        result = self.exchange([("act", {"steps": [{"type": "home"}] * 5})])[0]
+        self.assertTrue(result["isError"])
+        text = result["content"][0]["text"]
+        progress = json.loads(text.splitlines()[0])
+        self.assertEqual(progress["failed_step"], 3)
+        self.assertEqual(progress["completed"], 2)
+        self.assertEqual(progress["error"], "pointer is not ready")
+        self.assertIn("may have partially executed", text)
+        self.assertEqual([event[1] for event in self.server.events if event[0] == "POST"], ["/act"])
+        self.assertFalse(any(event[1].startswith("/screenshot") for event in self.server.events))
+
+    def test_act_failure_preserves_either_progress_field_including_zero(self):
+        for field, value in (("failed_step", 1), ("completed", 0)):
+            with self.subTest(field=field):
+                self.server.act_failure = {"error": "stopped", field: value}
+                result = self.exchange([("act", {"steps": [{"type": "home"}]})])[0]
+                self.assertTrue(result["isError"])
+                progress = json.loads(result["content"][0]["text"].splitlines()[0])
+                self.assertEqual(progress[field], value)
 
     def test_none_reuses_device_cache_and_performs_no_screen_reads(self):
         results = self.exchange([("home", {"observe": "none"}), ("home", {"observe": "none"})])

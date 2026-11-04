@@ -53,6 +53,7 @@ struct StringsMCP: LocalizedTable {
     let invalidDeviceList: String
     let expectedOneMatch: (Int) -> String
     let keyboardStopped: (Int, Int, String) -> String
+    let actStopped: String
     let screenshotCaption: (String, String, String) -> String
     let noResponse: String
     let appNotRunning: (String) -> String
@@ -116,6 +117,7 @@ struct StringsMCP: LocalizedTable {
         keyboardStopped: { step, count, error in
             "键盘序列在第 \(step)/\(count) 步停止：\(error)。之前的输入可能已执行；继续前请重新截图。"
         },
+        actStopped: "已完成的步骤已生效，请勿重放；失败步骤可能部分生效，继续前请重新截图。",
         screenshotCaption: { "\($0) 的截图，\($1)x\($2) 像素。默认使用这些像素坐标；每轴 0...1000 坐标须传 normalized=true。" },
         noResponse: "无响应",
         appNotRunning: { "iPhone Use 应用未运行（\($0)）" },
@@ -185,6 +187,8 @@ struct StringsMCP: LocalizedTable {
         keyboardStopped: { step, count, error in
             "Keyboard sequence stopped at step \(step)/\(count): \(error). Earlier input may have executed; take a fresh screenshot before continuing."
         },
+        actStopped:
+            "Completed steps have executed; do not replay them. The failed step may have partially executed; take a fresh screenshot before continuing.",
         screenshotCaption: {
             "Screenshot of \($0), \($1)x\($2) px. Use these pixels for tap and swipe, or pass normalized=true for 0...1000 per axis."
         },

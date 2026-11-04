@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import XCTest
 
 @testable import iPhoneUse
@@ -39,6 +40,110 @@ final class Phase2Tests: XCTestCase {
         }
         _ = ScreenOCR.recognize(data, device: device, recognition: recognize)
         XCTAssertEqual(calls, 13, "The ninth distinct frame evicts the least recently used entry")
+    }
+
+    private func lumaImage(_ pixels: [UInt8], width: Int, text: String? = nil) throws -> Data {
+        let height = pixels.count / width
+        let context = try XCTUnwrap(
+            CGContext(
+                data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue))
+        let source = try XCTUnwrap(
+            CGImage(
+                width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGBitmapInfo(rawValue: 0),
+                provider: try XCTUnwrap(CGDataProvider(data: Data(pixels) as CFData)),
+                decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+        context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+        if let text {
+            let attributes: [NSAttributedString.Key: Any] = [
+                NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName(
+                    "Helvetica" as CFString, 24, nil),
+                NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 0, alpha: 1),
+            ]
+            context.textPosition = CGPoint(x: 40, y: 80)
+            CTLineDraw(
+                CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attributes)), context)
+        }
+        let bitmap = NSBitmapImageRep(cgImage: try XCTUnwrap(context.makeImage()))
+        return try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+    }
+
+    func testOCRCacheMissesOnSmallTextChange() throws {
+        let background = [UInt8](repeating: 220, count: 512 * 256)
+        let first = try lumaImage(background, width: 512, text: "100")
+        let second = try lumaImage(background, width: 512, text: "200")
+        XCTAssertNotEqual(ScreenOCR.screenHash(first), ScreenOCR.screenHash(second))
+        let device = UUID().uuidString
+        var calls = 0
+        let recognition: (CGImage) throws -> [ScreenOCR.Item] = { _ in
+            calls += 1
+            return [.init(text: calls == 1 ? "100" : "200", x: 60, y: 80)]
+        }
+        XCTAssertEqual(ScreenOCR.recognize(first, device: device, recognition: recognition).items.first?.text, "100")
+        let changed = ScreenOCR.recognize(second, device: device, recognition: recognition)
+        XCTAssertEqual(calls, 2, "A local digit change must run recognition again")
+        XCTAssertEqual(changed.items.first?.text, "200")
+        XCTAssertEqual(changed.screenHash, ScreenOCR.screenHash(second))
+    }
+
+    func testOCRCacheReusesNoiseOnlyFrameAndKeepsCurrentExactHash() throws {
+        let device = UUID().uuidString
+        let pixels = [UInt8](repeating: 128, count: 200 * 200)
+        let first = try lumaImage(pixels, width: 200)
+        let noisy = try lumaImage(pixels.indices.map { $0.isMultiple(of: 2) ? 131 : 125 }, width: 200)
+        var calls = 0
+        let recognition: (CGImage) throws -> [ScreenOCR.Item] = { _ in
+            calls += 1
+            return [.init(text: "same", x: 20, y: 30)]
+        }
+        let original = ScreenOCR.recognize(first, device: device, recognition: recognition)
+        let reused = ScreenOCR.recognize(noisy, device: device, recognition: recognition)
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(reused.items.first?.text, "same")
+        XCTAssertNotEqual(original.screenHash, reused.screenHash)
+        XCTAssertEqual(reused.screenHash, ScreenOCR.screenHash(noisy))
+        _ = ScreenOCR.recognize(noisy, device: device, recognition: recognition)
+        XCTAssertEqual(calls, 1, "L2 reuse must also populate the current exact L1 key")
+    }
+
+    func testOCRCacheRejectsNoiseAboveEitherThreshold() throws {
+        for (changedCount, delta, expectedCalls) in [(1, 16, 1), (1, 17, 2), (20, 7, 1), (21, 7, 2)] {
+            let device = UUID().uuidString
+            var pixels = [UInt8](repeating: 128, count: 200 * 200)
+            let original = try lumaImage(pixels, width: 200)
+            for index in 0..<changedCount { pixels[index] += UInt8(delta) }
+            let changed = try lumaImage(pixels, width: 200)
+            var calls = 0
+            let recognition: (CGImage) throws -> [ScreenOCR.Item] = { _ in
+                calls += 1
+                return []
+            }
+            _ = ScreenOCR.recognize(original, device: device, recognition: recognition)
+            _ = ScreenOCR.recognize(changed, device: device, recognition: recognition)
+            XCTAssertEqual(calls, expectedCalls, "count=\(changedCount), delta=\(delta)")
+        }
+    }
+
+    func testOCRNoiseReuseCannotAccumulateDrift() throws {
+        let device = UUID().uuidString
+        var calls = 0
+        for gray in [128, 131, 134, 137] {
+            let data = try lumaImage([UInt8](repeating: UInt8(gray), count: 400), width: 20)
+            _ = ScreenOCR.recognize(data, device: device) { _ in
+                calls += 1
+                return []
+            }
+        }
+        XCTAssertEqual(calls, 2)
+    }
+
+    func testStabilitySignatureToleratesNoiseButExactHashDoesNot() throws {
+        let first = try image(0.5, width: 31)
+        let noisy = try image(0.5 + 1.0 / 255, width: 31)
+        XCTAssertEqual(ScreenOCR.stabilitySignature(first), ScreenOCR.stabilitySignature(noisy))
+        XCTAssertNotEqual(ScreenOCR.screenHash(first), ScreenOCR.screenHash(noisy))
+        XCTAssertEqual(ScreenOCR.stabilitySignature(Data()), "")
     }
 
     func testConcurrentSameFrameRunsRecognitionOnce() throws {
@@ -164,6 +269,23 @@ final class Phase2Tests: XCTestCase {
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
         XCTAssertEqual(json["failed_step"] as? Int, 3)
         XCTAssertEqual(json["completed"] as? Int, 2)
+        XCTAssertEqual(json["error"] as? String, "not ready")
+    }
+
+    func testActPreservesNonJSONSubstepErrorsAndStops() throws {
+        let request = try ActRequest(["steps": [["type": "home"], ["type": "home"]]])
+        var calls = 0
+        let response = try request.perform(
+            device: nil, capture: { _, _ in ("", Data()) },
+            execute: { _, _, _ in
+                calls += 1
+                return HTTPResponse(status: 502, headers: [:], body: Data("upstream failed".utf8))
+            })
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        XCTAssertEqual(json["error"] as? String, "upstream failed")
+        XCTAssertEqual(json["failed_step"] as? Int, 1)
+        XCTAssertEqual(json["completed"] as? Int, 0)
+        XCTAssertEqual(calls, 1)
     }
 
     func testWaitTextTimeoutStopsBatchWithDeterministicSleep() throws {

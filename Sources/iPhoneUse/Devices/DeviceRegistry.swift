@@ -118,12 +118,12 @@ final class DeviceRegistry {
         lock.withLock {
             promoteVerifiedAssociationsLocked(screens: snapshot.screens, sessions: sessions)
         }
-        HIDPeripheral.shared.setUSBScreenDemand(!snapshot.screens.isEmpty, revision: snapshot.revision)
+        HIDPeripheral.shared.setUSBScreenDemand(snapshot.retainsUSBDemand, revision: snapshot.revision)
         reconnectSavedBluetoothHosts(for: snapshot.screens, resetExhausted: resetExhausted)
     }
 
-    /// Starts Bluetooth advertising and saved-host reconnection immediately in parallel
-    /// with USB Valeria activation when waking from quiet-mode idle sleep.
+    /// Reconnects hosts that unexpectedly disconnected during idle, in parallel with USB resume.
+    /// Normally the retained USB demand keeps the existing Bluetooth session alive.
     func prewakeBluetoothForIdleResume() {
         matchQueue.async { [weak self] in
             guard let self else { return }

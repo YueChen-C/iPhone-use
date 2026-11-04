@@ -623,10 +623,12 @@ struct ActRequest {
                 } else {
                     let response = try execute("/" + type, step, device)
                     if response.status != 200 {
+                        let body = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any]
+                        let message = body?["error"] as? String ?? String(decoding: response.body, as: UTF8.self)
                         return .json(
                             [
                                 "ok": false, "failed_step": index + 1, "completed": index,
-                                "error": String(decoding: response.body, as: UTF8.self),
+                                "error": message,
                             ], status: response.status)
                     }
                 }

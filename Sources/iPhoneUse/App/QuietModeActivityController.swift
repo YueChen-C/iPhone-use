@@ -16,6 +16,7 @@ final class QuietModeActivityController {
     private let now: () -> TimeInterval
     private let suspendCapture: () -> ScreenCaptureStopResult
     private let resumeCapture: () -> Void
+    private let checkIdleUnplug: () -> Void
     private var shutdownClean = true
     private var resumedAt: TimeInterval?
 
@@ -24,9 +25,14 @@ final class QuietModeActivityController {
         mode: @escaping () -> AppRunMode = { AppRunModeStore.shared.mode },
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         suspendCapture: @escaping () -> ScreenCaptureStopResult = {
-            let result = ScreenCaptureManager.shared.stop(waitTimeout: Application.shutdownWaitTimeout)
+            let result = ScreenCaptureManager.shared.suspendForIdle(waitTimeout: Application.shutdownWaitTimeout)
             ScreenCaptureManager.shared.onScreensChanged?()
             return result
+        },
+        checkIdleUnplug: @escaping () -> Void = {
+            if ScreenCaptureManager.shared.clearIdleUSBDemandIfUnplugged() {
+                ScreenCaptureManager.shared.onScreensChanged?()
+            }
         },
         resumeCapture: @escaping () -> Void = {
             DeviceRegistry.shared.prewakeBluetoothForIdleResume()
@@ -37,6 +43,7 @@ final class QuietModeActivityController {
         self.now = now
         self.suspendCapture = suspendCapture
         self.resumeCapture = resumeCapture
+        self.checkIdleUnplug = checkIdleUnplug
         let value = environment["IPHONE_USE_IDLE_TIMEOUT"].flatMap(Double.init)
         timeout = value.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 60
     }
@@ -125,8 +132,12 @@ final class QuietModeActivityController {
     }
 
     func checkIdle() {
+        if suspended {
+            checkIdleUnplug()
+            return
+        }
         guard mode() == .residentQuiet, !openWindows, activeRequests == 0,
-            !suspended, now() - lastActivity >= timeout
+            now() - lastActivity >= timeout
         else { return }
         suspended = true
         resumedAt = nil

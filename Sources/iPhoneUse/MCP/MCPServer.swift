@@ -194,7 +194,7 @@ enum MCPServer {
                                     "/screenshot?maxEdge=64&device=\(encoded)&stability=1", timeout: remaining
                                 ).0
                             else { return nil }
-                            let hash = ScreenOCR.screenHash(data)
+                            let hash = ScreenOCR.stabilitySignature(data)
                             return hash.isEmpty ? nil : hash
                         }
                     }
@@ -335,6 +335,20 @@ private struct MCPHTTPClient {
         return try self.request(request, timeout: 60).0
     }
 
+    private static func check(_ data: Data, status: Int, language: AppLanguage) -> MCPServer.MCPError {
+        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let message = body?["error"] as? String ?? "HTTP \(status)"
+        guard let body, body["failed_step"] != nil || body["completed"] != nil else {
+            return MCPServer.MCPError(message)
+        }
+        var progress: [String: Any] = ["error": message]
+        progress["failed_step"] = body["failed_step"]
+        progress["completed"] = body["completed"]
+        let encoded = try? JSONSerialization.data(withJSONObject: progress, options: [.sortedKeys])
+        let details = encoded.map { String(decoding: $0, as: UTF8.self) } ?? message
+        return MCPServer.MCPError(details + "\n" + StringsMCP(language: language).actStopped)
+    }
+
     private func request(_ request: URLRequest, timeout: TimeInterval) throws -> (Data, HTTPURLResponse) {
         let table = StringsMCP(language: language)
         var result: Result<(Data, HTTPURLResponse), Error> = .failure(MCPServer.MCPError(table.noResponse))
@@ -348,8 +362,7 @@ private struct MCPHTTPClient {
                 if http.statusCode == 200 {
                     result = .success((data, http))
                 } else {
-                    let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"]
-                    result = .failure(MCPServer.MCPError(message as? String ?? "HTTP \(http.statusCode)"))
+                    result = .failure(Self.check(data, status: http.statusCode, language: language))
                 }
             }
             done.signal()
