@@ -124,10 +124,13 @@ final class DeviceRegistry {
 
     /// Reconnects hosts that unexpectedly disconnected during idle, in parallel with USB resume.
     /// Normally the retained USB demand keeps the existing Bluetooth session alive.
-    func prewakeBluetoothForIdleResume() {
+    func prewakeBluetoothForIdleResume(
+        observeUSBTopology: @escaping () -> USBValeriaConfigurator.IOSUSBTopologyObservation =
+            USBValeriaConfigurator.currentIOSUSBTopology
+    ) {
         matchQueue.async { [weak self] in
             guard let self else { return }
-            guard USBValeriaConfigurator.currentSingleIOSDeviceIdentity() != nil else { return }
+            guard observeUSBTopology().hasAttachedDevices else { return }
             let pairings = self.lock.withLock { self.pairings }
             guard !pairings.isEmpty else { return }
             let revision = ScreenCaptureManager.shared.mintUSBDemandRevision()

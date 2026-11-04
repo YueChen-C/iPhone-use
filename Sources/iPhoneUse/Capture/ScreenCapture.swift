@@ -345,24 +345,37 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
 
     @discardableResult
     func stop(waitTimeout: TimeInterval = 0) -> ScreenCaptureStopResult {
-        stop(waitTimeout: waitTimeout, retainingIdleUSBDemand: false)
+        stop(waitTimeout: waitTimeout, retainingIdleUSBDemand: { _ in false })
     }
 
     @discardableResult
     func suspendForIdle(
         waitTimeout: TimeInterval = 0,
-        hasAttachedIOSDevice: () -> Bool = { USBValeriaConfigurator.currentSingleIOSDeviceIdentity() != nil }
+        observeUSBTopology: () -> USBValeriaConfigurator.IOSUSBTopologyObservation =
+            USBValeriaConfigurator.currentIOSUSBTopology
     ) -> ScreenCaptureStopResult {
         // USB topology queries must stay outside the manager lock (USB queue lock order).
-        let attached = hasAttachedIOSDevice()
-        return stop(waitTimeout: waitTimeout, retainingIdleUSBDemand: attached)
+        let observation = observeUSBTopology()
+        return stop(
+            waitTimeout: waitTimeout,
+            retainingIdleUSBDemand: { hasActiveCapture in
+                switch observation {
+                case .observed(let topology):
+                    return !topology.attachedEntryIDs.isEmpty
+                case .unavailable:
+                    return hasActiveCapture
+                }
+            })
     }
 
     @discardableResult
     func clearIdleUSBDemandIfUnplugged(
-        hasAttachedIOSDevice: () -> Bool = { USBValeriaConfigurator.currentSingleIOSDeviceIdentity() != nil }
+        observeUSBTopology: () -> USBValeriaConfigurator.IOSUSBTopologyObservation =
+            USBValeriaConfigurator.currentIOSUSBTopology
     ) -> Bool {
-        guard lock.withLock({ isStopped && retainsIdleUSBDemand }), !hasAttachedIOSDevice() else { return false }
+        guard lock.withLock({ isStopped && retainsIdleUSBDemand }),
+            observeUSBTopology().confirmsNoAttachedDevices
+        else { return false }
         return lock.withLock {
             guard isStopped, retainsIdleUSBDemand else { return false }
             retainsIdleUSBDemand = false
@@ -370,12 +383,16 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         }
     }
 
-    private func stop(waitTimeout: TimeInterval, retainingIdleUSBDemand: Bool) -> ScreenCaptureStopResult {
+    private func stop(
+        waitTimeout: TimeInterval,
+        retainingIdleUSBDemand: (_ hasActiveCapture: Bool) -> Bool = { _ in false }
+    ) -> ScreenCaptureStopResult {
         refreshTimer?.invalidate()
         refreshTimer = nil
         let (observers, activeSources) = lock.withLock {
+            let hadActiveCapture = !sources.isEmpty || !screens.isEmpty || retainsIdleUSBDemand
             isStopped = true
-            retainsIdleUSBDemand = retainingIdleUSBDemand
+            retainsIdleUSBDemand = retainingIdleUSBDemand(hadActiveCapture)
             captureDiscoveryEnabled = false
             startupReconciliationGate.reset()
             lifecycleGeneration &+= 1

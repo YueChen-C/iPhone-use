@@ -146,6 +146,20 @@ enum USBValeriaConfigurator {
     enum IOSUSBTopologyObservation: Equatable {
         case unavailable
         case observed(ConnectedIOSUSBTopology)
+
+        var hasAttachedDevices: Bool {
+            if case .observed(let topology) = self {
+                return !topology.attachedEntryIDs.isEmpty
+            }
+            return false
+        }
+
+        var confirmsNoAttachedDevices: Bool {
+            if case .observed(let topology) = self {
+                return topology.attachedEntryIDs.isEmpty
+            }
+            return false
+        }
     }
 
     enum USBServicePropertyObservation: Equatable {
