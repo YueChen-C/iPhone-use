@@ -25,19 +25,25 @@ class MockApp(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        self.server.events.append(("GET", self.path))
+        if "stability=1" in self.path:
+            self.server.stability_events.append(self.path)
+        else:
+            self.server.events.append(("GET", self.path))
         if self.path == "/devices":
             self.server.devices_requested.set()
             self.send(200, json.dumps({"devices": self.server.devices}).encode())
         elif self.path == "/config":
             self.send(200, json.dumps({"language": self.server.language}).encode())
         elif self.path.startswith("/screenshot?"):
-            if self.server.before_screenshot:
+            if self.server.before_screenshot and "stability=1" not in self.path:
                 self.server.before_screenshot(self.path)
-            self.send(200, IMAGE, {
-                "Content-Type": "image/jpeg", "X-Device": parse_qs(urlsplit(self.path).query)["device"][0],
-                "X-Image-Width": "600", "X-Image-Height": "1200",
-            })
+            device = parse_qs(urlsplit(self.path).query)["device"][0]
+            headers = {"Content-Type": "image/jpeg", "X-Device": device,
+                       "X-Image-Width": "500", "X-Image-Height": "1000"}
+            if self.server.screen_ocr is not None and "ocr=1" in self.path:
+                ocr = self.server.screen_ocr(device) if callable(self.server.screen_ocr) else self.server.screen_ocr
+                headers["X-Screen-OCR"] = base64.b64encode(json.dumps(ocr).encode()).decode()
+            self.send(200, IMAGE, headers)
         else:
             self.send(404, b'{"error":"not found"}')
 
@@ -46,6 +52,13 @@ class MockApp(BaseHTTPRequestHandler):
         self.server.events.append(("POST", self.path, body))
         if self.server.before_post:
             self.server.before_post(body)
+        if self.path == "/ocr":
+            self.send(200, json.dumps({"device": body["device"], "width": 600, "height": 1200,
+                                       "items": [{"text": "设置", "x": 120, "y": 400}]}).encode())
+            return
+        if self.path == "/act" and self.server.act_failure is not None:
+            self.send(400, json.dumps(self.server.act_failure).encode())
+            return
         if self.server.fail_actions:
             self.send(503, b'{"error":"pointer is not ready"}')
         else:
@@ -65,12 +78,15 @@ class MCPStdioTests(unittest.TestCase):
     def setUp(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MockApp)
         self.server.events = []
+        self.server.stability_events = []
         self.server.fail_actions = False
+        self.server.act_failure = None
         self.server.language = "en"
         self.server.devices = [{"id": "phone-1", "name": "First", "bluetooth": True}]
         self.server.devices_requested = threading.Event()
         self.server.before_post = None
         self.server.before_screenshot = None
+        self.server.screen_ocr = None
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.state = tempfile.TemporaryDirectory()
@@ -104,6 +120,94 @@ class MCPStdioTests(unittest.TestCase):
         self.assertEqual([reply["id"] for reply in replies], ["init"] + list(range(1, len(calls) + 1)))
         return [reply["result"] for reply in replies[1:]]
 
+    def test_act_posts_once_and_none_avoids_observation(self):
+        steps = [{"type": "home"}, {"type": "delay", "seconds": 0.01},
+                 {"type": "type", "text": "重庆", "use_clipboard": True},
+                 {"type": "key", "key": "enter"}]
+        result = self.exchange([("act", {"steps": steps, "device": "First", "observe": "none"})])[0]
+        self.assertNotIn("isError", result)
+        self.assertEqual(json.loads(result["content"][0]["text"]), {"ok": True})
+        self.assertEqual(self.server.events, [
+            ("GET", "/config"), ("GET", "/devices"),
+            ("POST", "/act", {"steps": steps, "device": "phone-1"}),
+        ])
+        self.assertEqual(self.server.stability_events, [])
+
+    def test_act_failure_preserves_progress_without_replaying(self):
+        self.server.act_failure = {"ok": False, "failed_step": 3, "completed": 2,
+                                   "error": "pointer is not ready"}
+        result = self.exchange([("act", {"steps": [{"type": "home"}] * 5})])[0]
+        self.assertTrue(result["isError"])
+        text = result["content"][0]["text"]
+        progress = json.loads(text.splitlines()[0])
+        self.assertEqual(progress["failed_step"], 3)
+        self.assertEqual(progress["completed"], 2)
+        self.assertEqual(progress["error"], "pointer is not ready")
+        self.assertIn("may have partially executed", text)
+        self.assertEqual([event[1] for event in self.server.events if event[0] == "POST"], ["/act"])
+        self.assertFalse(any(event[1].startswith("/screenshot") for event in self.server.events))
+
+    def test_act_failure_preserves_either_progress_field_including_zero(self):
+        for field, value in (("failed_step", 1), ("completed", 0)):
+            with self.subTest(field=field):
+                self.server.act_failure = {"error": "stopped", field: value}
+                result = self.exchange([("act", {"steps": [{"type": "home"}]})])[0]
+                self.assertTrue(result["isError"])
+                progress = json.loads(result["content"][0]["text"].splitlines()[0])
+                self.assertEqual(progress[field], value)
+
+    def test_none_reuses_device_cache_and_performs_no_screen_reads(self):
+        results = self.exchange([("home", {"observe": "none"}), ("home", {"observe": "none"})])
+        self.assertTrue(all("isError" not in result for result in results))
+        self.assertEqual(sum(event[1] == "/devices" for event in self.server.events), 1)
+        self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 2)
+        self.assertFalse(any(event[1].startswith("/screenshot") for event in self.server.events))
+        self.assertEqual(self.server.stability_events, [])
+
+    def test_diff_reuses_server_ocr_and_tracks_full_observation_baseline(self):
+        observations = iter([("old", "a"), ("new", "b"), ("new", "b")])
+
+        def ocr(device):
+            text, hash_value = next(observations)
+            return {"device": device, "width": 500, "height": 1000, "screenHash": hash_value,
+                    "items": [{"text": text, "x": 20, "y": 30}]}
+
+        self.server.screen_ocr = ocr
+        full, changed, unchanged = self.exchange([
+            ("home", {}), ("home", {"observe": "ocr_diff"}), ("home", {"observe": "ocr_diff"}),
+        ])
+        self.assertNotIn("isError", full)
+        self.assertIn('"old" (20,30)', full["content"][1]["text"])
+        for result in (changed, unchanged):
+            self.assertEqual([block["type"] for block in result["content"]], ["text"])
+        self.assertIn("+new", changed["content"][0]["text"])
+        self.assertIn("-old", changed["content"][0]["text"])
+        self.assertIn("screenHash: b", changed["content"][0]["text"])
+        self.assertIn("unchanged: true", unchanged["content"][0]["text"])
+        self.assertTrue(self.server.stability_events)
+
+    def test_invalid_observation_and_later_act_step_never_send_input(self):
+        calls = [("home", {"observe": value}) for value in ("bad", True, 1)]
+        calls += [("act", {"steps": [{"type": "home"}, {"type": "key", "key": "invalid-key"}]})]
+        for call in calls:
+            self.assertTrue(self.exchange([call])[0]["isError"])
+        self.assertEqual(self.server.events, [("GET", "/config")] * len(calls))
+
+    def test_cached_selector_miss_refreshes_list_without_replaying_input(self):
+        def attach_second(body):
+            if len(self.server.devices) == 1:
+                self.server.devices.append({"id": "phone-2", "name": "Second"})
+
+        self.server.before_post = attach_second
+        results = self.exchange([
+            ("home", {"device": "First", "observe": "none"}),
+            ("home", {"device": "Second", "observe": "none"}),
+        ])
+        self.assertTrue(all("isError" not in result for result in results))
+        self.assertEqual(sum(event[1] == "/devices" for event in self.server.events), 2)
+        self.assertEqual([event[2]["device"] for event in self.server.events if event[0] == "POST"],
+                         ["phone-1", "phone-2"])
+
     def test_protocol_checker_can_launch_from_an_unrelated_directory(self):
         with tempfile.TemporaryDirectory(prefix="iphone use ") as directory:
             process = subprocess.run(
@@ -111,7 +215,7 @@ class MCPStdioTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=15,
             )
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertIn("12 tools", process.stdout)
+        self.assertIn("15 tools", process.stdout)
         # The checker's initialize fetches /config; tools/list reuses the value.
         self.assertEqual(self.server.events, [("GET", "/config")])
 
@@ -124,14 +228,53 @@ class MCPStdioTests(unittest.TestCase):
         self.assertEqual(tapped["content"][0], {
             "type": "image", "data": base64.b64encode(IMAGE).decode(), "mimeType": "image/jpeg",
         })
-        self.assertIn("600x1200 px", tapped["content"][1]["text"])
+        self.assertIn("500x1000 px", tapped["content"][1]["text"])
         self.assertEqual(self.server.events, [
             ("GET", "/config"),
             ("GET", "/devices"),
-            ("GET", "/devices"),
-            ("POST", "/tap", {"x": 120.5, "y": 400, "device": "phone-1", "maxEdge": 1200}),
-            ("GET", "/screenshot?maxEdge=1200&device=phone-1"),
+            ("POST", "/tap", {"x": 120.5, "y": 400, "device": "phone-1", "maxEdge": 1000}),
+            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
         ])
+
+    def test_ocr_screen_returns_only_text_and_preserves_dimensions_and_device(self):
+        result = self.exchange([("ocr_screen", {"device": "First", "maxEdge": 800})])[0]
+        self.assertNotIn("isError", result)
+        self.assertEqual(len(result["content"]), 1)
+        self.assertEqual(result["content"][0]["type"], "text")
+        self.assertEqual(json.loads(result["content"][0]["text"]), {
+            "device": "phone-1", "width": 600, "height": 1200,
+            "items": [{"text": "设置", "x": 120, "y": 400}],
+        })
+        self.assertEqual(self.server.events, [
+            ("GET", "/config"), ("GET", "/devices"),
+            ("POST", "/ocr", {"device": "phone-1", "maxEdge": 800}),
+        ])
+
+    def test_text_only_screenshot_and_tap_text_have_no_base64_image(self):
+        screenshot, tapped = self.exchange([
+            ("screenshot", {"device": "First", "include_image": False}),
+            ("tap_text", {"text": "设置", "exact": True, "index": 1, "hold": 0.2,
+                          "maxEdge": 800, "device": "phone-1", "include_image": False}),
+        ])
+        for result in (screenshot, tapped):
+            self.assertNotIn("isError", result)
+            self.assertEqual([block["type"] for block in result["content"]], ["text"])
+            self.assertNotIn("data", result["content"][0])
+            self.assertIn("500x1000 px", result["content"][0]["text"])
+        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+            ("POST", "/tap_text", {"device": "phone-1", "text": "设置", "exact": True,
+                                   "index": 1, "hold": 0.2, "maxEdge": 800}),
+        ])
+        self.assertEqual(sum(event[1].startswith("/screenshot?") for event in self.server.events), 2)
+
+    def test_invalid_ocr_arguments_never_query_devices_or_send_input(self):
+        calls = [("tap_text", {}), ("tap_text", {"text": " "}),
+                 ("tap_text", {"text": "x", "index": -1}),
+                 ("ocr_screen", {"maxEdge": 0}),
+                 ("screenshot", {"include_image": "false"})]
+        for name, arguments in calls:
+            self.assertTrue(self.exchange([(name, arguments)])[0]["isError"])
+        self.assertEqual(self.server.events, [("GET", "/config")] * len(calls))
 
     def test_failed_action_and_unknown_tool_return_errors_without_a_screenshot(self):
         self.server.fail_actions = True
@@ -145,6 +288,25 @@ class MCPStdioTests(unittest.TestCase):
         self.assertEqual(len(self.server.events), 3)
         self.assertEqual(self.server.events[2][:2], ("POST", "/tap"))
 
+    def test_normalized_tools_forward_screen_fractions_and_capture_at_1000(self):
+        results = self.exchange([
+            ("move_pointer", {"x": 250, "y": 750, "normalized": True}),
+            ("tap", {"x": 0, "y": 1000, "normalized": True}),
+            ("long_press", {"x": 500, "y": 500, "seconds": 2, "normalized": True}),
+            ("swipe", {"points": [{"x": 0, "y": 1000}, {"x": 500, "y": 0}],
+                       "duration": 0.4, "normalized": True}),
+        ])
+        self.assertTrue(all("isError" not in result for result in results))
+        common = {"fraction": True, "maxEdge": 1000, "device": "phone-1"}
+        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+            ("POST", "/move", dict(common, x=0.25, y=0.75)),
+            ("POST", "/tap", dict(common, x=0, y=1)),
+            ("POST", "/tap", dict(common, x=0.5, y=0.5, hold=2)),
+            ("POST", "/swipe", dict(common, points=[{"x": 0, "y": 1}, {"x": 0.5, "y": 0}], duration=0.4)),
+        ])
+        self.assertEqual([event for event in self.server.events if event[1].startswith("/screenshot")],
+                         [("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1")] * 4)
+
     def test_pointer_inspection_does_not_click_and_click_does_not_reposition(self):
         results = self.exchange([
             ("move_pointer", {"x": 100, "y": 200, "device": "First"}),
@@ -155,7 +317,7 @@ class MCPStdioTests(unittest.TestCase):
             self.assertNotIn("isError", result)
             self.assertEqual(result["content"][0]["type"], "image")
         self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
-            ("POST", "/move", {"x": 100, "y": 200, "maxEdge": 1200, "device": "phone-1"}),
+            ("POST", "/move", {"x": 100, "y": 200, "maxEdge": 1000, "device": "phone-1"}),
             ("POST", "/nudge", {"dx": -2, "dy": 3, "click": False, "device": "phone-1"}),
             ("POST", "/nudge", {"dx": 0, "dy": 0, "click": True, "device": "phone-1"}),
         ])
@@ -182,12 +344,93 @@ class MCPStdioTests(unittest.TestCase):
             ("POST", "/key", {"key": "l", "modifiers": ["cmd"], "device": "phone-1"}),
             ("POST", "/type", {"text": "https://www.baidu.com", "device": "phone-1"}),
             ("POST", "/key", {"key": "enter", "modifiers": [], "device": "phone-1"}),
-            ("GET", "/screenshot?maxEdge=1200&device=phone-1"),
+            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
         ])
+
+    def test_device_id_routes_screenshot_and_actions_with_original_precedence(self):
+        self.server.devices.append({"id": "phone-2", "name": "Second"})
+        results = self.exchange([
+            ("screenshot", {"device_id": "Second"}),
+            ("type_text", {"text": "nihao", "device_id": "Second", "clear_before": True,
+                           "commit_ime": True, "press_enter": True}),
+            ("home", {"device": "First", "device_id": "Second"}),
+        ])
+        self.assertTrue(all("isError" not in result for result in results))
+        posts = [event for event in self.server.events if event[0] == "POST"]
+        self.assertEqual(posts, [
+            ("POST", "/type", {"text": "nihao", "device": "phone-2", "clear_before": True,
+                               "commit_ime": True, "press_enter": True}),
+            ("POST", "/home", {"device": "phone-1"}),
+        ])
+        self.assertIn(("GET", "/screenshot?maxEdge=1000&device=phone-2&ocr=1"), self.server.events)
+
+    def test_ocr_and_tap_text_aliases_default_to_1000(self):
+        self.server.devices.append({"id": "phone-2", "name": "Second"})
+        results = self.exchange([
+            ("ocr_screen", {"device_id": "Second", "include_image": False}),
+            ("tap_text", {"text": "Confirm", "device_id": "Second", "include_image": False}),
+        ])
+        self.assertTrue(all("isError" not in result for result in results))
+        self.assertTrue(all(block["type"] == "text" for result in results for block in result["content"]))
+        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+            ("POST", "/ocr", {"device": "phone-2", "maxEdge": 1000}),
+            ("POST", "/tap_text", {"device": "phone-2", "text": "Confirm", "maxEdge": 1000}),
+        ])
+        self.assertIn(("GET", "/screenshot?maxEdge=1000&device=phone-2&ocr=1"), self.server.events)
+
+    def test_actions_typed_steps_and_delays_preserve_atomic_order(self):
+        result = self.exchange([("keyboard_sequence", {"device_id": "First", "actions": [
+            {"type": "text", "text": "nihao", "clear_before": True,
+             "commit_ime": True, "press_enter": True},
+            {"delay": 0}, {"wait": 0}, {"type": "delay", "seconds": 0.01},
+            {"type": "wait", "seconds": 0}, {"type": "key", "key": "tab"},
+        ]})])[0]
+        self.assertNotIn("isError", result)
+        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+            ("POST", "/key", {"key": "a", "modifiers": ["command"], "device": "phone-1"}),
+            ("POST", "/key", {"key": "backspace", "modifiers": [], "device": "phone-1"}),
+            ("POST", "/type", {"text": "nihao", "device": "phone-1"}),
+            ("POST", "/key", {"key": "space", "modifiers": [], "device": "phone-1"}),
+            ("POST", "/key", {"key": "enter", "modifiers": [], "device": "phone-1"}),
+            ("POST", "/key", {"key": "tab", "modifiers": [], "device": "phone-1"}),
+        ])
+        self.assertEqual(sum(event[1].startswith("/screenshot") for event in self.server.events), 1)
+
+    def test_chinese_text_and_sequence_forward_ime_option(self):
+        results = self.exchange([
+            ("type_text", {"text": "蓝牙", "device": "First", "ensure_chinese_ime": False}),
+            ("keyboard_sequence", {"device": "First", "include_image": False,
+                                   "steps": [{"text": "快捷指令", "ensure_chinese_ime": True}]}),
+        ])
+        self.assertTrue(all("isError" not in result for result in results))
+        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+            ("POST", "/type", {"text": "蓝牙", "device": "phone-1", "ensure_chinese_ime": False}),
+            ("POST", "/type", {"text": "快捷指令", "device": "phone-1", "ensure_chinese_ime": True}),
+        ])
+
+    def test_new_invalid_forms_fail_before_device_lookup(self):
+        invalid = [
+            {"actions": [{"delay": True}]}, {"actions": [{"wait": 5.1}]},
+            {"actions": [{"type": "delay", "seconds": -1}]},
+            {"actions": [{"type": "key", "text": "x"}]},
+            {"actions": [{"text": "x", "commit_ime": 1}]},
+            {"steps": [{"text": "x"}], "actions": [{"text": "y"}]},
+        ]
+        for arguments in invalid:
+            self.assertTrue(self.exchange([("keyboard_sequence", arguments)])[0]["isError"])
+        self.assertTrue(self.exchange([("type_text", {"text": "a", "press_enter": 1})])[0]["isError"])
+        self.assertEqual(self.server.events, [("GET", "/config")] * (len(invalid) + 1))
+
+    def test_sequence_can_omit_confirmation_image(self):
+        result = self.exchange([("keyboard_sequence", {
+            "actions": [{"wait": 0}], "include_image": False,
+        })])[0]
+        self.assertNotIn("isError", result)
+        self.assertEqual(self.server.events, [("GET", "/config"), ("GET", "/devices")])
 
     def test_invalid_later_keyboard_step_prevents_all_input_and_device_queries(self):
         bad_steps = [
-            {"text": "今天"}, {"text": "x" * 257}, {"text": ""},
+            {"text": "🙂"}, {"text": "x" * 257}, {"text": ""},
             {"text": "x", "key": "enter"}, {"key": "enter", "unexpected": True},
             {"key": "unknown-name"}, {"key": ""}, {"key": "🌟"},
             {"key": "enter", "modifiers": ["unknown"]}, {"key": "enter", "modifiers": "cmd"},
@@ -252,8 +495,8 @@ class MCPStdioTests(unittest.TestCase):
         changes = [event for event in self.server.events if event[0] == "POST" or event[1].startswith("/screenshot")]
         self.assertEqual([event[:2] for event in changes], [
             ("POST", "/key"), ("POST", "/type"), ("POST", "/key"),
-            ("GET", "/screenshot?maxEdge=1200&device=phone-1"),
-            ("POST", "/key"), ("GET", "/screenshot?maxEdge=1200&device=phone-1"),
+            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
+            ("POST", "/key"), ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
         ])
 
     def test_same_phone_aliases_queue_action_and_confirmation_across_processes(self):
@@ -337,7 +580,7 @@ class MCPStdioTests(unittest.TestCase):
         self.assertIn("控制真实 iPhone", replies[0]["result"]["instructions"])
         tools = replies[1]["result"]["tools"]
         # Tool and parameter names are the client contract and stay English.
-        self.assertEqual(len(tools), 12)
+        self.assertEqual(len(tools), 15)
         home = next(tool for tool in tools if tool["name"] == "home")
         self.assertEqual(home["description"], "回到主屏幕。")
         error = replies[2]["result"]["content"][0]["text"]

@@ -10,6 +10,8 @@ struct StringsAPI: LocalizedTable {
     let pointerNotReady: String
     let textRequired: String
     let keyRequired: String
+    let ocrParameterInvalid: (String) -> String
+    let ocrTextNotFound: String
 
     // SwipeRequest validation (ControlAPI.swift)
     let swipePointsMin: String
@@ -44,10 +46,6 @@ struct StringsAPI: LocalizedTable {
     let swipeReasonDuration: String
     let swipeReasonReportCount: String
 
-    // ClipboardQRCode errors
-    let qrTextTooLong: String
-    let qrGenerationFailed: String
-
     static var current: StringsAPI { StringsAPI(language: AppLanguageStore.shared.language) }
 
     static let zh = StringsAPI(
@@ -57,6 +55,8 @@ struct StringsAPI: LocalizedTable {
         pointerNotReady: "指针未就绪：请等待蓝牙鼠标订阅与有效校准",
         textRequired: "缺少 text",
         keyRequired: "缺少 key",
+        ocrParameterInvalid: { "无效的 OCR 参数：\($0)" },
+        ocrTextNotFound: "未找到指定序号的匹配文字",
         swipePointsMin: "points 必须包含至少两个带数值 x、y 的对象",
         swipePointFinite: { "points[\($0)].x 与 points[\($0)].y 必须是有限数值" },
         swipeDurationInvalid: "duration 必须是大于零的有限数值",
@@ -83,9 +83,7 @@ struct StringsAPI: LocalizedTable {
         pairingProbeUnavailable: "蓝牙指针探测不可用",
         swipeReasonPoints: "points 必须包含至少两个 0...1 内的有限坐标",
         swipeReasonDuration: "duration 必须是有限的正数",
-        swipeReasonReportCount: "duration 与上报间隔产生了无效的上报次数",
-        qrTextTooLong: "文字超过单个二维码容量（约 2.8 KB），请分段发送",
-        qrGenerationFailed: "无法生成文字二维码，请重试")
+        swipeReasonReportCount: "duration 与上报间隔产生了无效的上报次数")
 
     static let en = StringsAPI(
         pairHostRequired: "host is required (a UUID from unmatchedHosts)",
@@ -94,6 +92,8 @@ struct StringsAPI: LocalizedTable {
         pointerNotReady: "pointer is not ready: wait for Bluetooth mouse subscription and a valid calibration",
         textRequired: "text is required",
         keyRequired: "key is required",
+        ocrParameterInvalid: { "invalid OCR parameter: \($0)" },
+        ocrTextNotFound: "no matching text at the requested index",
         swipePointsMin: "points must contain at least two objects with numeric x and y",
         swipePointFinite: { "points[\($0)].x and points[\($0)].y must be finite numbers" },
         swipeDurationInvalid: "duration must be a finite number greater than zero",
@@ -125,7 +125,5 @@ struct StringsAPI: LocalizedTable {
         pairingProbeUnavailable: "Bluetooth pointer probe is unavailable",
         swipeReasonPoints: "points must contain at least two finite coordinates in 0...1",
         swipeReasonDuration: "duration must be a finite positive number",
-        swipeReasonReportCount: "duration and report interval produce an invalid report count",
-        qrTextTooLong: "Text exceeds a single QR code's capacity (about 2.8 KB); send it in chunks",
-        qrGenerationFailed: "Could not generate a text QR code; try again")
+        swipeReasonReportCount: "duration and report interval produce an invalid report count")
 }

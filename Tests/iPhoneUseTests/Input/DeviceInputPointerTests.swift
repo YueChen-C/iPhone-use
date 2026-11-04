@@ -272,6 +272,7 @@ final class DeviceInputPointerTests: XCTestCase {
         XCTAssertEqual(reports.last?.1, [0, 0, 0, 0])
         let movement = reports.filter { $0.0 == .relativeMouse }.dropFirst().dropLast()
         XCTAssertTrue(movement.allSatisfy { $0.1[0] == 1 })
+        XCTAssertTrue(movement.contains { $0.1[1] != 0 && $0.1[2] != 0 }, "diagonal drags combine both axes")
         // Replaying the reports through the built-in curve reaches the target.
         var position = CGPoint(x: 0, y: 0)
         for (_, bytes) in movement {
@@ -286,7 +287,24 @@ final class DeviceInputPointerTests: XCTestCase {
         XCTAssertEqual(pauses.last, 0.125)
         XCTAssertEqual(
             Array(pauses.dropFirst(2).dropLast()), Array(repeating: 0.125, count: pauses.count - 3))
+        XCTAssertEqual(pauses.count, movement.count + 3, "movement reports must not incur a second outer pause")
         XCTAssertTrue(pauses.allSatisfy { $0.isFinite && $0 >= 0 })
+    }
+
+    func testSlowEstimatedSwipeOnlyWaitsForTheRemainingInterval() throws {
+        var pauses: [TimeInterval] = []
+        var movementCount = 0
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), screenSize: { CGSize(width: 750, height: 1334) },
+            sleep: { pauses.append($0) },
+            reportSender: { id, bytes in
+                if id == .relativeMouse, bytes[1] != 0 || bytes[2] != 0 { movementCount += 1 }
+            })
+        input.step = 0.125
+        try input.swipe(points: [(0.5, 0.5), (0.501, 0.501)], duration: 0.6)
+        XCTAssertGreaterThan(movementCount, 0)
+        XCTAssertTrue(pauses.dropFirst(2).dropLast().contains { $0 > 0 && $0 < input.step })
+        XCTAssertEqual(pauses.dropFirst(2).dropLast().reduce(0, +), 0.6, accuracy: 1e-12)
     }
 
     func testPairingProbeMovesAndCapturesOnTheInputQueue() throws {

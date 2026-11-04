@@ -146,6 +146,20 @@ enum USBValeriaConfigurator {
     enum IOSUSBTopologyObservation: Equatable {
         case unavailable
         case observed(ConnectedIOSUSBTopology)
+
+        var hasAttachedDevices: Bool {
+            if case .observed(let topology) = self {
+                return !topology.attachedEntryIDs.isEmpty
+            }
+            return false
+        }
+
+        var confirmsNoAttachedDevices: Bool {
+            if case .observed(let topology) = self {
+                return topology.attachedEntryIDs.isEmpty
+            }
+            return false
+        }
     }
 
     enum USBServicePropertyObservation: Equatable {
@@ -467,11 +481,7 @@ enum USBValeriaConfigurator {
         if (service["IsNULL"] as? NSNumber)?.boolValue == true {
             return false
         }
-        guard
-            let router = (service["Router"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            !router.isEmpty
-        else { return false }
+        guard let router = nonemptyString(service["Router"]) else { return false }
         let addresses = (service["Addresses"] as? [String]) ?? []
         if isIPv6 {
             guard let routerBytes = parseIPv6Bytes(router),
@@ -492,12 +502,16 @@ enum USBValeriaConfigurator {
         }
     }
 
+    private static func nonemptyString(_ raw: Any?) -> String? {
+        guard let value = (raw as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !value.isEmpty
+        else { return nil }
+        return value
+    }
+
     private static func serviceInterfaceName(_ dict: [String: Any]) -> String? {
         let name = (dict["ConfirmedInterfaceName"] as? String) ?? (dict["InterfaceName"] as? String)
-        guard let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines),
-            !trimmed.isEmpty
-        else { return nil }
-        return trimmed
+        return nonemptyString(name)
     }
 
     private static func resolveFamilyRoute(
@@ -515,9 +529,7 @@ enum USBValeriaConfigurator {
             })
 
         guard let global,
-            let primaryIface = (global["PrimaryInterface"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            !primaryIface.isEmpty
+            let primaryIface = nonemptyString(global["PrimaryInterface"])
         else {
             return routedPhysicalInterfaces.isEmpty ? .none : .unresolvedPrimary
         }
@@ -576,10 +588,7 @@ enum USBValeriaConfigurator {
         var serviceReferencedInterfaces: Set<String> = []
         for serviceDict in Array(servicesIPv4.values) + Array(servicesIPv6.values) {
             for key in ["ConfirmedInterfaceName", "InterfaceName"] {
-                if let name = (serviceDict[key] as? String)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines),
-                    !name.isEmpty
-                {
+                if let name = nonemptyString(serviceDict[key]) {
                     serviceReferencedInterfaces.insert(name)
                 }
             }
@@ -589,10 +598,7 @@ enum USBValeriaConfigurator {
                     return .unknown
                 }
                 for route in routeList {
-                    if let name = (route["InterfaceName"] as? String)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines),
-                        !name.isEmpty
-                    {
+                    if let name = nonemptyString(route["InterfaceName"]) {
                         serviceReferencedInterfaces.insert(name)
                     }
                 }
@@ -1052,28 +1058,23 @@ enum USBValeriaConfigurator {
         return .deviceDetached
     }
 
+    private static func property<Value>(of service: io_service_t, key: String) -> Value? {
+        IORegistryEntryCreateCFProperty(
+            service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Value
+    }
+
     private static func intProperty(of service: io_service_t, key: String) -> Int? {
-        guard
-            let prop = IORegistryEntryCreateCFProperty(
-                service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
-        else { return nil }
-        return (prop as? NSNumber)?.intValue
+        let number: NSNumber? = property(of: service, key: key)
+        return number?.intValue
     }
 
     private static func boolProperty(of service: io_service_t, key: String) -> Bool {
-        guard
-            let prop = IORegistryEntryCreateCFProperty(
-                service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
-        else { return false }
-        return (prop as? NSNumber)?.boolValue ?? false
+        let number: NSNumber? = property(of: service, key: key)
+        return number?.boolValue ?? false
     }
 
     private static func stringProperty(of service: io_service_t, key: String) -> String? {
-        guard
-            let prop = IORegistryEntryCreateCFProperty(
-                service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
-        else { return nil }
-        return prop as? String
+        property(of: service, key: key)
     }
 
     private static func inspectHostAndDeviceNetworkEnvironment(
@@ -1649,14 +1650,49 @@ struct USBSwitchLedger {
     }
 
     @discardableResult
-    mutating func markDeviceDetached(registryEntryID: UInt64) -> Bool {
-        guard reloadIfFaulted() else { return false }
-        guard let removed = entries.removeValue(forKey: registryEntryID) else { return true }
+    private mutating func persistEntry(
+        _ entry: USBValeriaConfigurator.ActivatedSwitch?,
+        for registryEntryID: UInt64,
+        fallback: USBValeriaConfigurator.ActivatedSwitch?
+    ) -> Bool {
+        entries[registryEntryID] = entry
         guard persistCurrentEntries() else {
-            entries[registryEntryID] = removed
+            entries[registryEntryID] = fallback
             return false
         }
         return true
+    }
+
+    private mutating func retainForRetry(
+        _ record: USBValeriaConfigurator.ActivatedSwitch,
+        for registryEntryID: UInt64
+    ) -> USBValeriaConfigurator.RestoreOutcome {
+        persistEntry(record, for: registryEntryID, fallback: record)
+        return .transientFailure
+    }
+
+    private mutating func finishRestoreIfUnneeded(
+        _ record: USBValeriaConfigurator.ActivatedSwitch,
+        for registryEntryID: UInt64,
+        restoredOutcome: USBValeriaConfigurator.RestoreOutcome
+    ) -> USBValeriaConfigurator.RestoreOutcome? {
+        let outcome: USBValeriaConfigurator.RestoreOutcome
+        if record.lastObservedConfiguration == record.previousConfiguration {
+            outcome = restoredOutcome
+        } else if record.lastObservedConfiguration != record.requestedConfiguration {
+            outcome = .supersededByExternalChange
+        } else {
+            return nil
+        }
+        return removeTrackedEntryAndPersist(
+            registryEntryID: registryEntryID, fallback: record, outcome: outcome)
+    }
+
+    @discardableResult
+    mutating func markDeviceDetached(registryEntryID: UInt64) -> Bool {
+        guard reloadIfFaulted() else { return false }
+        guard let removed = entries[registryEntryID] else { return true }
+        return persistEntry(nil, for: registryEntryID, fallback: removed)
     }
 
     private mutating func removeTrackedEntryAndPersist(
@@ -1664,12 +1700,7 @@ struct USBSwitchLedger {
         fallback: USBValeriaConfigurator.ActivatedSwitch,
         outcome: USBValeriaConfigurator.RestoreOutcome
     ) -> USBValeriaConfigurator.RestoreOutcome {
-        entries[registryEntryID] = nil
-        guard persistCurrentEntries() else {
-            entries[registryEntryID] = fallback
-            return .transientFailure
-        }
-        return outcome
+        persistEntry(nil, for: registryEntryID, fallback: fallback) ? outcome : .transientFailure
     }
 
     mutating func activate(
@@ -1739,46 +1770,25 @@ struct USBSwitchLedger {
             requestedConfiguration: targetInfo.value,
             lastObservedConfiguration: nil,
             readbackConfirmed: false)
-        entries[session.registryEntryID] = preSwitchIntent
-        guard persistCurrentEntries() else {
-            entries[session.registryEntryID] = priorEntry
+        guard persistEntry(preSwitchIntent, for: session.registryEntryID, fallback: priorEntry) else {
             return .notActivated
         }
 
         guard session.setConfiguration(targetInfo.value) else {
-            entries[session.registryEntryID] = priorEntry
-            if !persistCurrentEntries() {
-                entries[session.registryEntryID] = preSwitchIntent
-            }
+            persistEntry(priorEntry, for: session.registryEntryID, fallback: preSwitchIntent)
             return .notActivated
         }
 
         let observed = session.getConfiguration()
-        if observed == targetInfo.value {
-            let record = USBValeriaConfigurator.ActivatedSwitch(
-                registryEntryID: session.registryEntryID,
-                previousConfiguration: baselinePrevious,
-                requestedConfiguration: targetInfo.value,
-                lastObservedConfiguration: observed,
-                readbackConfirmed: true)
-            entries[session.registryEntryID] = record
-            if !persistCurrentEntries() {
-                entries[session.registryEntryID] = preSwitchIntent
-            }
-            return .switched(record)
-        } else {
-            let unconfirmed = USBValeriaConfigurator.ActivatedSwitch(
-                registryEntryID: session.registryEntryID,
-                previousConfiguration: baselinePrevious,
-                requestedConfiguration: targetInfo.value,
-                lastObservedConfiguration: observed,
-                readbackConfirmed: false)
-            entries[session.registryEntryID] = unconfirmed
-            if !persistCurrentEntries() {
-                entries[session.registryEntryID] = preSwitchIntent
-            }
-            return .unconfirmedSwitch(unconfirmed)
-        }
+        let confirmed = observed == targetInfo.value
+        let record = USBValeriaConfigurator.ActivatedSwitch(
+            registryEntryID: session.registryEntryID,
+            previousConfiguration: baselinePrevious,
+            requestedConfiguration: targetInfo.value,
+            lastObservedConfiguration: observed,
+            readbackConfirmed: confirmed)
+        persistEntry(record, for: session.registryEntryID, fallback: preSwitchIntent)
+        return confirmed ? .switched(record) : .unconfirmedSwitch(record)
     }
 
     mutating func restore(
@@ -1791,74 +1801,43 @@ struct USBSwitchLedger {
             return .transientFailure
         }
         record.lastObservedConfiguration = current
-        if current == record.previousConfiguration {
-            return removeTrackedEntryAndPersist(
-                registryEntryID: registryEntryID,
-                fallback: record,
-                outcome: .alreadyRestored)
-        }
-        if current != record.requestedConfiguration {
-            return removeTrackedEntryAndPersist(
-                registryEntryID: registryEntryID,
-                fallback: record,
-                outcome: .supersededByExternalChange)
+        if let outcome = finishRestoreIfUnneeded(
+            record, for: registryEntryID, restoredOutcome: .alreadyRestored)
+        {
+            return outcome
         }
 
         guard session.openSafely() else {
-            entries[registryEntryID] = record
-            _ = persistCurrentEntries()
-            return .transientFailure
+            return retainForRetry(record, for: registryEntryID)
         }
         defer { session.close() }
 
         guard let rechecked = session.getConfiguration() else {
             record.lastObservedConfiguration = nil
-            entries[registryEntryID] = record
-            _ = persistCurrentEntries()
-            return .transientFailure
+            return retainForRetry(record, for: registryEntryID)
         }
         record.lastObservedConfiguration = rechecked
-        if rechecked == record.previousConfiguration {
-            return removeTrackedEntryAndPersist(
-                registryEntryID: registryEntryID,
-                fallback: record,
-                outcome: .alreadyRestored)
-        }
-        if rechecked != record.requestedConfiguration {
-            return removeTrackedEntryAndPersist(
-                registryEntryID: registryEntryID,
-                fallback: record,
-                outcome: .supersededByExternalChange)
+        if let outcome = finishRestoreIfUnneeded(
+            record, for: registryEntryID, restoredOutcome: .alreadyRestored)
+        {
+            return outcome
         }
 
         guard session.setConfiguration(record.previousConfiguration) else {
-            entries[registryEntryID] = record
-            _ = persistCurrentEntries()
-            return .transientFailure
+            return retainForRetry(record, for: registryEntryID)
         }
         guard let confirmed = session.getConfiguration() else {
             record.lastObservedConfiguration = nil
             record.readbackConfirmed = false
-            entries[registryEntryID] = record
-            _ = persistCurrentEntries()
-            return .transientFailure
+            return retainForRetry(record, for: registryEntryID)
         }
         record.lastObservedConfiguration = confirmed
-        if confirmed == record.previousConfiguration {
-            return removeTrackedEntryAndPersist(
-                registryEntryID: registryEntryID,
-                fallback: record,
-                outcome: .restored)
-        }
-        if confirmed != record.requestedConfiguration {
-            return removeTrackedEntryAndPersist(
-                registryEntryID: registryEntryID,
-                fallback: record,
-                outcome: .supersededByExternalChange)
+        if let outcome = finishRestoreIfUnneeded(
+            record, for: registryEntryID, restoredOutcome: .restored)
+        {
+            return outcome
         }
         record.readbackConfirmed = true
-        entries[registryEntryID] = record
-        _ = persistCurrentEntries()
-        return .transientFailure
+        return retainForRetry(record, for: registryEntryID)
     }
 }

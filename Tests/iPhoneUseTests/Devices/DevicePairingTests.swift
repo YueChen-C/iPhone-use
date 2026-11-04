@@ -42,6 +42,94 @@ final class DevicePairingTests: XCTestCase {
         XCTAssertNil(store.load())
     }
 
+    func testVerifiedAssociationPromotesOnlyTheSamePhysicalScreenAndHost() {
+        let identity = UUID()
+        let host = UUID()
+        let oldSession = UUID()
+        let newSession = UUID()
+        let original = DeviceRegistry.Association(screen: identity, host: host, session: oldSession)
+        var verified: Set = [original]
+        DeviceRegistry.promoteVerifiedAssociations(
+            &verified, screenIdentities: ["phone": identity],
+            pairings: ["phone": host], sessions: [host: newSession])
+        XCTAssertEqual(
+            verified, [original, DeviceRegistry.Association(screen: identity, host: host, session: newSession)])
+
+        // Neither a new USB identity nor a different host inherits the old motion proof.
+        let replacementIdentity = UUID()
+        let otherHost = UUID()
+        DeviceRegistry.promoteVerifiedAssociations(
+            &verified, screenIdentities: ["phone": replacementIdentity, "other": identity],
+            pairings: ["phone": host, "other": otherHost], sessions: [host: UUID(), otherHost: UUID()])
+        XCTAssertEqual(verified.count, 2)
+        DeviceRegistry.promoteVerifiedAssociations(
+            &verified, screenIdentities: ["phone": identity], pairings: ["phone": host], sessions: [:])
+        XCTAssertEqual(verified.count, 2)
+    }
+
+    func testReplacingHostRevokesOldProofAndCannotReviveItByPairingBack() {
+        let identity = UUID()
+        let oldHost = UUID()
+        let newHost = UUID()
+        let session = UUID()
+        let unrelated = DeviceRegistry.Association(screen: UUID(), host: UUID(), session: UUID())
+        var verified: Set = [
+            DeviceRegistry.Association(screen: identity, host: oldHost, session: session),
+            DeviceRegistry.Association(screen: identity, host: oldHost, session: UUID()), unrelated,
+        ]
+        DeviceRegistry.invalidateReplacedAssociations(
+            &verified, screenID: "phone", host: newHost,
+            screenIdentities: ["phone": identity], pairings: ["phone": oldHost])
+        XCTAssertEqual(verified, [unrelated])
+        DeviceRegistry.promoteVerifiedAssociations(
+            &verified, screenIdentities: ["phone": identity],
+            pairings: ["phone": oldHost], sessions: [oldHost: UUID()])
+        XCTAssertEqual(verified, [unrelated])
+    }
+
+    func testMovingHostToAnotherScreenRevokesOldScreenProof() {
+        let oldIdentity = UUID()
+        let newIdentity = UUID()
+        let host = UUID()
+        let unrelated = DeviceRegistry.Association(screen: UUID(), host: UUID(), session: UUID())
+        var verified: Set = [
+            DeviceRegistry.Association(screen: oldIdentity, host: host, session: UUID()), unrelated,
+        ]
+        DeviceRegistry.invalidateReplacedAssociations(
+            &verified, screenID: "new-phone", host: host,
+            screenIdentities: ["old-phone": oldIdentity, "new-phone": newIdentity],
+            pairings: ["old-phone": host])
+        XCTAssertEqual(verified, [unrelated])
+        DeviceRegistry.promoteVerifiedAssociations(
+            &verified, screenIdentities: ["old-phone": oldIdentity],
+            pairings: ["old-phone": host], sessions: [host: UUID()])
+        XCTAssertEqual(verified, [unrelated])
+    }
+
+    func testReplacementRevokesProofEvenWhenOldScreenIsAbsent() {
+        let host = UUID()
+        var verified: Set = [DeviceRegistry.Association(screen: UUID(), host: host, session: UUID())]
+        DeviceRegistry.invalidateReplacedAssociations(
+            &verified, screenID: "new-phone", host: host,
+            screenIdentities: ["new-phone": UUID()], pairings: ["absent-phone": host])
+        XCTAssertTrue(verified.isEmpty)
+    }
+
+    func testUnchangedBindingPreservesExistingVerification() {
+        let identity = UUID()
+        let host = UUID()
+        let association = DeviceRegistry.Association(screen: identity, host: host, session: UUID())
+        var verified: Set = [association]
+        DeviceRegistry.invalidateReplacedAssociations(
+            &verified, screenID: "phone", host: host,
+            screenIdentities: ["phone": identity], pairings: ["phone": host])
+        XCTAssertEqual(verified, [association])
+        DeviceRegistry.promoteVerifiedAssociations(
+            &verified, screenIdentities: ["phone": identity],
+            pairings: ["phone": host], sessions: [host: association.session])
+        XCTAssertEqual(verified, [association])
+    }
+
     func testFailedDiscoveryCannotRearmAnEndlessProbeTimer() throws {
         let capture = NSObject()
         let topology = DevicePairingProbeSchedule.Topology(

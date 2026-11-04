@@ -139,8 +139,8 @@ final class LocalizationTests: XCTestCase {
         let enTools = MCPToolCatalog.tools(for: .en)
         let zhTools = MCPToolCatalog.tools(for: .zh)
         let required: Set<String> = [
-            "list_devices", "screenshot", "move_pointer", "adjust_pointer", "click_pointer",
-            "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home",
+            "list_devices", "screenshot", "ocr_screen", "tap_text", "move_pointer", "adjust_pointer", "click_pointer",
+            "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home", "act",
         ]
         func names(_ tools: [[String: Any]]) -> Set<String> {
             Set(tools.compactMap { $0["name"] as? String })
@@ -198,11 +198,36 @@ final class LocalizationTests: XCTestCase {
             XCTAssertEqual(
                 String(describing: error), StringsMCP(language: .zh).keyboardSequenceRange)
         }
+        XCTAssertThrowsError(
+            try MCPToolRequest.action(named: "tap_text", arguments: ["text": ""], longEdge: 1200, language: .zh)
+        ) { error in
+            XCTAssertEqual(String(describing: error), StringsAPI.zh.ocrParameterInvalid("text"))
+        }
+        XCTAssertNotEqual(StringsAPI.en.ocrTextNotFound, StringsAPI.zh.ocrTextNotFound)
         // Default-parameter callers keep the stable English contract.
         XCTAssertThrowsError(
             try MCPToolRequest.action(named: "move_pointer", arguments: ["x": -1, "y": 2], longEdge: 1200)
         ) { error in
             XCTAssertEqual(String(describing: error), "x must be a finite, nonnegative screenshot coordinate")
+        }
+    }
+}
+
+final class KeyboardOptionLocalizationTests: XCTestCase {
+    func testNewValidationAndDescriptionsCoverBothLanguages() {
+        for language: AppLanguage in [.en, .zh] {
+            let table = StringsMCP(language: language)
+            XCTAssertTrue(table.toolTypeText.contains("clear_before"))
+            XCTAssertTrue(table.toolTypeText.contains("commit_ime"))
+            XCTAssertTrue(table.toolTypeText.contains("press_enter"))
+            XCTAssertTrue(table.toolKeyboardSequence.contains("steps/actions"))
+            XCTAssertTrue(table.deviceParam.contains("device_id"))
+            XCTAssertThrowsError(
+                try MCPKeyboardSequence.actions(arguments: ["actions": [["delay": true]]], language: language)
+            ) { XCTAssertEqual(String(describing: $0), table.kbDelay(table.kbStepLabel(1))) }
+            XCTAssertThrowsError(try TypeTextRequest(["text": "a", "commit_ime": 1], language: language)) {
+                XCTAssertEqual(String(describing: $0), table.booleanRequired("commit_ime"))
+            }
         }
     }
 }
