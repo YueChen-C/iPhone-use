@@ -424,6 +424,7 @@ struct HIDLifecyclePolicy: Equatable {
     private(set) var hasPresentUSBScreens = false
     private(set) var lastUSBDemandRevision: UInt64 = 0
     private(set) var activeWindowTokens: Set<UUID> = []
+    private(set) var hasResidentQuietDemand = false
 
     var hasOpenControlWindows: Bool {
         !activeWindowTokens.isEmpty
@@ -432,8 +433,10 @@ struct HIDLifecyclePolicy: Equatable {
     /// Open control windows show Bluetooth pairing instructions only while at least
     /// one display is awake. Headless USB/MCP control remains active across display
     /// blanking (`isDisplaySleeping`) until actual system sleep (`isSystemSleeping`).
+    /// In resident quiet mode, BLE advertising is always maintained while the system
+    /// is awake so paired or pairing phones can discover and connect via Bluetooth.
     var hasEffectiveDemand: Bool {
-        hasPresentUSBScreens || (hasOpenControlWindows && !isDisplaySleeping)
+        hasPresentUSBScreens || hasResidentQuietDemand || (hasOpenControlWindows && !isDisplaySleeping)
     }
 
     var shouldRunCoreBluetooth: Bool {
@@ -473,6 +476,7 @@ struct HIDLifecyclePolicy: Equatable {
         hasUnresolvedDisplayQuery = false
         unknownDisplayRetryAttempts = 0
         hasPresentUSBScreens = false
+        hasResidentQuietDemand = false
         activeWindowTokens.removeAll()
     }
 
@@ -580,5 +584,10 @@ struct HIDLifecyclePolicy: Equatable {
 
     mutating func endWindowDemand(_ token: UUID) {
         activeWindowTokens.remove(token)
+    }
+
+    mutating func setResidentQuietDemand(_ active: Bool) {
+        guard !isPermanentlyStopped else { return }
+        hasResidentQuietDemand = active
     }
 }

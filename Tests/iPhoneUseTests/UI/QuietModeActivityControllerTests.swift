@@ -278,4 +278,20 @@ final class QuietModeActivityControllerTests: XCTestCase {
         XCTAssertFalse(controller.isWithinWakeGraceWindow)
     }
 
+    func testResidentQuietDemandKeepsBluetoothAdvertisingWhileAwakeWithoutScreensOrWindows() {
+        var policy = HIDLifecyclePolicy()
+        policy.start(initialDisplayState: .atLeastOneAwake)
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .idleNoDemand)
+
+        // Enabling resident quiet demand (e.g. --resident-quiet) keeps BLE running so phones can pair.
+        policy.setResidentQuietDemand(true)
+        XCTAssertTrue(policy.shouldRunCoreBluetooth)
+        XCTAssertNil(policy.inactiveReason)
+
+        // Stopping the policy tears it down.
+        policy.stop()
+        XCTAssertFalse(policy.shouldRunCoreBluetooth)
+        XCTAssertEqual(policy.inactiveReason, .stopped)
+    }
 }

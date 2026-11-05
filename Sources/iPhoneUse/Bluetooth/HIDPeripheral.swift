@@ -165,6 +165,16 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
         }
     }
 
+    func setResidentQuietDemand(_ active: Bool) {
+        queue.async {
+            self.lifecyclePolicy.setResidentQuietDemand(active)
+            self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
+            if self.applyCoreBluetoothLifecycleOnQueue() {
+                self.onHostsChanged?()
+            }
+        }
+    }
+
     func refreshDisplayStateIfNeeded() {
         queue.async {
             guard self.lifecyclePolicy.hasUnresolvedDisplayQuery else { return }
