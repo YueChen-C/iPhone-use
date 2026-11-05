@@ -3,45 +3,83 @@ import XCTest
 @testable import iPhoneUse
 
 final class RelativePointerCalibrationTests: XCTestCase {
+    func testAutomaticReplacementPreservesAProfileInstalledDuringMeasurement() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let old = RelativePointerCalibration(
+            host: UUID(), screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+            distances: [0, 1, 5, 25], screenID: "00008020-0000000000000003")
+        try old.saveVerified(directory: directory)
+        let snapshot = try RelativePointerCalibration.storageSnapshot(
+            host: old.host, screenID: "00008020-0000000000000003", directory: directory)
+        let newer = RelativePointerCalibration(
+            host: old.host, screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+            distances: [0, 2, 8, 30], screenID: "00008020-0000000000000003")
+        try newer.saveVerified(directory: directory)
+        XCTAssertThrowsError(try old.saveVerified(directory: directory, ifUnchanged: snapshot))
+        XCTAssertEqual(
+            RelativePointerCalibration.load(
+                host: old.host, screenSize: nil, screenID: "00008020-0000000000000003", directory: directory), newer)
+        let current = try RelativePointerCalibration.storageSnapshot(
+            host: old.host, screenID: "00008020-0000000000000003", directory: directory)
+        try old.saveVerified(directory: directory, ifUnchanged: current)
+        XCTAssertEqual(
+            RelativePointerCalibration.load(
+                host: old.host, screenSize: nil, screenID: "00008020-0000000000000003", directory: directory), old)
+    }
+
     func testVerifiedHostPrefersCurrentScreenTemplateOverAStaleHostProfile() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let host = UUID()
         let stale = RelativePointerCalibration(
             host: host, screenWidth: 750, screenHeight: 1334,
-            reportInterval: 0.03, distances: [0, 1, 3, 8, 20], screenID: "old-screen")
+            reportInterval: 0.03, distances: [0, 1, 3, 8, 20], screenID: "00008020-0000000000000001")
         let current = RelativePointerCalibration(
             host: UUID(), screenWidth: 750, screenHeight: 1334,
-            reportInterval: 0.03, distances: [0, 2, 5, 12, 25], screenID: "current-screen")
+            reportInterval: 0.03, distances: [0, 2, 5, 12, 25], screenID: "00008020-0000000000000002")
         try save(stale, in: directory)
         try save(current, in: directory)
-        let templateURL = RelativePointerCalibration.screenFileURL(screenID: "current-screen", directory: directory)
+        let templateURL = RelativePointerCalibration.screenFileURL(
+            screenID: "00008020-0000000000000002", directory: directory)
         try FileManager.default.createDirectory(
             at: templateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(current).write(to: templateURL)
 
         let resolved = try XCTUnwrap(
-            RelativePointerCalibration.loadVerifiedHost(
-                host: host, screenID: "current-screen", directory: directory))
+            RelativePointerCalibration.load(
+                host: host, screenSize: nil, screenID: "00008020-0000000000000002", directory: directory))
         XCTAssertEqual(resolved.host, host)
-        XCTAssertEqual(resolved.screenID, "current-screen")
+        XCTAssertEqual(resolved.screenID, "00008020-0000000000000002")
         XCTAssertEqual(resolved.distances, current.distances)
     }
 
-    func testVerifiedHostKeepsItsCurveWhenReplacementScreenHasNoTemplate() throws {
+    func testForeignHostCurveIsNeverAdoptedByAReplacementScreen() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let host = UUID()
         let own = RelativePointerCalibration(
-            host: host, screenWidth: 750, screenHeight: 1334,
-            reportInterval: 0.03, distances: [0, 1, 3, 8, 20], screenID: "old-screen")
+            host: UUID(), screenWidth: 750, screenHeight: 1334,
+            reportInterval: 0.03, distances: [0, 1, 3, 8, 20], screenID: "00008030-001A690E2EC3802E")
         try save(own, in: directory)
-
-        let resolved = try XCTUnwrap(
-            RelativePointerCalibration.loadVerifiedHost(
-                host: host, screenID: "replacement-screen", directory: directory))
-        XCTAssertEqual(resolved.screenID, "replacement-screen")
-        XCTAssertEqual(resolved.distances, own.distances)
+        let url = directory.appendingPathComponent(own.host.uuidString + ".json")
+        let before = try Data(contentsOf: url)
+        XCTAssertNil(
+            RelativePointerCalibration.load(
+                host: own.host, screenSize: nil, screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c",
+                directory: directory))
+        if case .unavailable = RelativePointerCalibration.pairingProbeCalibration(
+            host: own.host, screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c", directory: directory)
+        {
+        } else {
+            XCTFail("a foreign curve must not be donated to the pairing probe")
+        }
+        XCTAssertEqual(try Data(contentsOf: url), before)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath:
+                    RelativePointerCalibration.screenFileURL(
+                        screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c", directory: directory
+                    ).path))
     }
 
     func testNativeVerifiedProfilePersistsByHostAndUSBIdentity() throws {
@@ -50,28 +88,32 @@ final class RelativePointerCalibrationTests: XCTestCase {
         let host = UUID()
         let value = RelativePointerCalibration(
             host: host, screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
-            distances: [0, 0.5, 5, 25], screenID: "usb-phone")
+            distances: [0, 0.5, 5, 25], screenID: "00008020-0000000000000004")
         try value.saveVerified(directory: directory)
-        let stable = RelativePointerCalibration.screenFileURL(screenID: "usb-phone", directory: directory)
+        let stable = RelativePointerCalibration.screenFileURL(
+            screenID: "00008020-0000000000000004", directory: directory)
         XCTAssertEqual(
             try Data(contentsOf: stable),
             try Data(contentsOf: directory.appendingPathComponent(host.uuidString + ".json")))
         let rebound = RelativePointerCalibration.loadMatchingScreen(
-            host: UUID(), screenSize: CGSize(width: 750, height: 1334), screenID: "usb-phone", directory: directory)
+            host: UUID(), screenSize: CGSize(width: 750, height: 1334), screenID: "00008020-0000000000000004",
+            directory: directory)
         XCTAssertEqual(rebound?.distances, value.distances)
 
         let original = try Data(contentsOf: stable)
         let invalid = RelativePointerCalibration(
             host: host, screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
-            distances: [0, 0, 25], screenID: "usb-phone")
+            distances: [0, 0, 25], screenID: "00008020-0000000000000004")
         XCTAssertThrowsError(try invalid.saveVerified(directory: directory))
         XCTAssertEqual(try Data(contentsOf: stable), original)
     }
 
-    private func profile(_ distances: [Double] = [0, 1, 3, 8, 20]) -> RelativePointerCalibration {
+    private func profile(_ distances: [Double] = [0, 1, 3, 8, 20], screenID: String? = nil)
+        -> RelativePointerCalibration
+    {
         RelativePointerCalibration(
             host: UUID(), screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.01, distances: distances)
+            reportInterval: 0.01, distances: distances, screenID: screenID)
     }
 
     func testPlansBothAxesAndPreservesPredictedLandingAcrossMoves() throws {
@@ -192,7 +234,7 @@ final class RelativePointerCalibrationTests: XCTestCase {
     func testCaptureFirstFrameEnablesCalibrationAndRotationDisablesIt() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let saved = profile()
+        let saved = profile(screenID: "00008030-001A690E2EC3802E")
         try save(saved, in: directory)
         let calibration = try XCTUnwrap(
             RelativePointerCalibration.load(
@@ -232,36 +274,27 @@ final class RelativePointerCalibrationTests: XCTestCase {
             to: directory.appendingPathComponent((host ?? calibration.host).uuidString + ".json"))
     }
 
-    func testLegacyProfileBindsOnlyItsConfirmedHostAndPersistsScreenIdentity() throws {
+    func testLegacyProfileWithoutUDIDIsNeverAdoptedOrRewritten() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let calibration = profile()
-        try save(calibration, in: directory)
-        let size = CGSize(width: 100, height: 200)
-        let original = try XCTUnwrap(
-            RelativePointerCalibration.load(
-                host: calibration.host, screenSize: size, directory: directory))
-        XCTAssertNil(original.screenID)
-        XCTAssertNil(
-            RelativePointerCalibration.loadMatchingScreen(
-                host: UUID(), screenSize: size, screenID: "phone-a", directory: directory))
-
-        let bound = try XCTUnwrap(
-            RelativePointerCalibration.load(
-                host: calibration.host, screenSize: size, screenID: "phone-a", directory: directory))
-        XCTAssertEqual(bound.screenID, "phone-a")
-        let persisted = try XCTUnwrap(
-            RelativePointerCalibration.load(
-                host: calibration.host, screenSize: size, directory: directory))
-        XCTAssertEqual(persisted.screenID, "phone-a")
-        XCTAssertNil(
-            RelativePointerCalibration.load(
-                host: calibration.host, screenSize: size, screenID: "phone-b", directory: directory))
-        let unknownHost = UUID()
-        try save(calibration, in: directory, named: unknownHost)
-        XCTAssertNil(
-            RelativePointerCalibration.load(
-                host: unknownHost, screenSize: size, screenID: "phone-a", directory: directory))
+        for missingID in [nil, ""] {
+            let legacy = profile(screenID: missingID)
+            try save(legacy, in: directory)
+            let url = directory.appendingPathComponent(legacy.host.uuidString + ".json")
+            let before = try Data(contentsOf: url)
+            for screenID in [nil, "00008030-001A690E2EC3802E", "8bdbe135bcd781e8215eb391f48b2848608b292c"] {
+                XCTAssertNil(
+                    RelativePointerCalibration.load(
+                        host: legacy.host, screenSize: CGSize(width: 100, height: 200),
+                        screenID: screenID, directory: directory))
+            }
+            XCTAssertNil(
+                RelativePointerCalibration.loadMatchingScreen(
+                    host: UUID(), screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: directory))
+            XCTAssertThrowsError(try legacy.saveVerified(directory: directory))
+            XCTAssertEqual(try Data(contentsOf: url), before)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("by-screen").path))
     }
 
     func testDifferentScreenEvidenceRequiresAValidExplicitScreenIdentity() throws {
@@ -270,42 +303,42 @@ final class RelativePointerCalibrationTests: XCTestCase {
         let host = UUID()
         let bound = RelativePointerCalibration(
             host: host, screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.01, distances: [0, 1, 3, 8, 20], screenID: "old-usb-id")
+            reportInterval: 0.01, distances: [0, 1, 3, 8, 20], screenID: "00008020-0000000000000005")
         try save(bound, in: directory)
 
         XCTAssertTrue(
             RelativePointerCalibration.isBoundToDifferentScreen(
-                host: host, screenID: "new-usb-id", directory: directory))
+                host: host, screenID: "00008020-0000000000000006", directory: directory))
         XCTAssertFalse(
             RelativePointerCalibration.isBoundToDifferentScreen(
-                host: host, screenID: "old-usb-id", directory: directory))
+                host: host, screenID: "00008020-0000000000000005", directory: directory))
 
         let legacy = profile()
         try save(legacy, in: directory)
         XCTAssertFalse(
             RelativePointerCalibration.isBoundToDifferentScreen(
-                host: legacy.host, screenID: "new-usb-id", directory: directory))
+                host: legacy.host, screenID: "00008020-0000000000000006", directory: directory))
 
         let invalid = RelativePointerCalibration(
             host: UUID(), screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.01, distances: [0, 0], screenID: "old-usb-id")
+            reportInterval: 0.01, distances: [0, 0], screenID: "00008020-0000000000000005")
         try save(invalid, in: directory)
         XCTAssertFalse(
             RelativePointerCalibration.isBoundToDifferentScreen(
-                host: invalid.host, screenID: "new-usb-id", directory: directory))
+                host: invalid.host, screenID: "00008020-0000000000000006", directory: directory))
 
         let malformedHost = UUID()
         try Data("not-json".utf8).write(
             to: directory.appendingPathComponent(malformedHost.uuidString + ".json"))
         XCTAssertFalse(
             RelativePointerCalibration.isBoundToDifferentScreen(
-                host: malformedHost, screenID: "new-usb-id", directory: directory))
+                host: malformedHost, screenID: "00008020-0000000000000006", directory: directory))
 
         let wrongHost = UUID()
         try save(bound, in: directory, named: wrongHost)
         XCTAssertFalse(
             RelativePointerCalibration.isBoundToDifferentScreen(
-                host: wrongHost, screenID: "new-usb-id", directory: directory))
+                host: wrongHost, screenID: "00008020-0000000000000006", directory: directory))
     }
 
     func testRepairedHostRequiresExactScreenIdentityInsteadOfResolution() throws {
@@ -316,32 +349,35 @@ final class RelativePointerCalibrationTests: XCTestCase {
         try save(legacy, in: directory)
         let otherPhone = RelativePointerCalibration(
             host: UUID(), screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.01, distances: [0, 1, 4, 9, 22], screenID: "phone-b")
+            reportInterval: 0.01, distances: [0, 1, 4, 9, 22], screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c")
         try save(otherPhone, in: directory)
         XCTAssertNil(
             RelativePointerCalibration.loadMatchingScreen(
-                host: newHost, screenSize: CGSize(width: 100, height: 200), screenID: "phone-a", directory: directory))
+                host: newHost, screenSize: CGSize(width: 100, height: 200), screenID: "00008030-001A690E2EC3802E",
+                directory: directory))
         let calibration = RelativePointerCalibration(
             host: UUID(), screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.01, distances: [0, 1, 3, 8, 20], screenID: "phone-a")
+            reportInterval: 0.01, distances: [0, 1, 3, 8, 20], screenID: "00008030-001A690E2EC3802E")
         try save(calibration, in: directory)
         let rebound = try XCTUnwrap(
             RelativePointerCalibration.loadMatchingScreen(
-                host: newHost, screenSize: CGSize(width: 100, height: 200), screenID: "phone-a", directory: directory))
+                host: newHost, screenSize: CGSize(width: 100, height: 200), screenID: "00008030-001A690E2EC3802E",
+                directory: directory))
         try rebound.validate()
         XCTAssertEqual(rebound.host, newHost)
-        XCTAssertEqual(rebound.screenID, "phone-a")
+        XCTAssertEqual(rebound.screenID, "00008030-001A690E2EC3802E")
         XCTAssertEqual(rebound.distances, calibration.distances)
         let reboundWithoutFrame = try XCTUnwrap(
             RelativePointerCalibration.loadMatchingScreen(
-                host: newHost, screenSize: nil, screenID: "phone-a", directory: directory))
+                host: newHost, screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: directory))
         XCTAssertEqual(reboundWithoutFrame.host, newHost)
-        XCTAssertEqual(reboundWithoutFrame.screenID, "phone-a")
+        XCTAssertEqual(reboundWithoutFrame.screenID, "00008030-001A690E2EC3802E")
         let reboundAfterRotation = try XCTUnwrap(
             RelativePointerCalibration.loadMatchingScreen(
-                host: newHost, screenSize: CGSize(width: 200, height: 100), screenID: "phone-a", directory: directory))
+                host: newHost, screenSize: CGSize(width: 200, height: 100), screenID: "00008030-001A690E2EC3802E",
+                directory: directory))
         XCTAssertEqual(reboundAfterRotation.host, newHost)
-        XCTAssertEqual(reboundAfterRotation.screenID, "phone-a")
+        XCTAssertEqual(reboundAfterRotation.screenID, "00008030-001A690E2EC3802E")
         XCTAssertEqual(reboundAfterRotation.distances, calibration.distances)
         XCTAssertNil(
             RelativePointerCalibration.loadMatchingScreen(
@@ -376,17 +412,17 @@ final class RelativePointerCalibrationTests: XCTestCase {
         let rePairedHost = UUID()
         let bound = RelativePointerCalibration(
             host: UUID(), screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.01, distances: [0, 1, 3, 8, 20], screenID: "phone-a")
+            reportInterval: 0.01, distances: [0, 1, 3, 8, 20], screenID: "00008030-001A690E2EC3802E")
         try save(bound, in: directory)
 
         // The single free screen hands its uniquely bound profile to a
         // re-paired host, rebound in memory and never written to disk.
         let reused = RelativePointerCalibration.probeInputCalibration(
-            host: rePairedHost, screenID: "phone-a", directory: directory)
+            host: rePairedHost, screenID: "00008030-001A690E2EC3802E", directory: directory)
         XCTAssertTrue(reused.required)
         let rebound = try XCTUnwrap(reused.calibration)
         XCTAssertEqual(rebound.host, rePairedHost)
-        XCTAssertEqual(rebound.screenID, "phone-a")
+        XCTAssertEqual(rebound.screenID, "00008030-001A690E2EC3802E")
         XCTAssertEqual(rebound.distances, bound.distances)
         XCTAssertFalse(
             FileManager.default.fileExists(
@@ -394,7 +430,7 @@ final class RelativePointerCalibrationTests: XCTestCase {
 
         // Several free screens in play keep the candidate on the absolute
         // report, and so does a screen nothing was ever calibrated on.
-        for screenID in [nil, "phone-b"] {
+        for screenID in [nil, "8bdbe135bcd781e8215eb391f48b2848608b292c"] {
             let resolved = RelativePointerCalibration.probeInputCalibration(
                 host: rePairedHost, screenID: screenID, directory: directory)
             XCTAssertNil(resolved.calibration)
@@ -402,63 +438,113 @@ final class RelativePointerCalibrationTests: XCTestCase {
         }
     }
 
-    func testMatchProbeInputCalibrationPrefersOwnProfileAndKeepsBrokenOwnFilesCalibrated() throws {
+    func testMatchProbeUsesRequestedUDIDAndKeepsBrokenOwnFilesCalibrated() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let otherPhone = RelativePointerCalibration(
-            host: UUID(), screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.01, distances: [0, 1, 4, 9, 22], screenID: "phone-a")
-        try save(otherPhone, in: directory)
-
-        // The host's own profile wins over another phone's screen-bound one.
-        let own = profile()
+        let requested = profile([0, 1, 4, 9, 22], screenID: "00008030-001A690E2EC3802E")
+        let own = profile(screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c")
+        try save(requested, in: directory)
         try save(own, in: directory)
-        var resolved = RelativePointerCalibration.probeInputCalibration(
-            host: own.host, screenID: "phone-a", directory: directory)
+        let resolved = RelativePointerCalibration.probeInputCalibration(
+            host: own.host, screenID: "00008030-001A690E2EC3802E", directory: directory)
         XCTAssertTrue(resolved.required)
-        let ownLoaded = try XCTUnwrap(resolved.calibration)
-        XCTAssertEqual(ownLoaded.host, own.host)
-        XCTAssertNil(ownLoaded.screenID)
-
-        // A broken own profile still opts the host into calibrated control;
-        // it must not silently fall back to the absolute report.
+        XCTAssertEqual(resolved.calibration?.screenID, "00008030-001A690E2EC3802E")
+        XCTAssertEqual(resolved.calibration?.distances, requested.distances)
+        XCTAssertEqual(resolved.calibration?.host, own.host)
+        XCTAssertNil(
+            RelativePointerCalibration.probeInputCalibration(
+                host: own.host, screenID: nil, directory: directory
+            ).calibration)
         let brokenHost = UUID()
-        try Data("not-json".utf8).write(
-            to: directory.appendingPathComponent(brokenHost.uuidString + ".json"))
-        resolved = RelativePointerCalibration.probeInputCalibration(
-            host: brokenHost, screenID: "phone-b", directory: directory)
-        XCTAssertNil(resolved.calibration)
-        XCTAssertTrue(resolved.required)
-
-        // Two profiles bound to the same screen are ambiguous; the probe
-        // falls back to the absolute report instead of guessing.
-        try save(otherPhone, in: directory, named: UUID())
-        resolved = RelativePointerCalibration.probeInputCalibration(
-            host: UUID(), screenID: "phone-a", directory: directory)
-        XCTAssertNil(resolved.calibration)
-        XCTAssertFalse(resolved.required)
+        try Data("not-json".utf8).write(to: directory.appendingPathComponent(brokenHost.uuidString + ".json"))
+        let broken = RelativePointerCalibration.probeInputCalibration(
+            host: brokenHost, screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c", directory: directory)
+        XCTAssertEqual(broken.calibration?.screenID, "8bdbe135bcd781e8215eb391f48b2848608b292c")
+        XCTAssertTrue(broken.required)
+        let unknown = RelativePointerCalibration.probeInputCalibration(
+            host: brokenHost, screenID: "unknown", directory: directory)
+        XCTAssertNil(unknown.calibration)
+        XCTAssertTrue(unknown.required)
     }
 
-    func testMigrationUpdatesHostAndScreenIdentityOnDisk() throws {
+    func testRePairingChangesOnlyTheInMemoryRouteAndNeverWritesFiles() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let calibration = profile()
+        let calibration = profile(screenID: "00008030-001A690E2EC3802E")
         try save(calibration, in: directory)
-        let newHost = UUID()
-        let migrated = try XCTUnwrap(
-            RelativePointerCalibration.rebind(
-                from: calibration.host, to: newHost, screenID: "phone-a", directory: directory))
-        XCTAssertEqual(migrated.host, newHost)
-        XCTAssertEqual(migrated.screenID, "phone-a")
-        let persisted = try XCTUnwrap(
-            RelativePointerCalibration.load(
-                host: newHost, screenSize: CGSize(width: 100, height: 200), screenID: "phone-a", directory: directory))
-        XCTAssertEqual(persisted.host, newHost)
-        XCTAssertEqual(persisted.screenID, "phone-a")
-        XCTAssertEqual(persisted.distances, calibration.distances)
-        XCTAssertThrowsError(
-            try RelativePointerCalibration.rebind(
-                from: newHost, to: UUID(), screenID: "phone-b", directory: directory))
+        let url = directory.appendingPathComponent(calibration.host.uuidString + ".json")
+        let before = try Data(contentsOf: url)
+        for newHost in [UUID(), UUID()] {
+            let routed = try XCTUnwrap(
+                RelativePointerCalibration.load(
+                    host: newHost, screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: directory))
+            XCTAssertEqual(routed.host, newHost)
+            XCTAssertEqual(routed.screenID, calibration.screenID)
+            XCTAssertEqual(routed.distances, calibration.distances)
+            XCTAssertNil(
+                RelativePointerCalibration.load(
+                    host: newHost, screenSize: nil, screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c",
+                    directory: directory))
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath:
+                        directory.appendingPathComponent(newHost.uuidString + ".json").path))
+        }
+        XCTAssertEqual(try Data(contentsOf: url), before)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path).count, 1)
+    }
+
+    func testConflictingHistoricalCurvesNeverSelectAnArbitraryWinner() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = profile(screenID: "00008030-001A690E2EC3802E")
+        let conflict = profile([0, 2, 5, 12, 25], screenID: "00008030-001A690E2EC3802E")
+        try save(first, in: directory)
+        try save(conflict, in: directory)
+        for host in [first.host, conflict.host, UUID()] {
+            XCTAssertNil(
+                RelativePointerCalibration.load(
+                    host: host, screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: directory))
+            let probed = RelativePointerCalibration.probeInputCalibration(
+                host: host, screenID: "00008030-001A690E2EC3802E", directory: directory)
+            XCTAssertNil(probed.calibration)
+            XCTAssertTrue(probed.required)
+        }
+    }
+
+    func testIdenticalHistoricalCopiesReuseTheSameUDIDWithoutWriting() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for _ in 0..<2 { try save(profile(screenID: "00008030-001A690E2EC3802E"), in: directory) }
+        let loaded = try XCTUnwrap(
+            RelativePointerCalibration.loadMatchingScreen(
+                host: UUID(), screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: directory))
+        XCTAssertEqual(loaded.screenID, "00008030-001A690E2EC3802E")
+        XCTAssertEqual(loaded.distances, profile().distances)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path).count, 2)
+    }
+
+    func testOnlyPhoneUDIDsCanOwnPersistedCurves() throws {
+        for id in [
+            "00008030-001A690E2EC3802E", "00008030001A690E2EC3802E",
+            "8bdbe135bcd781e8215eb391f48b2848608b292c",
+        ] {
+            XCTAssertTrue(RelativePointerCalibration.isDeviceUDID(id))
+        }
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for id in [
+            nil, "", "capture-source", "A312CBE4-758D-50EE-CD7A-67F6FD40ACE4",
+            "00008030/001A690E2EC3802E", "00008030-001A690E2EC3802Z",
+        ] {
+            XCTAssertFalse(RelativePointerCalibration.isDeviceUDID(id))
+            let invalid = profile(screenID: id)
+            try save(invalid, in: directory)
+            XCTAssertThrowsError(try invalid.saveVerified(directory: directory))
+            XCTAssertNil(
+                RelativePointerCalibration.load(
+                    host: invalid.host, screenSize: nil, screenID: id, directory: directory))
+        }
     }
 
     func testScreenTemplateSurvivesMultiplePairingsAndOverridesStaleHostCurves() throws {
@@ -466,21 +552,23 @@ final class RelativePointerCalibrationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let old = RelativePointerCalibration(
             host: UUID(), screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.01, distances: [0, 1, 3, 8, 20], screenID: "phone-a")
+            reportInterval: 0.01, distances: [0, 1, 3, 8, 20], screenID: "00008030-001A690E2EC3802E")
         let latest = RelativePointerCalibration(
             host: UUID(), screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.03, distances: [0, 2, 5, 12, 25], screenID: "phone-a",
+            reportInterval: 0.03, distances: [0, 2, 5, 12, 25], screenID: "00008030-001A690E2EC3802E",
             vectorModel: .radialQuantized)
         try save(old, in: directory)
         try save(latest, in: directory)
-        let templateURL = RelativePointerCalibration.screenFileURL(screenID: "phone-a", directory: directory)
+        let templateURL = RelativePointerCalibration.screenFileURL(
+            screenID: "00008030-001A690E2EC3802E", directory: directory)
         try FileManager.default.createDirectory(
             at: templateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(latest).write(to: templateURL)
+        let templateBytes = try Data(contentsOf: templateURL)
 
         let reused = try XCTUnwrap(
             RelativePointerCalibration.load(
-                host: old.host, screenSize: nil, screenID: "phone-a", directory: directory))
+                host: old.host, screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: directory))
         XCTAssertEqual(reused.host, old.host)
         XCTAssertEqual(reused.distances, latest.distances)
         XCTAssertEqual(reused.reportInterval, latest.reportInterval)
@@ -488,42 +576,47 @@ final class RelativePointerCalibrationTests: XCTestCase {
         let newHost = UUID()
         let rePaired = try XCTUnwrap(
             RelativePointerCalibration.loadMatchingScreen(
-                host: newHost, screenSize: nil, screenID: "phone-a", directory: directory))
+                host: newHost, screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: directory))
         XCTAssertEqual(rePaired.host, newHost)
         XCTAssertEqual(rePaired.distances, latest.distances)
         XCTAssertTrue(
             RelativePointerCalibration.requiresCalibration(
-                host: newHost, screenID: "phone-a", directory: directory))
-        let migrated = try XCTUnwrap(
-            RelativePointerCalibration.rebind(
-                from: old.host, to: newHost, screenID: "phone-a", directory: directory))
-        XCTAssertEqual(migrated.distances, latest.distances)
+                host: newHost, screenID: "00008030-001A690E2EC3802E", directory: directory))
+        XCTAssertEqual(try Data(contentsOf: templateURL), templateBytes)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath:
+                    directory.appendingPathComponent(newHost.uuidString + ".json").path))
         XCTAssertNil(
             RelativePointerCalibration.load(
-                host: old.host, screenSize: nil, screenID: "phone-b", directory: directory))
+                host: old.host, screenSize: nil, screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c",
+                directory: directory))
         XCTAssertNil(
             RelativePointerCalibration.loadMatchingScreen(
-                host: UUID(), screenSize: nil, screenID: "phone-b", directory: directory))
+                host: UUID(), screenSize: nil, screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c",
+                directory: directory))
     }
 
     func testBrokenOrMisidentifiedScreenTemplateDoesNotFallBackToAbsoluteInput() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let templateURL = RelativePointerCalibration.screenFileURL(screenID: "phone-a", directory: directory)
+        let templateURL = RelativePointerCalibration.screenFileURL(
+            screenID: "00008030-001A690E2EC3802E", directory: directory)
         try FileManager.default.createDirectory(
             at: templateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try save(profile(screenID: "00008030-001A690E2EC3802E"), in: directory)
         let wrongScreen = RelativePointerCalibration(
             host: UUID(), screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.01, distances: [0, 1, 3, 8, 20], screenID: "phone-b")
+            reportInterval: 0.01, distances: [0, 1, 3, 8, 20], screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c")
         for data in [Data("not-json".utf8), try JSONEncoder().encode(wrongScreen)] {
             try data.write(to: templateURL)
             let host = UUID()
             XCTAssertNil(
                 RelativePointerCalibration.loadMatchingScreen(
-                    host: host, screenSize: nil, screenID: "phone-a", directory: directory))
+                    host: host, screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: directory))
             XCTAssertTrue(
                 RelativePointerCalibration.requiresCalibration(
-                    host: host, screenID: "phone-a", directory: directory))
+                    host: host, screenID: "00008030-001A690E2EC3802E", directory: directory))
         }
         let opaqueID = "phone/../other"
         XCTAssertEqual(
@@ -531,27 +624,22 @@ final class RelativePointerCalibrationTests: XCTestCase {
             "70686f6e652f2e2e2f6f74686572.json")
     }
 
-    func testInvalidOrMisnamedMigrationCannotCreateANewProfile() throws {
+    func testInvalidOrMisnamedHistoryCannotSupplyACurveOrCreateAProfile() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let invalid = RelativePointerCalibration(
-            host: UUID(), screenWidth: 100, screenHeight: 200,
-            reportInterval: 0.01, distances: [0, 0], screenID: "phone-a")
-        try save(invalid, in: directory)
-        let newHost = UUID()
-        XCTAssertThrowsError(
-            try RelativePointerCalibration.rebind(
-                from: invalid.host, to: newHost, screenID: "phone-a", directory: directory))
-        XCTAssertFalse(
-            FileManager.default.fileExists(atPath: directory.appendingPathComponent(newHost.uuidString + ".json").path))
+        try save(profile([0, 0], screenID: "00008030-001A690E2EC3802E"), in: directory)
         let wrongHost = UUID()
-        try save(profile(), in: directory, named: wrongHost)
-        XCTAssertThrowsError(
-            try RelativePointerCalibration.rebind(
-                from: wrongHost, to: newHost, screenID: "phone-a", directory: directory))
-        XCTAssertNil(
-            try RelativePointerCalibration.rebind(
-                from: UUID(), to: newHost, screenID: "phone-a", directory: directory))
+        try save(profile(screenID: "00008030-001A690E2EC3802E"), in: directory, named: wrongHost)
+        let newHost = UUID()
+        for host in [wrongHost, newHost] {
+            XCTAssertNil(
+                RelativePointerCalibration.load(
+                    host: host, screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: directory))
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath:
+                    directory.appendingPathComponent(newHost.uuidString + ".json").path))
     }
 
     func testInvalidBoundProfileStillRequiresCalibration() throws {
@@ -559,13 +647,16 @@ final class RelativePointerCalibrationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let host = UUID()
         XCTAssertFalse(
-            RelativePointerCalibration.requiresCalibration(host: host, screenID: "phone-a", directory: directory))
+            RelativePointerCalibration.requiresCalibration(
+                host: host, screenID: "00008030-001A690E2EC3802E", directory: directory))
         let invalid = directory.appendingPathComponent(UUID().uuidString + ".json")
-        try Data("{\"screenID\":\"phone-a\",\"distances\":[0,0]}".utf8).write(to: invalid)
+        try Data("{\"screenID\":\"00008030-001A690E2EC3802E\",\"distances\":[0,0]}".utf8).write(to: invalid)
         XCTAssertTrue(
-            RelativePointerCalibration.requiresCalibration(host: host, screenID: "phone-a", directory: directory))
+            RelativePointerCalibration.requiresCalibration(
+                host: host, screenID: "00008030-001A690E2EC3802E", directory: directory))
         XCTAssertFalse(
-            RelativePointerCalibration.requiresCalibration(host: host, screenID: "phone-b", directory: directory))
+            RelativePointerCalibration.requiresCalibration(
+                host: host, screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c", directory: directory))
         XCTAssertFalse(RelativePointerCalibration.requiresCalibration(host: host, screenID: nil, directory: directory))
         try Data("broken".utf8).write(to: directory.appendingPathComponent(host.uuidString + ".json"))
         XCTAssertTrue(RelativePointerCalibration.requiresCalibration(host: host, screenID: nil, directory: directory))
@@ -574,14 +665,14 @@ final class RelativePointerCalibrationTests: XCTestCase {
     func testRelativeModeRequirementSurvivesMissingProfilesAndBluetoothIdentityChanges() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        try RelativePointerCalibration.markRequired(screenID: "phone-a", directory: directory)
+        try RelativePointerCalibration.markRequired(screenID: "00008030-001A690E2EC3802E", directory: directory)
         for host in [UUID(), UUID()] {
             XCTAssertTrue(
                 RelativePointerCalibration.requiresCalibration(
-                    host: host, screenID: "phone-a", directory: directory))
+                    host: host, screenID: "00008030-001A690E2EC3802E", directory: directory))
             XCTAssertFalse(
                 RelativePointerCalibration.requiresCalibration(
-                    host: host, screenID: "phone-b", directory: directory))
+                    host: host, screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c", directory: directory))
         }
         XCTAssertThrowsError(try RelativePointerCalibration.markRequired(screenID: "", directory: directory))
     }
@@ -590,19 +681,24 @@ final class RelativePointerCalibrationTests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let host = UUID()
-        for screen in ["phone-a", "phone-b"] {
+        for screen in ["00008030-001A690E2EC3802E", "8bdbe135bcd781e8215eb391f48b2848608b292c"] {
             try RelativePointerCalibration.markRequired(screenID: screen, directory: directory)
         }
-        try RelativePointerCalibration.clearRequirementAfterAbsoluteProof(screenID: "phone-a", directory: directory)
+        try RelativePointerCalibration.clearRequirementAfterAbsoluteProof(
+            screenID: "00008030-001A690E2EC3802E", directory: directory)
         XCTAssertFalse(
-            RelativePointerCalibration.requiresCalibration(host: host, screenID: "phone-a", directory: directory))
+            RelativePointerCalibration.requiresCalibration(
+                host: host, screenID: "00008030-001A690E2EC3802E", directory: directory))
         XCTAssertTrue(
-            RelativePointerCalibration.requiresCalibration(host: host, screenID: "phone-b", directory: directory))
+            RelativePointerCalibration.requiresCalibration(
+                host: host, screenID: "8bdbe135bcd781e8215eb391f48b2848608b292c", directory: directory))
         let brokenProfile = directory.appendingPathComponent(host.uuidString + ".json")
         try Data("broken".utf8).write(to: brokenProfile)
-        try RelativePointerCalibration.clearRequirementAfterAbsoluteProof(screenID: "phone-a", directory: directory)
+        try RelativePointerCalibration.clearRequirementAfterAbsoluteProof(
+            screenID: "00008030-001A690E2EC3802E", directory: directory)
         XCTAssertEqual(try Data(contentsOf: brokenProfile), Data("broken".utf8))
         XCTAssertTrue(
-            RelativePointerCalibration.requiresCalibration(host: host, screenID: "phone-a", directory: directory))
+            RelativePointerCalibration.requiresCalibration(
+                host: host, screenID: "00008030-001A690E2EC3802E", directory: directory))
     }
 }

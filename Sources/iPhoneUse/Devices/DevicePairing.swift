@@ -16,7 +16,7 @@ enum DeviceBluetoothState: String {
 }
 
 /// The existing USB-device-ID to Bluetooth-host JSON format. Synchronization and
-/// calibration migration belong to DeviceRegistry; this type only reads/writes the file.
+/// association updates belong to DeviceRegistry; this type only reads/writes the file.
 struct DevicePairingStore {
     let file: URL
 

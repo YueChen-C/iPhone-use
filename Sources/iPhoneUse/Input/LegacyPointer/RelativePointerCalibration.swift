@@ -2,10 +2,10 @@ import Foundation
 
 /// Measured physical pixels per relative HID report. This compensates the host's
 /// acceleration curve; it is an estimate, not feedback about the current pointer.
-struct RelativePointerCalibration: Codable {
+struct RelativePointerCalibration: Codable, Equatable {
     let host: UUID
-    /// Stable USB capture identity. Older profiles omit this field and may only
-    /// be loaded for their original host until DeviceRegistry explicitly binds them.
+    /// Physical iPhone UDID. A missing identity is retained for decoding old
+    /// files, but cannot be inferred from a Bluetooth host or a capture UUID.
     let screenID: String?
     let screenWidth: Int
     let screenHeight: Int
@@ -20,6 +20,20 @@ struct RelativePointerCalibration: Codable {
         case radialQuantized
     }
     let vectorModel: VectorModel?
+
+    /// Apple USB UDIDs use 40 hex digits, or 24 hex digits with an optional
+    /// separator after the first eight. Capture UUIDs are not phone identities.
+    static func isDeviceUDID(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let bytes = Array(value.utf8)
+        let digits: [UInt8]
+        switch bytes.count {
+        case 24, 40: digits = bytes
+        case 25 where bytes[8] == 45: digits = Array(bytes.prefix(8) + bytes.suffix(16))
+        default: return false
+        }
+        return digits.allSatisfy { (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }
+    }
 
     init(
         host: UUID, screenWidth: Int, screenHeight: Int, reportInterval: Double,

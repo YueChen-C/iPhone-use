@@ -30,5 +30,13 @@ final class PointerCalibrationJobsTests: XCTestCase {
         jobs.finish(a, failure: nil)
         XCTAssertFalse(jobs.isRunning(screenID: "a"))
         XCTAssertTrue(jobs.isRunning(screenID: "b"))
+        jobs.rejectExisting(b)
+        jobs.finish(b, failure: "interrupted")
+        XCTAssertTrue(jobs.hasRejectedCalibration(b))
+        XCTAssertFalse(jobs.hasRejectedCalibration(a))
+        XCTAssertTrue(jobs.begin(b, retry: true))
+        XCTAssertTrue(jobs.hasRejectedCalibration(b))
+        jobs.finish(b, failure: nil, saved: true)
+        XCTAssertFalse(jobs.hasRejectedCalibration(b))
     }
 }

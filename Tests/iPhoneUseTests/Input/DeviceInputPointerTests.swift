@@ -9,6 +9,94 @@ private func curveStep(_ byte: UInt8) -> Double {
 }
 
 final class DeviceInputPointerTests: XCTestCase {
+    func testReadinessChangeCannotCancelItsOwnStaleCurveRecovery() throws {
+        let phone = AutomaticPointerCalibrationTests.Phone()
+        phone.radial = true
+        let old = RelativePointerCalibration(
+            host: UUID(), screenWidth: phone.width, screenHeight: phone.height, reportInterval: 0.03,
+            distances: (0...32).map { phone.distance($0) * 0.7 }, screenID: "phone", vectorModel: .radialQuantized)
+        var mismatch = false
+        var readinessPublished = false
+        var input: DeviceInput!
+        input = DeviceInput(
+            host: old.host, session: UUID(), calibration: old, sleep: { _ in },
+            reportSender: { id, bytes in
+                XCTAssertEqual(id, .relativeMouse)
+                XCTAssertEqual(bytes[0], 0)
+                if !readinessPublished {
+                    readinessPublished = true
+                    let activity = input.inputActivitySequence
+                    input.cancelPointer(preservingBackgroundMotion: true)
+                    input.invalidatePointerEstimate(preservingBackgroundMotion: true)
+                    XCTAssertEqual(input.inputActivitySequence, activity)
+                }
+                if mismatch {
+                    XCTAssertTrue(input.isPointerReady, "readiness must not change mid-recovery")
+                    if !input.isPointerReady { input.cancelBackgroundMotion() }
+                }
+                phone.send(Int(Int8(bitPattern: bytes[1])), Int(Int8(bitPattern: bytes[2])))
+            }, reportReadiness: { _, _, _ in true })
+        let result = try input.measureRelativePointer(
+            screenID: "phone", size: CGSize(width: phone.width, height: phone.height), reuseExisting: true,
+            isReady: { true }, capture: { phone.frame().pixels }, onMismatch: { mismatch = true })
+        XCTAssertTrue(mismatch)
+        XCTAssertFalse(result.reused)
+        XCTAssertEqual(result.profile.vectorModel, .radialQuantized)
+    }
+
+    func testInterruptedReplacementBlocksRejectedCurveAndKeepsKeyboardAvailable() throws {
+        let phone = AutomaticPointerCalibrationTests.Phone()
+        let old = RelativePointerCalibration(
+            host: UUID(), screenWidth: phone.width, screenHeight: phone.height, reportInterval: 0.03,
+            distances: (0...32).map { phone.distance($0) * 0.7 }, screenID: "phone")
+        var mismatch = false
+        var input: DeviceInput!
+        input = DeviceInput(
+            host: old.host, session: UUID(), calibration: old, sleep: { _ in },
+            reportSender: { id, bytes in
+                if id == .relativeMouse {
+                    phone.send(Int(Int8(bitPattern: bytes[1])), Int(Int8(bitPattern: bytes[2])))
+                    if mismatch { input.cancelBackgroundMotion() }
+                }
+            }, reportReadiness: { _, _, _ in true })
+        XCTAssertThrowsError(
+            try input.measureRelativePointer(
+                screenID: "phone", size: CGSize(width: phone.width, height: phone.height), reuseExisting: true,
+                isReady: { true }, capture: { phone.frame().pixels }, onMismatch: { mismatch = true }))
+        XCTAssertTrue(mismatch)
+        XCTAssertTrue(input.needsCalibration)
+        XCTAssertFalse(input.isPointerReady)
+        XCTAssertTrue(input.isBluetoothReady)
+        XCTAssertEqual(input.calibration, old)
+        XCTAssertThrowsError(try input.tap(x: 0.5, y: 0.5))
+        try input.key("enter", modifiers: [])
+    }
+
+    func testRejectedResponseBlocksCoordinatesButKeepsBluetoothAndKeyboard() throws {
+        var reports: [ReportID] = []
+        let calibration = RelativePointerCalibration(
+            host: UUID(), screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+            distances: [0, 1, 5, 25], screenID: "phone")
+        let input = DeviceInput(
+            host: calibration.host, session: UUID(), calibration: calibration, calibrationRejected: true,
+            sleep: { _ in }, reportSender: { id, _ in reports.append(id) }, reportReadiness: { _, _, _ in true })
+        XCTAssertTrue(input.isBluetoothReady)
+        XCTAssertTrue(input.needsCalibration)
+        XCTAssertFalse(input.isPointerReady)
+        XCTAssertThrowsError(try input.tap(x: 0.5, y: 0.5))
+        try input.key("enter", modifiers: [])
+        XCTAssertEqual(reports, [.keyboard, .keyboard])
+    }
+
+    func testForegroundActivityPreventsRetirementOfMeasuredInput() throws {
+        let input = DeviceInput(host: UUID(), session: UUID(), sleep: { _ in }, reportSender: { _, _ in })
+        let activity = input.inputActivitySequence
+        input.cancelBackgroundMotion()
+        XCTAssertThrowsError(try input.retireForCalibrationReload(ifActivityUnchanged: activity))
+        XCTAssertFalse(input.isRetired)
+        try input.move(x: 0.5, y: 0.5)
+    }
+
     func testCaptureRecheckRetainsBluetoothReadinessButBlocksInputUntilConfirmed() throws {
         var allowed = true
         var reports: [(ReportID, [UInt8])] = []

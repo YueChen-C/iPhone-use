@@ -204,10 +204,10 @@ final class PhoneControlView: NSView {
 
     // MARK: Gesture and shortcut coordination
 
-    func cancelInteraction() {
+    func cancelInteraction(preservingBackgroundMotion: Bool = false) {
         dragging = false
         mousePosition.reset()
-        input?.cancelPointer()
+        input?.cancelPointer(preservingBackgroundMotion: preservingBackgroundMotion)
     }
 
     func performShortcut(_ shortcut: ControlShortcut) {
@@ -370,7 +370,7 @@ final class PhoneControlView: NSView {
             screenPermitsInput: device.map { ScreenCaptureManager.shared.permitsPointerAssociation(for: $0.screen) }
                 ?? false)
         guard connectionStatus != status else { return }
-        cancelInteraction()
+        cancelInteraction(preservingBackgroundMotion: status == .connected)
         if status != .connected { input?.invalidatePointerEstimate() }
         shortcutFeedback = nil
         connectionStatus = status
@@ -382,8 +382,11 @@ final class PhoneControlView: NSView {
         guard ready != pointerReady else { return }
         // Keyboard subscriptions can arrive before the pointer reports. Reset
         // the observed position so readiness triggers fresh positioning.
-        cancelInteraction()
-        if !ready { input?.invalidatePointerEstimate() }
+        // A readiness notification is not user activity. In particular, the
+        // first ready tick must not cancel connection-time curve verification.
+        // Background jobs already check capture/session ownership themselves.
+        cancelInteraction(preservingBackgroundMotion: true)
+        if !ready { input?.invalidatePointerEstimate(preservingBackgroundMotion: true) }
         pointerReady = ready
     }
 
