@@ -52,6 +52,7 @@ final class DeviceInput {
     private let hid = HIDPeripheral.shared
     private let reportReadiness: (ReportID, UUID, UUID?) -> Bool
     private let inputIsAllowed: () -> Bool
+    private let calibrationIsVerified: () -> Bool
     private var buttons: UInt8 = 0
     private let reportSender: (ReportID, [UInt8]) -> Void
     private let sleep: (TimeInterval) -> Void
@@ -93,6 +94,7 @@ final class DeviceInput {
             "filePresent": calibrationFilePresent,
             "loaded": calibration != nil,
             "responseRejected": hasRejectedCalibration,
+            "sessionVerified": calibration == nil || calibrationIsVerified(),
             "mode": mode,
         ]
         if let currentSize {
@@ -136,6 +138,7 @@ final class DeviceInput {
         calibrationRequired: Bool = false,
         calibrationFilePresent: Bool? = nil,
         calibrationRejected: Bool = false,
+        calibrationIsVerified: @escaping () -> Bool = { true },
         screenSize: (() -> CGSize?)? = nil,
         inputIsAllowed: @escaping () -> Bool = { true },
         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
@@ -150,6 +153,7 @@ final class DeviceInput {
         self.calibrationRejected = calibrationRejected
         self.screenSize = screenSize
         self.inputIsAllowed = inputIsAllowed
+        self.calibrationIsVerified = calibrationIsVerified
         self.sleep = sleep
         self.reportReadiness =
             reportReadiness ?? {
@@ -376,7 +380,9 @@ extension DeviceInput {
             defer { clearPointerEstimate() }
             func requireCurrent() throws {
                 guard !self.isRetired, isReady(), self.backgroundSequence.isCurrent(sequence) else {
-                    throw InputError.pairingProbeUnavailable
+                    throw DeviceError(
+                        "pointer measurement interrupted (retired=\(self.isRetired), ready=\(isReady()), activityCurrent=\(self.backgroundSequence.isCurrent(sequence)))"
+                    )
                 }
             }
             try requireCurrent()

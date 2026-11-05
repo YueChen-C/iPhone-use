@@ -9,6 +9,60 @@ private func curveStep(_ byte: UInt8) -> Double {
 }
 
 final class DeviceInputPointerTests: XCTestCase {
+    func testInterruptedSessionVerificationDoesNotDisableSavedCurveOrMouseFollowing() throws {
+        let host = UUID()
+        var verified = false
+        var reports: [ReportID] = []
+        let profile = RelativePointerCalibration(
+            host: host, screenWidth: 750, screenHeight: 1334,
+            reportInterval: 0.03, distances: [0, 1, 10, 100], screenID: "phone")
+        let input = DeviceInput(
+            host: host, session: UUID(), calibration: profile,
+            calibrationIsVerified: { verified }, sleep: { _ in },
+            reportSender: { id, _ in reports.append(id) }, reportReadiness: { _, _, _ in true })
+        XCTAssertTrue(input.isPointerReady)
+        XCTAssertFalse(input.needsCalibration)
+        XCTAssertTrue(input.isBluetoothReady)
+        input.positionPointer(x: 0.4, y: 0.5)
+        try input.nudge(dx: 0, dy: 0, click: false)  // Drain the same queue.
+        XCTAssertTrue(reports.contains(.relativeMouse))
+        verified = true
+        XCTAssertTrue(input.isPointerReady)
+        verified = false
+        XCTAssertTrue(input.isPointerReady, "an interrupted observation must not disable the saved curve")
+        input.rejectCalibration()
+        XCTAssertFalse(input.isPointerReady, "a measured mismatch still blocks incorrect coordinates")
+        XCTAssertThrowsError(try input.move(x: 0.4, y: 0.5))
+        XCTAssertTrue(input.isBluetoothReady)
+    }
+
+    func testRejectedCoordinateInvalidationDoesNotCancelSessionVerification() throws {
+        let phone = AutomaticPointerCalibrationTests.Phone()
+        let profile = RelativePointerCalibration(
+            host: UUID(), screenWidth: phone.width, screenHeight: phone.height, reportInterval: 0.03,
+            distances: (0...32).map { phone.distance($0) }, screenID: "phone")
+        var checked = false
+        var input: DeviceInput!
+        input = DeviceInput(
+            host: profile.host, session: UUID(), calibration: profile,
+            calibrationIsVerified: { false }, sleep: { _ in },
+            reportSender: { id, bytes in
+                if !checked {
+                    checked = true
+                    let activity = input.inputActivitySequence
+                    XCTAssertTrue(input.isPointerReady)
+                    input.invalidatePointerEstimate(preservingBackgroundMotion: true)
+                    XCTAssertEqual(input.inputActivitySequence, activity)
+                }
+                phone.send(Int(Int8(bitPattern: bytes[1])), Int(Int8(bitPattern: bytes[2])))
+            }, reportReadiness: { _, _, _ in true })
+        let result = try input.measureRelativePointer(
+            screenID: "phone", size: CGSize(width: phone.width, height: phone.height), reuseExisting: true,
+            isReady: { true }, capture: { phone.frame().pixels })
+        XCTAssertTrue(checked)
+        XCTAssertTrue(result.reused)
+    }
+
     func testReadinessChangeCannotCancelItsOwnStaleCurveRecovery() throws {
         let phone = AutomaticPointerCalibrationTests.Phone()
         phone.radial = true

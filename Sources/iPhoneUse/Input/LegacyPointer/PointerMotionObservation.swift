@@ -63,7 +63,9 @@ enum PointerMotionObservation {
         return edges.last?.to
     }
 
-    static func motion(from a: Frame, to b: Frame, direction: CGPoint) -> Motion? {
+    static func motion(
+        from a: Frame, to b: Frame, direction: CGPoint, allowingBackgroundAnimation: Bool = false
+    ) -> Motion? {
         guard a.isValid, b.isValid, a.width == b.width, a.height == b.height,
             direction.x.isFinite, direction.y.isFinite, hypot(direction.x, direction.y) > 0
         else { return nil }
@@ -72,6 +74,9 @@ enum PointerMotionObservation {
         var mask = zip(a.pixels, b.pixels).map { abs(Int($0.0) - Int($0.1)) > 12 }
         var blobs: [Blob] = []
         var noise = 0
+        // Calibration still requires a unique pair of intact circular pointers.
+        // A bounded unrelated clock/text animation must not hide that evidence.
+        let noiseLimit = allowingBackgroundAnimation ? max(256, min(10000, width * height / 100)) : 256
         for index in mask.indices where mask[index] {
             mask[index] = false
             var stack = [index]
@@ -105,12 +110,18 @@ enum PointerMotionObservation {
             let blobHeight = maxY - minY + 1
             if area < 20 || min(blobWidth, blobHeight) < 8 {
                 noise += area
-                guard noise <= 256 else { return nil }
+                guard noise <= noiseLimit else { return nil }
                 continue
             }
             let bounds = CGRect(x: minX, y: minY, width: blobWidth, height: blobHeight)
+            let blob = Blob(area: area, bounds: bounds)
+            if allowingBackgroundAnimation && !blob.isPointer {
+                noise += area
+                guard noise <= noiseLimit else { return nil }
+                continue
+            }
             guard minX > 1, minY > 1, maxX < width - 2, maxY < height - 2 else { return nil }
-            blobs.append(Blob(area: area, bounds: bounds))
+            blobs.append(blob)
             guard blobs.count <= 2 else { return nil }
         }
         guard blobs.count == 2, blobs.allSatisfy(\.isPointer),

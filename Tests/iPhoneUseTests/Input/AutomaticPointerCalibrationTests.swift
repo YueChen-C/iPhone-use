@@ -8,6 +8,7 @@ final class AutomaticPointerCalibrationTests: XCTestCase {
         var x = 350.0, y = 340.0
         var verticalScale = 1.0
         var animate = false
+        var animateClock = false
         var radial = false
         var reports = 0
         var captures = 0
@@ -40,7 +41,12 @@ final class AutomaticPointerCalibrationTests: XCTestCase {
                 }
             }
             if animate {
-                for py in 80..<95 {
+                for py in 80..<140 {
+                    for px in 10..<100 { pixels[py * width + px] = captures % 2 == 0 ? 10 : 240 }
+                }
+            }
+            if animateClock {
+                for py in 20..<35 {
                     for px in 10..<40 { pixels[py * width + px] = captures % 2 == 0 ? 10 : 240 }
                 }
             }
@@ -86,6 +92,46 @@ final class AutomaticPointerCalibrationTests: XCTestCase {
         XCTAssertEqual(phone.y, Double(phone.height) * 0.5, accuracy: 3)
     }
 
+    func testMatchingAxisCurveUpgradesOnlyAfterMeasuringDiagonalResponse() throws {
+        let phone = Phone()
+        let existing = profile(phone)
+        phone.radial = true
+        let result = try resolve(
+            phone, existing: existing,
+            onMismatch: { XCTFail("valid axial distances must not be rejected") },
+            progress: { _ in XCTFail("valid axial distances must not be remeasured") })
+
+        XCTAssertFalse(result.reused, "the upgraded model must be persisted")
+        XCTAssertEqual(result.profile.distances, existing.distances)
+        XCTAssertEqual(result.profile.host, existing.host)
+        XCTAssertEqual(result.profile.screenID, existing.screenID)
+        XCTAssertEqual(result.profile.vectorModel, .radialQuantized)
+        XCTAssertEqual(phone.x, Double(phone.width) * 0.4, accuracy: 3)
+        XCTAssertEqual(phone.y, Double(phone.height) * 0.5, accuracy: 3)
+    }
+
+    func testNewRadialCurveDoesNotDowngradeToSingleAxisTracking() throws {
+        let phone = Phone()
+        phone.radial = true
+        let result = try measure(phone)
+
+        XCTAssertEqual(result.vectorModel, .radialQuantized)
+        XCTAssertEqual(phone.x, Double(phone.width) * 0.4, accuracy: 3)
+        XCTAssertEqual(phone.y, Double(phone.height) * 0.5, accuracy: 3)
+    }
+
+    func testMatchingAxisOnlyPhoneKeepsItsVerifiedAxisModel() throws {
+        let phone = Phone()
+        let existing = profile(phone)
+        let result = try resolve(
+            phone, existing: existing,
+            onMismatch: { XCTFail("valid axis-only curve must not be rejected") },
+            progress: { _ in XCTFail("valid curve must not be remeasured") })
+
+        XCTAssertTrue(result.reused)
+        XCTAssertEqual(result.profile, existing)
+    }
+
     func testStaleCurveIsRemeasuredAndKeepsOnlyVerifiedDiagonalTracking() throws {
         let phone = Phone()
         phone.radial = true
@@ -116,6 +162,17 @@ final class AutomaticPointerCalibrationTests: XCTestCase {
         XCTAssertTrue(rejected)
         XCTAssertFalse(result.reused)
         XCTAssertNil(result.profile.vectorModel)
+    }
+
+    func testUnrelatedClockAnimationDoesNotHideStaleCurveOrPreventRecovery() throws {
+        let phone = Phone()
+        phone.radial = true
+        phone.animateClock = true
+        var rejected = false
+        let result = try resolve(phone, existing: profile(phone, scale: 1.4), onMismatch: { rejected = true })
+        XCTAssertTrue(rejected)
+        XCTAssertFalse(result.reused)
+        XCTAssertEqual(result.profile.distances[32], phone.distance(32), accuracy: 0.8)
     }
 
     func testUnobservableScreenDoesNotRejectOrReplaceSavedCurve() {

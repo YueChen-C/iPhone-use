@@ -63,7 +63,7 @@ final class AutomaticPointerCalibration {
         guard try verifyTargets(profile) else {
             throw DeviceError("automatic pointer calibration failed target verification; no profile saved")
         }
-        return profile
+        return try verifyingVectorModel(profile)
     }
 
     struct Resolution {
@@ -83,21 +83,25 @@ final class AutomaticPointerCalibration {
             else { throw unavailable("profile identity, dimensions or report interval") }
             _ = try prepareSamplingArea()
             if try matchesResponse(existing), try verifyTargets(existing) {
-                return Resolution(profile: existing, reused: true)
+                let profile = try verifyingVectorModel(existing)
+                return Resolution(profile: profile, reused: profile == existing)
             }
             onMismatch()
         }
-        var profile = try measure()
-        // Keep smooth combined-axis tracking only after the new curve also
-        // explains diagonal motion. Never inherit the old model blindly.
-        if existing?.vectorModel == .radialQuantized, try matchesDiagonals(profile) {
-            profile = RelativePointerCalibration(
-                host: host, screenWidth: width, screenHeight: height,
-                reportInterval: profile.reportInterval, distances: profile.distances,
-                screenID: screenID, vectorModel: .radialQuantized)
-            guard try verifyTargets(profile) else { throw unavailable("diagonal target verification") }
-        }
-        return Resolution(profile: profile, reused: false)
+        return Resolution(profile: try measure(), reused: false)
+    }
+
+    /// Model selection belongs to measurement, not to the previous file's
+    /// metadata. An axis-only recovery must not permanently disable smooth
+    /// combined reports on a phone whose diagonal response can be verified.
+    private func verifyingVectorModel(_ profile: RelativePointerCalibration) throws -> RelativePointerCalibration {
+        guard profile.vectorModel == nil, try matchesDiagonals(profile) else { return profile }
+        let radial = RelativePointerCalibration(
+            host: host, screenWidth: width, screenHeight: height,
+            reportInterval: profile.reportInterval, distances: profile.distances,
+            screenID: screenID, vectorModel: .radialQuantized)
+        guard try verifyTargets(radial) else { throw unavailable("diagonal target verification") }
+        return radial
     }
 
     private func prepareSamplingArea() throws -> Double {
@@ -135,7 +139,7 @@ final class AutomaticPointerCalibration {
     }
 
     private func matchesResponse(_ profile: RelativePointerCalibration) throws -> Bool {
-        for (count, axis) in [(1, 0), (8, 0), (16, 0), (32, 0), (16, 1)] {
+        for (count, axis) in [(8, 0), (32, 0), (16, 0), (16, 1), (1, 0)] {
             guard count < profile.distances.count else { throw unavailable("profile sampling range") }
             let expected = profile.distances[count]
             guard
@@ -191,18 +195,20 @@ final class AutomaticPointerCalibration {
         let after = try frame()
         try burst(-dx, -dy, reports: reports)
         let returned = try frame()
-        // A clipped burst cannot be retried from a now-incorrect origin.
-        guard let changes = PointerMotionObservation.changedPixels(before, returned) else {
-            throw unavailable("invalid return frame at (\(dx), \(dy)), reports \(reports)")
-        }
-        guard changes <= 256 else {
-            throw unavailable(
-                "screen changed in \(changes) pixels after (\(dx), \(dy)), reports \(reports)")
-        }
-        guard let forward = PointerMotionObservation.motion(from: before, to: after, direction: direction),
+        guard
+            let forward = PointerMotionObservation.motion(
+                from: before, to: after, direction: direction, allowingBackgroundAnimation: true),
             let reverse = PointerMotionObservation.motion(
-                from: after, to: returned, direction: CGPoint(x: -direction.x, y: -direction.y))
-        else { return nil }  // Small overlapping pointers need a longer burst.
+                from: after, to: returned, direction: CGPoint(x: -direction.x, y: -direction.y),
+                allowingBackgroundAnimation: true)
+        else {
+            // Overlap may need a longer burst. An animated/invalid return frame
+            // cannot establish that the pointer returned and must stop sampling.
+            guard let changes = PointerMotionObservation.changedPixels(before, returned), changes <= 256 else {
+                throw unavailable("unobservable return at (\(dx), \(dy)), reports \(reports)")
+            }
+            return nil
+        }
         guard distance(forward.from, reverse.to) <= 2, distance(forward.to, reverse.from) <= 1,
             abs(forward.delta.x * Double(dy) - forward.delta.y * Double(dx)) <= hypot(Double(dx), Double(dy))
         else { throw unavailable("nonrepeatable motion at (\(dx), \(dy))") }
@@ -228,7 +234,8 @@ final class AutomaticPointerCalibration {
             let after = try frame()
             guard
                 let motion = PointerMotionObservation.motion(
-                    from: before, to: after, direction: CGPoint(x: target.x - start.x, y: target.y - start.y)),
+                    from: before, to: after, direction: CGPoint(x: target.x - start.x, y: target.y - start.y),
+                    allowingBackgroundAnimation: true),
                 distance(motion.from, start) <= 2
             else { throw unavailable("target observation") }
             position = motion.to

@@ -52,6 +52,7 @@ final class DeviceRegistry {
     }
     private var inputs: [UUID: CachedInput] = [:]
     private var matchPending = false
+    private var usableScreenRetries: Set<String> = []
     private let matchQueue = DispatchQueue(label: "iphone-use.match")
     /// Accessed only by matchQueue (and its synchronous probe callbacks).
     private var probeSchedule = DevicePairingProbeSchedule()
@@ -72,6 +73,7 @@ final class DeviceRegistry {
     private var backgroundMotionGeneration: UInt64 = 0
     private var probingGeneration: UInt64 = 0
     private var calibrationJobs = PointerCalibrationJobs()
+    private var calibrationRetryTimer: DispatchSourceTimer?
     /// Persisted identities are candidates until motion confirms the physical
     /// phone and Bluetooth session. A continuously present phone retains that
     /// proof across capture remaps; separate capture verification gates input.
@@ -105,7 +107,23 @@ final class DeviceRegistry {
             }
             self?.scheduleMatch()
         }
+        DeviceLockMonitor.shared.onUsableFrameRestored = { [weak self] screenID in
+            self?.scheduleMatch(usableScreenID: screenID)
+            self?.matchQueue.async {
+                guard let self, let device = self.all().first(where: { $0.id == screenID }),
+                    device.host != nil, !self.isAutomaticallyCalibrating(screenID: screenID),
+                    let state = self.lock.withLock({ self.calibrationJobs.status(screenID: screenID) }),
+                    state["state"] as? String == "unavailable"
+                else { return }
+                self.automaticallyCalibrate(device, retry: true)
+            }
+        }
         DeviceLockMonitor.shared.start()
+        let timer = DispatchSource.makeTimerSource(queue: matchQueue)
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in self?.scheduleAutomaticCalibrations() }
+        calibrationRetryTimer = timer
+        timer.resume()
         matchQueue.async { [weak self] in
             self?.syncBluetoothForCurrentScreens(resetExhausted: true)
         }
@@ -330,6 +348,13 @@ final class DeviceRegistry {
             calibrationFilePresent: FileManager.default.fileExists(
                 atPath: RelativePointerCalibration.fileURL(host: host).path),
             calibrationRejected: rejected,
+            calibrationIsVerified: { [weak self] in
+                guard calibration != nil else { return true }
+                guard let self, let screenID, let session else { return false }
+                return self.lock.withLock {
+                    self.calibrationJobs.isVerified(.init(screenID: screenID, host: host, session: session))
+                }
+            },
             screenSize: screenID.map { id in
                 // USB reconnect creates a new ScreenCaptureSession while the
                 // Bluetooth session may remain unchanged.
@@ -372,10 +397,11 @@ final class DeviceRegistry {
         input?.cancelBackgroundMotion()
     }
 
-    /// Check saved curves once per Bluetooth session. Only repeatable observed
+    /// Verify saved curves per Bluetooth session with bounded retries. Only repeatable observed
     /// mismatches may trigger replacement; observation failure preserves files.
     func automaticallyCalibrate(_ device: Device, retry: Bool = false, verifyOnly: Bool = false) {
-        guard RelativePointerCalibration.isDeviceUDID(device.id),
+        guard device.lockState != .suspected, device.lockState != .paused,
+            RelativePointerCalibration.isDeviceUDID(device.id),
             ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen),
             let host = device.host, let size = device.screen.size,
             size.width <= 4096, size.height <= 4096
@@ -411,7 +437,8 @@ final class DeviceRegistry {
             defer {
                 self.lock.withLock {
                     self.calibrationJobs.finish(
-                        identity, failure: failure, profile: verifiedProfile, saved: saved, reused: reused)
+                        identity, failure: failure, profile: verifiedProfile, saved: saved, reused: reused,
+                        userInterrupted: failure != nil && input.inputActivitySequence != activity)
                 }
             }
             let isReady = {
@@ -510,7 +537,7 @@ final class DeviceRegistry {
         guard !isAutomaticallyCalibrating(screenID: device.id) else { throw DeviceInput.InputError.pointerBusy }
         try inputLock.withLock {
             if let cached = inputs[host] { try cached.input.retireForCalibrationReload() }
-            lock.withLock { calibrationJobs.clearRejection(screenID: device.id) }
+            lock.withLock { calibrationJobs.invalidate(screenID: device.id) }
             inputs[host] = nil
         }
     }
@@ -553,14 +580,19 @@ final class DeviceRegistry {
 
     // MARK: Matching
 
-    private func scheduleMatch() {
+    private func scheduleMatch(usableScreenID: String? = nil) {
         let alreadyPending = lock.withLock {
+            if let usableScreenID { usableScreenRetries.insert(usableScreenID) }
             defer { matchPending = true }
             return matchPending
         }
         guard !alreadyPending else { return }
         matchQueue.asyncAfter(deadline: .now() + 1.5) {
-            self.lock.withLock { self.matchPending = false }
+            let usableScreenIDs = self.lock.withLock {
+                self.matchPending = false
+                defer { self.usableScreenRetries.removeAll() }
+                return self.usableScreenRetries
+            }
             let sessions = Dictionary(
                 uniqueKeysWithValues: HIDPeripheral.shared.hostDetails.compactMap { detail in
                     detail.session.map { (detail.host, $0) }
@@ -568,7 +600,10 @@ final class DeviceRegistry {
             if self.identityRetrySchedule.update(sessions) {
                 ScreenCaptureManager.shared.retryIdentityVerification()
             }
-            self.runMatch(force: false, alwaysProbe: false, requireChangedTopology: true)
+            let retryUnmatched = self.all().contains { usableScreenIDs.contains($0.id) && $0.host == nil }
+            if retryUnmatched { log("usable unlocked frame restored; retrying unmatched Bluetooth association") }
+            self.runMatch(
+                force: false, alwaysProbe: false, requireChangedTopology: !retryUnmatched)
         }
     }
 

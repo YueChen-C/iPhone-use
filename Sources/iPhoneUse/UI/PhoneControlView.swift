@@ -130,9 +130,10 @@ final class PhoneControlView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         if !dragging {
-            if canSendPointerInput { preemptBackgroundPointerMotion() }
+            let ready = canSendPointerInput && input?.isPointerReady == true
+            if ready { preemptBackgroundPointerMotion() }
             mousePosition.reset()
-            input?.cancelPointer()
+            input?.cancelPointer(preservingBackgroundMotion: !ready)
         }
     }
 
@@ -441,7 +442,7 @@ final class PhoneControlView: NSView {
         }
         // Hovering a disabled connection overlay cannot steer this phone.
         // Do not let tracking-area events cancel the discovery that enables it.
-        if canSendPointerInput { preemptBackgroundPointerMotion() }
+        if canSendPointerInput && input?.isPointerReady == true { preemptBackgroundPointerMotion() }
         updatePointerReadiness()
         guard canSendPointerInput, activeShortcut == nil, pointerReady, let device,
             let point = normalizedPoint(event.locationInWindow, device: device, clamp: clampToImage)

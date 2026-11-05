@@ -3,6 +3,21 @@ import XCTest
 @testable import iPhoneUse
 
 final class PointerCalibrationJobsTests: XCTestCase {
+    func testForegroundTakeoverStopsAutomaticRetriesUntilExplicitRetryOrNewSession() {
+        var jobs = PointerCalibrationJobs()
+        let id = PointerCalibrationJobs.Identity(screenID: "phone", host: UUID(), session: UUID())
+        XCTAssertTrue(jobs.begin(id, retry: false, now: 0))
+        jobs.finish(id, failure: "interrupted", userInterrupted: true, now: 1)
+        XCTAssertFalse(jobs.status(screenID: "phone")?["automaticRetryPending"] as? Bool ?? true)
+        for now in [4.0, 17.0, 1000.0] {
+            XCTAssertFalse(jobs.begin(id, retry: false, now: now), "background work must not fight the user")
+        }
+        XCTAssertTrue(jobs.begin(id, retry: true, now: 1001))
+        jobs.finish(id, failure: "interrupted", userInterrupted: true, now: 1002)
+        let reconnect = PointerCalibrationJobs.Identity(screenID: id.screenID, host: id.host, session: UUID())
+        XCTAssertTrue(jobs.begin(reconnect, retry: false, now: 1003))
+    }
+
     func testOnlyOneAttemptPerSessionUntilExplicitRetryOrReconnect() {
         var jobs = PointerCalibrationJobs()
         let identity = PointerCalibrationJobs.Identity(screenID: "phone", host: UUID(), session: UUID())
@@ -19,6 +34,56 @@ final class PointerCalibrationJobsTests: XCTestCase {
         XCTAssertTrue(jobs.begin(newSession, retry: false))
         jobs.finish(identity, failure: "stale worker")
         XCTAssertTrue(jobs.isRunning(screenID: "phone"))
+    }
+
+    func testTransientFailuresRetryWithBackoffAndStopAfterThreeAttempts() {
+        var jobs = PointerCalibrationJobs()
+        let id = PointerCalibrationJobs.Identity(screenID: "phone", host: UUID(), session: UUID())
+        XCTAssertFalse(jobs.isVerified(id))
+        XCTAssertTrue(jobs.begin(id, retry: false, now: 0))
+        jobs.finish(id, failure: "animation", now: 1)
+        XCTAssertFalse(jobs.isVerified(id))
+        XCTAssertFalse(jobs.begin(id, retry: false, now: 3))
+        XCTAssertTrue(jobs.begin(id, retry: false, now: 4))
+        jobs.finish(id, failure: "animation", now: 5)
+        XCTAssertFalse(jobs.begin(id, retry: false, now: 16))
+        XCTAssertTrue(jobs.begin(id, retry: false, now: 17))
+        jobs.finish(id, failure: "animation", now: 18)
+        XCTAssertFalse(jobs.begin(id, retry: false, now: 100))
+        XCTAssertTrue(jobs.begin(id, retry: true, now: 100))
+        jobs.finish(id, failure: nil, reused: true, now: 101)
+        XCTAssertTrue(jobs.isVerified(id))
+        XCTAssertFalse(jobs.begin(id, retry: false, now: 200))
+        // A read-only diagnostic must not revoke a curve already verified in this session.
+        XCTAssertTrue(jobs.begin(id, retry: true, now: 201))
+        jobs.finish(id, failure: nil, now: 202)
+        XCTAssertTrue(jobs.isVerified(id))
+        let reconnect = PointerCalibrationJobs.Identity(screenID: id.screenID, host: id.host, session: UUID())
+        XCTAssertFalse(jobs.isVerified(reconnect))
+    }
+
+    func testExplicitReloadCannotInheritVerificationForDifferentProfileContents() {
+        var jobs = PointerCalibrationJobs()
+        let id = PointerCalibrationJobs.Identity(screenID: "phone", host: UUID(), session: UUID())
+        XCTAssertTrue(jobs.begin(id, retry: false))
+        jobs.finish(id, failure: nil, reused: true)
+        XCTAssertTrue(jobs.isVerified(id))
+        jobs.invalidate(screenID: id.screenID)
+        XCTAssertFalse(jobs.isVerified(id))
+        XCTAssertTrue(jobs.begin(id, retry: false))
+    }
+
+    func testMeasuredMismatchSurvivesReconnectUntilSuccessfulReplacement() {
+        var jobs = PointerCalibrationJobs()
+        let id = PointerCalibrationJobs.Identity(screenID: "phone", host: UUID(), session: UUID())
+        XCTAssertTrue(jobs.begin(id, retry: false))
+        jobs.rejectExisting(id)
+        jobs.finish(id, failure: "replacement interrupted")
+        let reconnect = PointerCalibrationJobs.Identity(screenID: id.screenID, host: id.host, session: UUID())
+        XCTAssertTrue(jobs.hasRejectedCalibration(reconnect))
+        XCTAssertTrue(jobs.begin(reconnect, retry: false))
+        jobs.finish(reconnect, failure: nil, saved: true)
+        XCTAssertFalse(jobs.hasRejectedCalibration(reconnect))
     }
 
     func testTwoPhonesCanAdaptIndependently() {
