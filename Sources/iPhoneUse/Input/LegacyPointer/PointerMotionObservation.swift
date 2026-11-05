@@ -42,9 +42,14 @@ enum PointerMotionObservation {
     /// Full-size frames refine a separately matched rectangle's final landing.
     /// Every edge must join the next within two pixels and return to the same
     /// origin. Ambiguous or morphed pointers leave normal homing as the fallback.
-    static func closedRectangleOrigin(_ frames: [Frame]) -> CGPoint? {
+    static func closedRectangleOrigin(
+        _ frames: [Frame], orientation: RelativePointerScreenMatcher.Orientation = .identity
+    ) -> CGPoint? {
         guard frames.count == 5 else { return nil }
-        let directions = [CGPoint(x: 1, y: 0), CGPoint(x: 0, y: 1), CGPoint(x: -1, y: 0), CGPoint(x: 0, y: -1)]
+        let directions = [(1, 0), (0, 1), (-1, 0), (0, -1)].map {
+            let delta = orientation.screenDelta(dx: $0.0, dy: $0.1)
+            return CGPoint(x: delta.dx, y: delta.dy)
+        }
         var edges: [Motion] = []
         for i in directions.indices {
             guard let edge = motion(from: frames[i], to: frames[i + 1], direction: directions[i]),

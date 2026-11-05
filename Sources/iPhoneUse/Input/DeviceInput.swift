@@ -10,6 +10,9 @@ final class DeviceInput {
     private var calibrationRejected: Bool
     var isRetired: Bool { lifecycleLock.withLock { retired } }
     var hasRejectedCalibration: Bool { lifecycleLock.withLock { calibrationRejected } }
+    var pointerOrientation: RelativePointerScreenMatcher.Orientation {
+        lifecycleLock.withLock { relativePointerOrientation }
+    }
 
     func rejectCalibration() {
         lifecycleLock.withLock { calibrationRejected = true }
@@ -63,6 +66,7 @@ final class DeviceInput {
     /// Queue-confined progress lets fresh hover targets share one homing path.
     /// Cancelling the interaction or invalidating its mapping starts a new path.
     private var relativeHomingReportIndex = 0
+    private var relativePointerOrientation: RelativePointerScreenMatcher.Orientation
     private var lastTrackingMovement: RelativePointerCalibration.Movement?
     /// Predicted pointer position in physical pixels while an uncalibrated
     /// drag runs on the relative collection. Nil outside a drag.
@@ -117,6 +121,7 @@ final class DeviceInput {
             "ready": isPointerReady,
             "needsCalibration": needsCalibration,
             "sessionCurrent": isCurrentSession,
+            "relativePointerOrientation": pointerOrientation.rawValue,
             "coordinateMappingAvailable": coordinateMappingAvailable,
             "calibration": calibrationInfo,
         ]
@@ -139,6 +144,7 @@ final class DeviceInput {
         calibrationFilePresent: Bool? = nil,
         calibrationRejected: Bool = false,
         calibrationIsVerified: @escaping () -> Bool = { true },
+        relativePointerOrientation: RelativePointerScreenMatcher.Orientation = .identity,
         screenSize: (() -> CGSize?)? = nil,
         inputIsAllowed: @escaping () -> Bool = { true },
         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
@@ -154,6 +160,7 @@ final class DeviceInput {
         self.screenSize = screenSize
         self.inputIsAllowed = inputIsAllowed
         self.calibrationIsVerified = calibrationIsVerified
+        self.relativePointerOrientation = relativePointerOrientation
         self.sleep = sleep
         self.reportReadiness =
             reportReadiness ?? {
@@ -301,7 +308,8 @@ extension DeviceInput {
                     guard isReady(), backgroundSequence.isCurrent(sequence) else {
                         throw InputError.pairingProbeUnavailable
                     }
-                    relative(dx, dy)
+                    // Discovery observes raw HID axes before applying a transform.
+                    send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 0, dx: dx, dy: dy))
                     pause(step)
                 }
             }
@@ -332,6 +340,15 @@ extension DeviceInput {
                 frames.append(images.map { $0! })
             }
             return frames
+        }
+    }
+
+    /// Adopt only a transform proven by this session's closed discovery path.
+    /// Registry cache rebuilds receive the same proof explicitly; files are unchanged.
+    func adoptRelativePointerOrientation(_ orientation: RelativePointerScreenMatcher.Orientation) {
+        queue.sync {
+            lifecycleLock.withLock { relativePointerOrientation = orientation }
+            clearPointerEstimate()
         }
     }
 
@@ -921,7 +938,8 @@ extension DeviceInput {
     }
 
     fileprivate func relative(_ dx: Int, _ dy: Int) {
-        send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: buttons, dx: dx, dy: dy))
+        let report = relativePointerOrientation.reportDelta(dx: dx, dy: dy)
+        send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: buttons, dx: report.dx, dy: report.dy))
     }
 
     fileprivate func button(down: Bool) {

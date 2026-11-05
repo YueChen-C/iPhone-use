@@ -63,6 +63,7 @@ final class DeviceRegistry {
         var scores: [ObjectIdentifier: Int] = [:]
         var absoluteScreens: Set<ObjectIdentifier> = []
         var results: [ObjectIdentifier: DevicePairingRecovery.ProbeResult] = [:]
+        var orientations: [ObjectIdentifier: RelativePointerScreenMatcher.Orientation] = [:]
         var pointerOrigins: [ObjectIdentifier: (point: CGPoint, activity: UInt64)] = [:]
         var preparedScreens: Set<ObjectIdentifier> = []
     }
@@ -83,6 +84,8 @@ final class DeviceRegistry {
         let session: UUID
     }
     private var verifiedAssociations: Set<Association> = []
+    /// Never persist or carry an HID-to-capture rotation into another session.
+    private var pointerOrientations: [Association: RelativePointerScreenMatcher.Orientation] = [:]
 
     private let pairingStore = DevicePairingStore()
 
@@ -165,12 +168,15 @@ final class DeviceRegistry {
 
     private func buildDevices(from screens: [ScreenCaptureSession]) -> [Device] {
         let sessions = currentHostSessions()
-        let (pairings, verified) = lock.withLock { (self.pairings, self.verifiedAssociations) }
+        let (pairings, verified, orientations) = lock.withLock {
+            (self.pairings, self.verifiedAssociations, self.pointerOrientations)
+        }
         return screens.map { screen in
             let host = pairings[screen.id].flatMap { host -> UUID? in
                 guard ScreenCaptureManager.shared.isCurrent(screen), let session = sessions[host],
                     verified.contains(
-                        Association(screen: screen.associationIdentity, host: host, session: session))
+                        Association(screen: screen.associationIdentity, host: host, session: session)),
+                    orientations[Association(screen: screen.associationIdentity, host: host, session: session)] != nil
                 else { return nil }
                 return host
             }
@@ -301,9 +307,15 @@ final class DeviceRegistry {
             // session cannot replace a newer DeviceInput and split the input queues.
             let session = HIDPeripheral.shared.connectionSession(for: host)
             let screenID = screen?.id
+            let orientation: RelativePointerScreenMatcher.Orientation? = lock.withLock {
+                guard let screen, let session else { return nil }
+                return pointerOrientations[
+                    Association(screen: screen.associationIdentity, host: host, session: session)]
+            }
             if let cached = inputs[host], !cached.input.isRetired,
                 cached.input.session == session, cached.screenID == screenID,
-                cached.screenObject == screen.map(ObjectIdentifier.init)
+                cached.screenObject == screen.map(ObjectIdentifier.init),
+                orientation == nil || cached.input.pointerOrientation == orientation
             {
                 return cached.input
             }
@@ -354,6 +366,11 @@ final class DeviceRegistry {
                 return self.lock.withLock {
                     self.calibrationJobs.isVerified(.init(screenID: screenID, host: host, session: session))
                 }
+            },
+            relativePointerOrientation: lock.withLock {
+                guard let screen, let session else { return .identity }
+                return pointerOrientations[
+                    Association(screen: screen.associationIdentity, host: host, session: session)] ?? .identity
             },
             screenSize: screenID.map { id in
                 // USB reconnect creates a new ScreenCaptureSession while the
@@ -751,7 +768,9 @@ final class DeviceRegistry {
             guard probingMayContinue() else { break }
             guard let host = saved[screen.id], let session = sessions[host] else { continue }
             let key = Association(screen: screen.associationIdentity, host: host, session: session)
-            guard !lock.withLock({ verifiedAssociations.contains(key) }) else { continue }
+            guard !lock.withLock({ verifiedAssociations.contains(key) && pointerOrientations[key] != nil }) else {
+                continue
+            }
             guard let actual = probe(host, among: screens), found[actual.id] == nil else { continue }
             found[actual.id] = host
         }
@@ -1157,7 +1176,10 @@ final class DeviceRegistry {
         if let results = DevicePairingRecovery.absoluteProbeResults(
             verified: screens.map { evidence.absoluteScreens.contains(ObjectIdentifier($0)) })
         {
-            for (screen, result) in zip(screens, results) { evidence.results[ObjectIdentifier(screen)] = result }
+            for (screen, result) in zip(screens, results) {
+                evidence.results[ObjectIdentifier(screen)] = result
+                if result == .hit { evidence.orientations[ObjectIdentifier(screen)] = .identity }
+            }
             probeEvidence[host] = evidence
             log("absolute trajectory matched \(host); relative discovery skipped")
             return evidence
@@ -1189,13 +1211,22 @@ final class DeviceRegistry {
                     screens.allSatisfy({ screen in ScreenCaptureManager.shared.all.contains { $0 === screen } })
                 else { return empty }
                 for (i, screen) in rankedScreens.enumerated() {
-                    let result = DevicePairingRecovery.probeResult(for: captures.map { $0[i] })
+                    let frames = captures.map { $0[i] }
+                    let orientation = RelativePointerScreenMatcher.orientation(frames)
+                    let result =
+                        orientation != nil
+                        ? DevicePairingRecovery.ProbeResult.hit : DevicePairingRecovery.probeResult(for: frames)
+                    evidence.orientations[ObjectIdentifier(screen)] = orientation
                     evidence.results[ObjectIdentifier(screen)] = result
-                    log("relative probe \(host) on \(screen.name): \(result), prepared=\(preparePosition)")
+                    log(
+                        "relative probe \(host) on \(screen.name): \(result), prepared=\(preparePosition), orientation=\(orientation?.rawValue ?? "unknown")"
+                    )
                 }
                 if evidence.results.values.filter({ $0 == .hit }).count == 1 {
                     if let originScreen, evidence.results[ObjectIdentifier(originScreen)] == .hit,
-                        let origin = PointerMotionObservation.closedRectangleOrigin(originFrames)
+                        let orientation = evidence.orientations[ObjectIdentifier(originScreen)],
+                        let origin = PointerMotionObservation.closedRectangleOrigin(
+                            originFrames, orientation: orientation)
                     {
                         evidence.pointerOrigins[ObjectIdentifier(originScreen)] = (origin, sequence)
                     }
@@ -1232,6 +1263,8 @@ final class DeviceRegistry {
         let hasProfile =
             RelativePointerCalibration.loadMatchingScreen(host: input.host, screenSize: nil, screenID: screen.id) != nil
         let absoluteVerified = evidence.absoluteScreens.contains(key)
+        guard let orientation = evidence.orientations[key] else { return false }
+        input.adoptRelativePointerOrientation(orientation)
         if let origin = evidence.pointerOrigins[key],
             input.adoptObservedPointerOrigin(origin.point, screenID: screen.id, activity: origin.activity)
         {
@@ -1313,9 +1346,14 @@ final class DeviceRegistry {
                 for (other, existing) in pairings where existing == host { pairings[other] = nil }
                 pairings[id] = host
                 if motionVerified, let screen = screens.first(where: { $0.id == id }), let session = sessions[host] {
-                    verifiedAssociations.insert(
-                        Association(screen: screen.associationIdentity, host: host, session: session))
+                    let association = Association(screen: screen.associationIdentity, host: host, session: session)
+                    verifiedAssociations.insert(association)
+                    pointerOrientations[association] = probeEvidence[host]?.orientations[ObjectIdentifier(screen)]
                 }
+            }
+            pointerOrientations = pointerOrientations.filter { association, _ in
+                verifiedAssociations.contains(association) && sessions[association.host] == association.session
+                    && screens.contains { $0.associationIdentity == association.screen }
             }
             pairingStore.save(pairings)
             return true

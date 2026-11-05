@@ -9,6 +9,101 @@ private func curveStep(_ byte: UInt8) -> Double {
 }
 
 final class DeviceInputPointerTests: XCTestCase {
+    func testVerifiedRotationCorrectsHomingTrackingAndSurvivesRawRediscovery() throws {
+        for orientation in RelativePointerScreenMatcher.Orientation.allCases {
+            let profile = RelativePointerCalibration(
+                host: UUID(), screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+                distances: [0, 1, 10, 100], screenID: "phone")
+            var position = CGPoint(x: 320, y: 640)
+            var reports: [[UInt8]] = []
+            var rediscovering = false
+            let input = DeviceInput(
+                host: profile.host, session: UUID(), calibration: profile,
+                relativePointerOrientation: orientation, sleep: { _ in },
+                reportSender: { id, bytes in
+                    XCTAssertEqual(id, .relativeMouse)
+                    reports.append(bytes)
+                    if rediscovering { return }
+                    let report = orientation.screenDelta(
+                        dx: Int(Int8(bitPattern: bytes[1])), dy: Int(Int8(bitPattern: bytes[2])))
+                    func distance(_ count: Int) -> Double {
+                        Double(count.signum()) * profile.distances[abs(count)]
+                    }
+                    position.x = min(749, max(0, position.x + distance(report.dx)))
+                    position.y = min(1333, max(0, position.y + distance(report.dy)))
+                }, reportReadiness: { _, _, _ in true })
+            try input.move(x: 0.4, y: 0.5)
+            XCTAssertEqual(position.x, 300, accuracy: 0.5)
+            XCTAssertEqual(position.y, 667, accuracy: 0.5)
+            input.positionPointer(x: 0.6, y: 0.6)
+            try input.nudge(dx: 0, dy: 0, click: false)
+            XCTAssertEqual(position.x, 450, accuracy: 0.5)
+            XCTAssertEqual(position.y, 800.4, accuracy: 0.5)
+            XCTAssertEqual(input.pointerStatus["relativePointerOrientation"] as? String, orientation.rawValue)
+            XCTAssertTrue(reports.allSatisfy { $0[0] == 0 })
+
+            // Discovery must always use raw reports, not apply the last transform
+            // twice when a reconnect/rotation requires another proof.
+            reports.removeAll()
+            rediscovering = true
+            _ = try input.relativePairingProbe(preparePosition: false, isReady: { true }, capture: { [[0]] })
+            XCTAssertEqual(reports[0], [0, 248, 0, 0])
+            XCTAssertEqual(reports[1], [0, 8, 0, 0])
+        }
+    }
+
+    func testRotatedSessionVerificationReusesCurveWithoutTreatingOrientationAsGainMismatch() throws {
+        let phone = AutomaticPointerCalibrationTests.Phone()
+        phone.radial = true
+        let profile = RelativePointerCalibration(
+            host: UUID(), screenWidth: phone.width, screenHeight: phone.height, reportInterval: 0.03,
+            distances: (0...32).map { phone.distance($0) }, screenID: "phone", vectorModel: .radialQuantized)
+        let orientation = RelativePointerScreenMatcher.Orientation.counterclockwise
+        let input = DeviceInput(
+            host: profile.host, session: UUID(), calibration: profile,
+            relativePointerOrientation: orientation, sleep: { _ in },
+            reportSender: { id, bytes in
+                XCTAssertEqual(id, .relativeMouse)
+                XCTAssertEqual(bytes[0], 0)
+                let delta = orientation.screenDelta(
+                    dx: Int(Int8(bitPattern: bytes[1])), dy: Int(Int8(bitPattern: bytes[2])))
+                phone.send(delta.dx, delta.dy)
+            }, reportReadiness: { _, _, _ in true })
+        let result = try input.measureRelativePointer(
+            screenID: "phone", size: CGSize(width: phone.width, height: phone.height), reuseExisting: true,
+            isReady: { true }, capture: { phone.frame().pixels },
+            onMismatch: { XCTFail("a session rotation must not invalidate the gain curve") })
+        XCTAssertTrue(result.reused)
+        XCTAssertEqual(result.profile, profile)
+    }
+
+    func testRotationAdoptionInvalidatesOldEstimateWithoutChangingCurve() throws {
+        let profile = RelativePointerCalibration(
+            host: UUID(), screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+            distances: [0, 1, 10, 100], screenID: "phone")
+        var rotation = RelativePointerScreenMatcher.Orientation.identity
+        var position = CGPoint(x: 100, y: 300)
+        let input = DeviceInput(
+            host: profile.host, session: UUID(), calibration: profile, sleep: { _ in },
+            reportSender: { _, bytes in
+                let delta = rotation.screenDelta(
+                    dx: Int(Int8(bitPattern: bytes[1])), dy: Int(Int8(bitPattern: bytes[2])))
+                func step(_ n: Int) -> Double { Double(n.signum()) * profile.distances[abs(n)] }
+                position.x = min(749, max(0, position.x + step(delta.dx)))
+                position.y = min(1333, max(0, position.y + step(delta.dy)))
+            }, reportReadiness: { _, _, _ in true })
+        try input.move(x: 0.4, y: 0.5)
+        rotation = .counterclockwise
+        input.adoptRelativePointerOrientation(rotation)
+        try input.move(x: 0.6, y: 0.6)
+        XCTAssertEqual(position.x, 450, accuracy: 0.5)
+        XCTAssertEqual(position.y, 800.4, accuracy: 0.5)
+        XCTAssertEqual(input.calibration, profile)
+        // A new BLE session must not inherit another session's transform.
+        let fresh = DeviceInput(host: profile.host, session: UUID(), calibration: profile)
+        XCTAssertEqual(fresh.pointerOrientation, .identity)
+    }
+
     func testConfirmedBadCurveMustStayBlockedUntilReplacementIsPublished() throws {
         let phone = AutomaticPointerCalibrationTests.Phone()
         let old = RelativePointerCalibration(
