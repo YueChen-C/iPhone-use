@@ -95,13 +95,23 @@ final class AutomaticPointerCalibration {
     /// metadata. An axis-only recovery must not permanently disable smooth
     /// combined reports on a phone whose diagonal response can be verified.
     private func verifyingVectorModel(_ profile: RelativePointerCalibration) throws -> RelativePointerCalibration {
-        guard profile.vectorModel == nil, try matchesDiagonals(profile) else { return profile }
-        let radial = RelativePointerCalibration(
-            host: host, screenWidth: width, screenHeight: height,
-            reportInterval: profile.reportInterval, distances: profile.distances,
-            screenID: screenID, vectorModel: .radialQuantized)
-        guard try verifyTargets(radial) else { throw unavailable("diagonal target verification") }
-        return radial
+        guard profile.vectorModel == nil else { return profile }
+        do {
+            guard try matchesDiagonals(profile) else { return profile }
+            let radial = RelativePointerCalibration(
+                host: host, screenWidth: width, screenHeight: height,
+                reportInterval: profile.reportInterval, distances: profile.distances,
+                screenID: screenID, vectorModel: .radialQuantized)
+            if try verifyTargets(radial) { return radial }
+        } catch is ObservationError {
+            // Only local observation failures are recoverable here. Transport,
+            // cancellation and session errors from send/capture must propagate.
+        }
+        // Optional probing may have lost the origin or moved under a different
+        // model. Re-establish it and prove axis landings again before fallback.
+        _ = try prepareSamplingArea()
+        guard try verifyTargets(profile) else { throw unavailable("axis fallback target verification") }
+        return profile
     }
 
     private func prepareSamplingArea() throws -> Double {
@@ -159,7 +169,7 @@ final class AutomaticPointerCalibration {
             let gain = profile.distances[count] / Double(count)
             let expected = CGPoint(x: gain * Double(dx), y: gain * Double(dy))
             let reports = max(1, min(256, Int(ceil(48 / max(expected.x, expected.y)))))
-            guard let measured = try sample(dx: dx, dy: dy, reports: reports) else {
+            guard let measured = try sample(dx: dx, dy: dy, reports: reports, requiringParallelMotion: false) else {
                 throw unavailable("diagonal response")
             }
             if abs(measured.x - expected.x) > max(0.75, expected.x * 0.05)
@@ -188,7 +198,9 @@ final class AutomaticPointerCalibration {
         return axis == 0 ? delta.x : delta.y
     }
 
-    private func sample(dx: Int, dy: Int, reports: Int) throws -> CGPoint? {
+    private func sample(
+        dx: Int, dy: Int, reports: Int, requiringParallelMotion: Bool = true
+    ) throws -> CGPoint? {
         let before = try frame()
         let direction = CGPoint(x: dx, y: dy)
         try burst(dx, dy, reports: reports)
@@ -210,7 +222,8 @@ final class AutomaticPointerCalibration {
             return nil
         }
         guard distance(forward.from, reverse.to) <= 2, distance(forward.to, reverse.from) <= 1,
-            abs(forward.delta.x * Double(dy) - forward.delta.y * Double(dx)) <= hypot(Double(dx), Double(dy))
+            !requiringParallelMotion
+                || abs(forward.delta.x * Double(dy) - forward.delta.y * Double(dx)) <= hypot(Double(dx), Double(dy))
         else { throw unavailable("nonrepeatable motion at (\(dx), \(dy))") }
         position = reverse.to
         return CGPoint(
@@ -246,7 +259,14 @@ final class AutomaticPointerCalibration {
 
     private func distance(_ a: CGPoint, _ b: CGPoint) -> Double { hypot(a.x - b.x, a.y - b.y) }
 
-    private func unavailable(_ reason: String = "pointer observation") -> DeviceError {
-        DeviceError("cannot observe repeatable pointer motion in USB frames (\(reason)); no profile saved")
+    private struct ObservationError: Error, CustomStringConvertible {
+        let reason: String
+        var description: String {
+            "cannot observe repeatable pointer motion in USB frames (\(reason)); no profile saved"
+        }
+    }
+
+    private func unavailable(_ reason: String = "pointer observation") -> ObservationError {
+        ObservationError(reason: reason)
     }
 }

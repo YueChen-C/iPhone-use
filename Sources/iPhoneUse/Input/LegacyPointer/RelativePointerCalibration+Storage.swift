@@ -47,7 +47,24 @@ extension RelativePointerCalibration {
 
     static func storageSnapshot(host: UUID, screenID: String, directory: URL? = nil) throws -> StorageSnapshot {
         let root = directory ?? directoryURL
-        let urls = [screenFileURL(screenID: screenID, directory: root), fileURL(host: host, directory: root)]
+        let template = screenFileURL(screenID: screenID, directory: root)
+        let destination = fileURL(host: host, directory: root)
+        var urls = [template, destination]
+        if !FileManager.default.fileExists(atPath: template.path),
+            FileManager.default.fileExists(atPath: root.path)
+        {
+            // Without an authoritative template, resolution depends on all
+            // valid historical candidates, including duplicates and conflicts.
+            let history = try FileManager.default.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+            urls += history.filter { url in
+                guard url.pathExtension.lowercased() == "json",
+                    let owner = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                    let profile = hostProfile(host: owner, directory: root)
+                else { return false }
+                return profile.screenID == screenID && url != destination
+            }.sorted { $0.path < $1.path }
+        }
         return StorageSnapshot(
             urls: urls,
             contents: try urls.map { url in

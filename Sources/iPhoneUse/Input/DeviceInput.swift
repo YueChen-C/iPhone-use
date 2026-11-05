@@ -410,7 +410,15 @@ extension DeviceInput {
                         onMismatch()
                     }
                     try requireCurrent()
-                    if result.reused { self.lifecycleLock.withLock { self.calibrationRejected = false } }
+                    // Publish rejection before releasing this queue: a waiting
+                    // click must not use the old curve during registry publication.
+                    self.lifecycleLock.withLock {
+                        if result.reused {
+                            self.calibrationRejected = false
+                        } else if rejected {
+                            self.calibrationRejected = true
+                        }
+                    }
                     return result
                 } catch {
                     // Publishing a readiness change while reports are still

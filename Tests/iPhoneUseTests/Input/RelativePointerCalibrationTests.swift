@@ -3,6 +3,125 @@ import XCTest
 @testable import iPhoneUse
 
 final class RelativePointerCalibrationTests: XCTestCase {
+    func testSuccessfulReuseStillDetectsHistoricalSourceChangedDuringObservation() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let phone = AutomaticPointerCalibrationTests.Phone()
+        let screenID = "00008020-0000000000000003"
+        let source = RelativePointerCalibration(
+            host: UUID(), screenWidth: phone.width, screenHeight: phone.height, reportInterval: 0.03,
+            distances: (0...32).map { phone.distance($0) }, screenID: screenID)
+        try save(source, in: directory)
+        let host = UUID()
+        let loaded = try XCTUnwrap(
+            RelativePointerCalibration.loadMatchingScreen(
+                host: host, screenSize: nil, screenID: screenID, directory: directory))
+        let snapshot = try RelativePointerCalibration.storageSnapshot(
+            host: host, screenID: screenID, directory: directory)
+        var changed = false
+        let newer = RelativePointerCalibration(
+            host: source.host, screenWidth: phone.width, screenHeight: phone.height, reportInterval: 0.03,
+            distances: source.distances.map { $0 * 1.2 }, screenID: screenID)
+        let runner = AutomaticPointerCalibration(
+            host: host, screenID: screenID, width: phone.width, height: phone.height,
+            send: phone.send,
+            capture: {
+                if !changed {
+                    changed = true
+                    try self.save(newer, in: directory)
+                }
+                return phone.frame()
+            })
+        let result = try runner.resolve(existing: loaded)
+        XCTAssertTrue(result.reused)
+        XCTAssertNotEqual(
+            snapshot,
+            try RelativePointerCalibration.storageSnapshot(host: host, screenID: screenID, directory: directory))
+        XCTAssertThrowsError(try result.profile.saveVerified(directory: directory, ifUnchanged: snapshot))
+        XCTAssertEqual(
+            RelativePointerCalibration.loadMatchingScreen(
+                host: host, screenSize: nil, screenID: screenID, directory: directory)?.distances,
+            newer.distances)
+    }
+
+    func testHistoricalSnapshotDetectsCandidateChangesAndIgnoresOtherPhones() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let screenID = "00008020-0000000000000003"
+        let source = RelativePointerCalibration(
+            host: UUID(), screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+            distances: (0...32).map { Double($0 * $0) }, screenID: screenID)
+        try save(source, in: directory)
+        let host = UUID()
+        let snapshot = try RelativePointerCalibration.storageSnapshot(
+            host: host, screenID: screenID, directory: directory)
+        XCTAssertEqual(
+            snapshot,
+            try RelativePointerCalibration.storageSnapshot(host: host, screenID: screenID, directory: directory))
+        let other = RelativePointerCalibration(
+            host: UUID(), screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+            distances: source.distances, screenID: "00008020-0000000000000004")
+        try save(other, in: directory)
+        XCTAssertEqual(
+            snapshot,
+            try RelativePointerCalibration.storageSnapshot(host: host, screenID: screenID, directory: directory))
+
+        for conflict in [false, true] {
+            let added = RelativePointerCalibration(
+                host: UUID(), screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+                distances: source.distances.map { $0 * (conflict ? 1.5 : 1) }, screenID: screenID)
+            try save(added, in: directory)
+            XCTAssertNotEqual(
+                snapshot,
+                try RelativePointerCalibration.storageSnapshot(host: host, screenID: screenID, directory: directory))
+            XCTAssertThrowsError(try source.saveVerified(directory: directory, ifUnchanged: snapshot))
+            try FileManager.default.removeItem(at: directory.appendingPathComponent(added.host.uuidString + ".json"))
+        }
+        let sourceURL = directory.appendingPathComponent(source.host.uuidString + ".json")
+        try FileManager.default.removeItem(at: sourceURL)
+        XCTAssertNotEqual(
+            snapshot,
+            try RelativePointerCalibration.storageSnapshot(host: host, screenID: screenID, directory: directory))
+        XCTAssertThrowsError(try source.saveVerified(directory: directory, ifUnchanged: snapshot))
+    }
+
+    func testChangedHistoricalSourceMustPreventAutomaticReplacement() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let oldHost = UUID()
+        let newHost = UUID()
+        let historical = RelativePointerCalibration(
+            host: oldHost, screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+            distances: [0, 1, 5, 25], screenID: "00008030-001A690E2EC3802E")
+        let historyURL = root.appendingPathComponent(oldHost.uuidString + ".json")
+        try JSONEncoder().encode(historical).write(to: historyURL)
+        let loaded = try XCTUnwrap(
+            RelativePointerCalibration.loadMatchingScreen(
+                host: newHost, screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: root))
+        let snapshot = try RelativePointerCalibration.storageSnapshot(
+            host: newHost, screenID: "00008030-001A690E2EC3802E", directory: root)
+        // Another calibration tool updates the historical file supplying this route's curve.
+        let newer = RelativePointerCalibration(
+            host: oldHost, screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+            distances: [0, 2, 8, 30], screenID: "00008030-001A690E2EC3802E")
+        try JSONEncoder().encode(newer).write(to: historyURL, options: .atomic)
+        let after = try RelativePointerCalibration.storageSnapshot(
+            host: newHost, screenID: "00008030-001A690E2EC3802E", directory: root)
+        print(
+            "REVIEW HISTORY changedSource=\(loaded.distances != newer.distances) snapshotChanged=\(snapshot != after)")
+        XCTAssertNotEqual(snapshot, after, "A changed source curve must invalidate the measurement snapshot")
+        let replacement = RelativePointerCalibration(
+            host: newHost, screenWidth: 750, screenHeight: 1334, reportInterval: 0.03,
+            distances: [0, 3, 9, 35], screenID: "00008030-001A690E2EC3802E")
+        XCTAssertThrowsError(try replacement.saveVerified(directory: root, ifUnchanged: snapshot))
+        let selected = try XCTUnwrap(
+            RelativePointerCalibration.loadMatchingScreen(
+                host: newHost, screenSize: nil, screenID: "00008030-001A690E2EC3802E", directory: root))
+        print("REVIEW HISTORY newer=\(newer.distances) selected=\(selected.distances)")
+        XCTAssertEqual(selected.distances, newer.distances, "Do not shadow the concurrent update with this measurement")
+    }
+
     func testAutomaticReplacementPreservesAProfileInstalledDuringMeasurement() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

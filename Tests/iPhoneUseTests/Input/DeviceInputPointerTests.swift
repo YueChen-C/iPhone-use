@@ -9,6 +9,41 @@ private func curveStep(_ byte: UInt8) -> Double {
 }
 
 final class DeviceInputPointerTests: XCTestCase {
+    func testConfirmedBadCurveMustStayBlockedUntilReplacementIsPublished() throws {
+        let phone = AutomaticPointerCalibrationTests.Phone()
+        let old = RelativePointerCalibration(
+            host: UUID(), screenWidth: phone.width, screenHeight: phone.height,
+            reportInterval: 0.03, distances: (0...32).map { phone.distance($0) * 0.7 },
+            screenID: "00008030-001A690E2EC3802E")
+        var mismatch = false
+        var clicked: CGPoint?
+        var input: DeviceInput!
+        input = DeviceInput(
+            host: old.host, session: UUID(), calibration: old, sleep: { _ in },
+            reportSender: { id, bytes in
+                guard id == .relativeMouse else { return }
+                phone.send(Int(Int8(bitPattern: bytes[1])), Int(Int8(bitPattern: bytes[2])))
+                if bytes[0] == 1 { clicked = CGPoint(x: phone.x, y: phone.y) }
+            }, reportReadiness: { _, _, _ in true })
+        let resolution = try input.measureRelativePointer(
+            screenID: "00008030-001A690E2EC3802E", size: CGSize(width: phone.width, height: phone.height),
+            reuseExisting: true,
+            isReady: { true }, capture: { phone.frame().pixels }, onMismatch: { mismatch = true })
+        // Foreground input arrives while the registry checks files before retiring/publishing.
+        print("REVIEW SAVE WINDOW rejected=\(mismatch) reused=\(resolution.reused) oldReady=\(input.isPointerReady)")
+        XCTAssertTrue(mismatch)
+        XCTAssertFalse(resolution.reused)
+        XCTAssertFalse(
+            input.isPointerReady, "A proven-bad old curve must not become available before replacement publication")
+        let activity = input.inputActivitySequence
+        XCTAssertThrowsError(try input.tap(x: 0.5, y: 0.5, hold: 0))
+        print(
+            "REVIEW SAVE WINDOW requested=(\(Double(phone.width) * 0.5),\(Double(phone.height) * 0.5)) clicked=\(String(describing: clicked))"
+        )
+        XCTAssertNil(clicked, "Do not click using the curve which measurement just rejected")
+        XCTAssertThrowsError(try input.retireForCalibrationReload(ifActivityUnchanged: activity))
+    }
+
     func testInterruptedSessionVerificationDoesNotDisableSavedCurveOrMouseFollowing() throws {
         let host = UUID()
         var verified = false

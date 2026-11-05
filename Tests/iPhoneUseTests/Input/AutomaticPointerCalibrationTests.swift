@@ -78,6 +78,30 @@ final class AutomaticPointerCalibrationTests: XCTestCase {
         ).resolve(existing: existing, onMismatch: onMismatch)
     }
 
+    func testValidAxisCurveSurvivesUnsupportedDiagonalModel() throws {
+        let phone = AutomaticPointerCalibrationTests.Phone()
+        func step(_ count: Int) -> Double {
+            let n = Double(abs(count))
+            let excess = max(0, n - 10)
+            return (0.8 * n + 0.04 * excess * excess) * Double(count.signum())
+        }
+        let runner = AutomaticPointerCalibration(
+            host: UUID(), screenID: "00008030-001A690E2EC3802E", width: phone.width, height: phone.height,
+            send: { dx, dy in
+                phone.x = max(0, min(Double(phone.width - 1), phone.x + step(dx)))
+                phone.y = max(0, min(Double(phone.height - 1), phone.y + step(dy)))
+            }, capture: phone.frame)
+        do {
+            let profile = try runner.measure()
+            print("REVIEW AXIS curve32=\(profile.distances[32]) vector=\(String(describing: profile.vectorModel))")
+            XCTAssertEqual(profile.distances[32], step(32), accuracy: 0.5)
+            XCTAssertNil(profile.vectorModel)
+        } catch {
+            print("REVIEW AXIS noProfile error=\(error)")
+            XCTFail("Verified axial calibration must survive unsupported optional diagonal gain: \(error)")
+        }
+    }
+
     func testMatchingSavedCurveIsReusedWithoutMeasuringAllCounts() throws {
         let phone = Phone()
         phone.radial = true
@@ -130,6 +154,102 @@ final class AutomaticPointerCalibrationTests: XCTestCase {
 
         XCTAssertTrue(result.reused)
         XCTAssertEqual(result.profile, existing)
+    }
+
+    func testUnobservableOptionalDiagonalRechecksAndKeepsVerifiedAxisCurve() throws {
+        let phone = Phone()
+        let existing = profile(phone)
+        phone.radial = true
+        var diagonal = false
+        var obscured = false
+        let runner = AutomaticPointerCalibration(
+            host: existing.host, screenID: "phone", width: phone.width, height: phone.height,
+            send: { dx, dy in
+                if dx != 0 && dy != 0 { diagonal = true }
+                phone.send(dx, dy)
+            },
+            capture: {
+                if diagonal && !obscured {
+                    obscured = true
+                    return .init(
+                        width: phone.width, height: phone.height,
+                        pixels: [UInt8](repeating: 240, count: phone.width * phone.height))
+                }
+                return phone.frame()
+            })
+        let result = try runner.resolve(existing: existing)
+        XCTAssertTrue(obscured)
+        XCTAssertTrue(result.reused)
+        XCTAssertEqual(result.profile, existing)
+        XCTAssertEqual(phone.x, Double(phone.width) * 0.4, accuracy: 3)
+        XCTAssertEqual(phone.y, Double(phone.height) * 0.5, accuracy: 3)
+    }
+
+    func testOptionalDiagonalDoesNotSwallowCancellationOrSessionLoss() {
+        for failInCapture in [false, true] {
+            let phone = Phone()
+            let existing = profile(phone)
+            phone.radial = true
+            var diagonal = false
+            var reportsAtFailure: Int?
+            let runner = AutomaticPointerCalibration(
+                host: existing.host, screenID: "phone", width: phone.width, height: phone.height,
+                send: { dx, dy in
+                    if dx != 0 && dy != 0 {
+                        diagonal = true
+                        if !failInCapture {
+                            reportsAtFailure = phone.reports
+                            throw DeviceError("cancelled diagonal report")
+                        }
+                    }
+                    phone.send(dx, dy)
+                },
+                capture: {
+                    if diagonal && failInCapture {
+                        reportsAtFailure = phone.reports
+                        throw DeviceError("lost session during diagonal capture")
+                    }
+                    return phone.frame()
+                })
+            XCTAssertThrowsError(try runner.resolve(existing: existing)) { error in
+                XCTAssertTrue(String(describing: error).contains(failInCapture ? "lost session" : "cancelled"))
+            }
+            XCTAssertNotNil(reportsAtFailure)
+            XCTAssertEqual(phone.reports, reportsAtFailure, "fallback must not send reports after cancellation")
+        }
+    }
+
+    func testFailedRadialLandingsRecheckAxisModelBeforeFallback() throws {
+        let phone = Phone()
+        let existing = profile(phone)
+        phone.radial = true
+        var lastReport = (0, 0)
+        var testingRadialTargets = false
+        var fallbackStarted = false
+        let runner = AutomaticPointerCalibration(
+            host: existing.host, screenID: "phone", width: phone.width, height: phone.height,
+            send: { dx, dy in
+                lastReport = (dx, dy)
+                if testingRadialTargets && dx == -127 { fallbackStarted = true }
+                let before = CGPoint(x: phone.x, y: phone.y)
+                phone.send(dx, dy)
+                if testingRadialTargets && !fallbackStarted && dx != 0 && dy != 0 {
+                    phone.x = before.x + (phone.x - before.x) * 1.3
+                    phone.y = before.y + (phone.y - before.y) * 1.3
+                }
+            },
+            capture: {
+                let frame = phone.frame()
+                if lastReport == (-12, -16) { testingRadialTargets = true }
+                return frame
+            })
+        let result = try runner.resolve(existing: existing)
+        XCTAssertTrue(testingRadialTargets)
+        XCTAssertTrue(fallbackStarted)
+        XCTAssertTrue(result.reused)
+        XCTAssertEqual(result.profile, existing)
+        XCTAssertEqual(phone.x, Double(phone.width) * 0.4, accuracy: 3)
+        XCTAssertEqual(phone.y, Double(phone.height) * 0.5, accuracy: 3)
     }
 
     func testStaleCurveIsRemeasuredAndKeepsOnlyVerifiedDiagonalTracking() throws {
