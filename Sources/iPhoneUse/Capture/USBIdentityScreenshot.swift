@@ -35,7 +35,10 @@ enum USBIdentityScreenshot {
             executable: executable, arguments: [workerArgument, physicalID, output.path],
             timeout: 8, diagnostic: handle)
         if status == unavailableExitCode {
-            log("capture identity screenshot unavailable for \(physicalID): native service unavailable")
+            let detail = (try? String(contentsOf: diagnostic, encoding: .utf8)) ?? ""
+            log(
+                "capture identity screenshot unavailable for \(physicalID): \(detail.trimmingCharacters(in: .whitespacesAndNewlines))"
+            )
             return .unavailable
         }
         guard status == 0,
@@ -217,7 +220,10 @@ private final class NativeUSBDeviceServices {
         let code = startService(device, "com.apple.mobile.screenshotr" as CFString, nil, &connection)
         // kAMDInvalidServiceError means this phone does not expose screenshotr.
         // Trust/lock/transport failures must not be treated as missing capability.
-        if USBIdentityScreenshot.screenshotServiceIsUnavailable(code) { throw Failure.unavailable }
+        if USBIdentityScreenshot.screenshotServiceIsUnavailable(code) {
+            log("native USB screenshot service not offered: code=\(String(UInt32(bitPattern: code), radix: 16))")
+            throw Failure.unavailable
+        }
         try check(code, "start screenshot service")
         guard let connection else { throw Failure.invalidReply }
         defer {

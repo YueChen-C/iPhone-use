@@ -4,6 +4,32 @@ import XCTest
 @testable import iPhoneUse
 
 final class CaptureIdentityMatcherTests: XCTestCase {
+    func testSparseIndependentScreenshotRequiresCompleteUniqueAspectAndCloseImageMatch() {
+        var pixels = [UInt8](repeating: 245, count: CaptureIdentityImage.width * CaptureIdentityImage.height * 3)
+        for i in 0..<(40 * 3) { pixels[i] = 180 }
+        let sparse = CaptureIdentityImage(aspectRatio: 0.56, pixels: pixels)
+        let other = CaptureIdentityImage(aspectRatio: 0.46, pixels: signature().pixels)
+        XCTAssertFalse(sparse.isInformative)
+        XCTAssertTrue(sparse.hasVisibleContent)
+        XCTAssertEqual(
+            CaptureIdentityMatcher.verifiedMappings(
+                physicalIDs: ["a", "b"], physical: ["a": sparse],
+                sources: ["b": sparse, "a": other], unavailable: ["b"]), ["a": "b", "b": "a"])
+        XCTAssertEqual(
+            CaptureIdentityMatcher.verifiedMappings(
+                physicalIDs: ["a", "b"], physical: ["a": sparse],
+                sources: ["a": sparse, "b": sparse], unavailable: ["b"]), [:])
+        XCTAssertEqual(
+            CaptureIdentityMatcher.verifiedMappings(
+                physicalIDs: ["a", "b"], physical: ["a": sparse],
+                sources: ["a": sparse], unavailable: ["b"]), [:])
+        let different = CaptureIdentityImage(aspectRatio: 0.56, pixels: pixels.map { $0 - 30 })
+        XCTAssertEqual(
+            CaptureIdentityMatcher.verifiedMappings(
+                physicalIDs: ["a", "b"], physical: ["a": sparse],
+                sources: ["a": different, "b": other], unavailable: ["b"]), [:])
+    }
+
     private func signature(inverted: Bool = false, noise: Int = 0) -> CaptureIdentityImage {
         let pixels = (0..<(CaptureIdentityImage.width * CaptureIdentityImage.height)).flatMap { index in
             let bright =

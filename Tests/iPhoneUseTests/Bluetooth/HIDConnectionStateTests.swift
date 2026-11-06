@@ -6,6 +6,43 @@ final class HIDConnectionStateTests: XCTestCase {
     private let host = UUID()
     private let other = UUID()
 
+    func testPointerReportMapsAreIsolatedWithoutChangingPayloadIDs() {
+        XCTAssertEqual(HIDReportMap.primaryReports, [.keyboard, .relativeMouse, .consumer])
+        XCTAssertEqual(HIDReportMap.absoluteReports, [.absolutePointer])
+        XCTAssertEqual(
+            HIDReportMap.descriptor(for: HIDReportMap.primaryReports),
+            HIDReportMap.keyboard + HIDReportMap.relativeMouse + HIDReportMap.consumer)
+        XCTAssertEqual(HIDReportMap.descriptor(for: HIDReportMap.absoluteReports), HIDReportMap.absolutePointer)
+        XCTAssertEqual(ReportID.absolutePointer.rawValue, 2)
+        XCTAssertEqual(ReportID.relativeMouse.rawValue, 3)
+    }
+
+    func testAbsoluteReleaseUsesLastAcceptedPositionAfterIdentityInvalidation() throws {
+        var state = HIDConnectionState()
+        state.subscribe(.report(.absolutePointer), host: host)
+        let session = try XCTUnwrap(state.sessions[host])
+        var allowed = true
+        state.enqueue(.report(.absolutePointer), data: Data([1, 10, 0, 20, 0]), host: host, session: session)
+        state.removeFirst()  // Accepted by BLE.
+        state.enqueue(
+            .report(.absolutePointer), data: Data([1, 90, 0, 90, 0]), host: host,
+            session: session, isAllowed: { allowed })
+        state.enqueue(
+            .report(.absolutePointer), data: Data([0, 90, 0, 90, 0]), host: host,
+            session: session, isAllowed: { allowed }, absoluteRelease: true)
+        allowed = false
+        let release = try XCTUnwrap(state.nextPendingReport())
+        XCTAssertEqual(release.data, Data([0, 10, 0, 20, 0]))
+        state.removeFirst()
+        XCTAssertNil(state.nextPendingReport())
+        state.unsubscribe(.report(.absolutePointer), host: host)
+        state.subscribe(.report(.absolutePointer), host: host)
+        state.enqueue(
+            .report(.absolutePointer), data: Data([0, 10, 0, 20, 0]), host: host,
+            session: session, absoluteRelease: true)
+        XCTAssertNil(state.nextPendingReport(), "stale session releases cannot reach a new connection")
+    }
+
     func testKeyboardConnectionIsNotReadyForPointerUntilItsReportsSubscribe() throws {
         var state = HIDConnectionState()
         state.subscribe(.report(.keyboard), host: host)
@@ -157,7 +194,7 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertEqual(
             state.pending.map(\.data),
             [
-                Data([0, 2, 0, 2, 0]), Data([1, 0, 0, 0]), Data([1, 4, 0, 4, 0]),
+                Data([0, 2, 0, 2, 0]), Data([1, 0, 0, 0]), Data([1, 3, 0, 3, 0]), Data([1, 4, 0, 4, 0]),
                 Data([0, 0, 0, 0]), Data([0, 0, 4, 0, 0, 0, 0, 0]), Data(repeating: 0, count: 8),
             ])
     }

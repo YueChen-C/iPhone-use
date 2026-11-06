@@ -21,8 +21,10 @@ struct HIDConnectionState {
         let data: Data
         let session: UUID?
         let isAllowed: (() -> Bool)?
+        let isAbsoluteRelease: Bool
 
         var permissionIsCurrent: Bool {
+            if isAbsoluteRelease { return true }
             // Releases cannot move a pointer and must survive invalidation so
             // a key or mouse button pressed earlier does not remain held.
             switch channel {
@@ -37,6 +39,7 @@ struct HIDConnectionState {
     private(set) var subscriptions: [UUID: Set<Channel>] = [:]
     private(set) var sessions: [UUID: UUID] = [:]
     private(set) var pending: [PendingReport] = []
+    private var sentAbsolutePositions: [UUID: Data] = [:]
 
     /// A connected keyboard does not imply that the host has subscribed to its
     /// pointer reports yet. Check the report as well as the current session.
@@ -52,6 +55,7 @@ struct HIDConnectionState {
 
     mutating func unsubscribe(_ channel: Channel, host: UUID) {
         subscriptions[host]?.remove(channel)
+        if channel == .report(.absolutePointer) { sentAbsolutePositions[host] = nil }
         pending.removeAll { $0.host == host && $0.channel == channel }
         if !(subscriptions[host]?.contains(where: \.isInput) ?? false) {
             sessions[host] = nil
@@ -63,18 +67,23 @@ struct HIDConnectionState {
     /// An old DeviceInput may still have work queued when the same phone reconnects.
     /// Its token must match the current session, as well as the subscription.
     mutating func enqueue(
-        _ channel: Channel, data: Data, host: UUID, session: UUID? = nil, isAllowed: (() -> Bool)? = nil
+        _ channel: Channel, data: Data, host: UUID, session: UUID? = nil, isAllowed: (() -> Bool)? = nil,
+        absoluteRelease: Bool = false
     ) {
         guard subscriptions[host]?.contains(channel) == true else { return }
         if channel.isInput {
             guard let session, sessions[host] == session else { return }
         }
-        let report = PendingReport(host: host, channel: channel, data: data, session: session, isAllowed: isAllowed)
+        let release = absoluteRelease && channel == .report(.absolutePointer) && data.count == 5 && data.first == 0
+        let report = PendingReport(
+            host: host, channel: channel, data: data, session: session,
+            isAllowed: isAllowed, isAbsoluteRelease: release)
         guard report.permissionIsCurrent else { return }
-        // Under backpressure only replace consecutive absolute positions with the
-        // same button state. Never merge a key, click or relative displacement.
-        if channel == .report(.absolutePointer), let last = pending.last,
-            last.host == host, last.channel == channel, last.data.first == data.first
+        // Coalesce only idle hover. A held path must keep its initial down
+        // location and corners even when BLE briefly applies backpressure.
+        if channel == .report(.absolutePointer), data.first == 0, let last = pending.last,
+            last.host == host, last.channel == channel, last.data.first == data.first,
+            !last.isAbsoluteRelease, !report.isAbsoluteRelease
         {
             pending[pending.count - 1] = report
         } else {
@@ -103,6 +112,21 @@ struct HIDConnectionState {
             let currentSession =
                 !report.channel.isInput || (report.session != nil && sessions[report.host] == report.session)
             if subscribed, currentSession, report.permissionIsCurrent {
+                if report.isAbsoluteRelease {
+                    // The last enqueued move may have been dropped after identity
+                    // invalidation. Release at the last accepted BLE position only.
+                    guard var position = sentAbsolutePositions[report.host] else {
+                        pending.remove(at: index)
+                        continue
+                    }
+                    position[0] = 0
+                    return (
+                        index,
+                        PendingReport(
+                            host: report.host, channel: report.channel,
+                            data: position, session: report.session, isAllowed: nil, isAbsoluteRelease: true)
+                    )
+                }
                 return (index, report)
             }
             pending.remove(at: index)
@@ -115,16 +139,20 @@ struct HIDConnectionState {
         nextPendingReportIndex()?.report
     }
 
-    mutating func removePending(at index: Int) {
-        pending.remove(at: index)
+    mutating func removePending(at index: Int, accepted: Bool = true) {
+        let report = pending.remove(at: index)
+        if accepted, report.channel == .report(.absolutePointer), !report.isAbsoluteRelease, report.data.count == 5 {
+            sentAbsolutePositions[report.host] = report.data
+        }
     }
 
-    mutating func removeFirst() { pending.removeFirst() }
+    mutating func removeFirst() { removePending(at: 0) }
 
     mutating func reset() {
         subscriptions.removeAll()
         sessions.removeAll()
         pending.removeAll()
+        sentAbsolutePositions.removeAll()
     }
 }
 

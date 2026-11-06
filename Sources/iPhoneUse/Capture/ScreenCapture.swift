@@ -728,12 +728,12 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
 
     private func scheduleIdentityVerification(
         generation: UInt64, sources: [String: ScreenCaptureSource], retryOnFailure: Bool = true,
-        delay: TimeInterval = 0.5
+        delay: TimeInterval = 0.5, recoveryAttempt: Int = 0
     ) {
         // Wait for newly started streams to deliver their first complete frames.
         identityQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            let isCurrent = { self.lock.withLock { self.identityGeneration == generation } }
+            let isCurrent = { self.lock.withLock { !self.isStopped && self.identityGeneration == generation } }
             guard isCurrent() else { return }
             let result = CaptureIdentityVerifier.verify(
                 physicalIDs: sources.keys.sorted(),
@@ -786,13 +786,28 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             if applied { self.onScreensChanged?() }
             if applied, shouldRecover {
                 self.scheduleIdentityVerification(
-                    generation: generation, sources: sources, retryOnFailure: false, delay: 1.5)
+                    generation: generation, sources: sources, retryOnFailure: false, delay: 1.5,
+                    recoveryAttempt: recoveryAttempt)
             } else if applied, shouldRetry {
                 // Capture and screenshotr can race during USB/service startup.
-                // One delayed retry gives them time to settle without polling
-                // indefinitely or ever moving a pointer for identity checks.
+                // Retry startup quickly, then use low-frequency recovery while
+                // the topology remains unchanged. Never move a pointer here.
                 self.scheduleIdentityVerification(
-                    generation: generation, sources: sources, retryOnFailure: false, delay: 3)
+                    generation: generation, sources: sources, retryOnFailure: false, delay: 3,
+                    recoveryAttempt: recoveryAttempt)
+            } else if applied {
+                let retry = self.lock.withLock {
+                    CaptureIdentityRecovery.permitsRetry(
+                        stopped: self.isStopped, expected: generation, current: self.identityGeneration,
+                        sourceCount: self.sources.count, state: self.verificationState)
+                }
+                if retry {
+                    let delay = CaptureIdentityRecovery.delay(attempt: recoveryAttempt)
+                    log("capture identity automatic recheck in \(delay)s; input remains gated per screen")
+                    self.scheduleIdentityVerification(
+                        generation: generation, sources: sources, retryOnFailure: false, delay: delay,
+                        recoveryAttempt: min(2, recoveryAttempt + 1))
+                }
             }
         }
     }

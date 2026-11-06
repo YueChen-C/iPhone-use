@@ -23,9 +23,8 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
     private var published = false
 
     private var inputs: [ReportID: CBMutableCharacteristic] = [:]
+    private var reportMaps: [ObjectIdentifier: [UInt8]] = [:]
     private var keyboardOutput: CBMutableCharacteristic?
-    private var controlPoint: CBMutableCharacteristic?
-    private var protocolMode: CBMutableCharacteristic?
     private var batteryLevel: CBMutableCharacteristic?
     private var serviceChanged: CBMutableCharacteristic?
 
@@ -247,9 +246,8 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
         manager?.delegate = nil
         manager = nil
         resetConnectionState()
+        reportMaps.removeAll()
         keyboardOutput = nil
-        controlPoint = nil
-        protocolMode = nil
         batteryLevel = nil
         serviceChanged = nil
         let nextDescription = lifecyclePolicy.inactiveReason?.stateDescription ?? "stopped"
@@ -370,7 +368,8 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
     /// `isAllowed` runs on the Bluetooth queue at enqueue and notification;
     /// it must not call this object's queue-synchronized readers.
     func send(
-        _ id: ReportID, _ bytes: [UInt8], to host: UUID, session: UUID?, isAllowed: (() -> Bool)? = nil
+        _ id: ReportID, _ bytes: [UInt8], to host: UUID, session: UUID?, isAllowed: (() -> Bool)? = nil,
+        absoluteRelease: Bool = false
     ) {
         queue.async {
             if self.tracePointer, id == .absolutePointer || id == .relativeMouse,
@@ -383,7 +382,8 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
             }
             guard self.manager?.state == .poweredOn, self.published else { return }
             self.connections.enqueue(
-                .report(id), data: Data(bytes), host: host, session: session, isAllowed: isAllowed)
+                .report(id), data: Data(bytes), host: host, session: session, isAllowed: isAllowed,
+                absoluteRelease: absoluteRelease)
             self.drain()
         }
     }
@@ -395,12 +395,13 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
     }
 
     private func buildServices() -> [CBMutableService] {
+        reportMaps.removeAll()
         // Service/characteristic order is part of the host's cached GATT layout.
         let gatt = makeGenericAttributeService()
-        let hid = makeHIDService()
+        let hid = makeHIDService(reports: HIDReportMap.primaryReports)
         let device = makeDeviceInformationService()
         let battery = makeBatteryService()
-        return [gatt, hid, device, battery]
+        return [gatt, hid, device, battery, makeHIDService(reports: HIDReportMap.absoluteReports)]
     }
 
     private func makeGenericAttributeService() -> CBMutableService {
@@ -412,24 +413,23 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
         return gatt
     }
 
-    private func makeHIDService() -> CBMutableService {
+    private func makeHIDService(reports: [ReportID]) -> CBMutableService {
         let info = CBMutableCharacteristic(
             type: CBUUID(string: "2A4A"), properties: [.read],
             value: Data([0x11, 0x01, 0x00, 0x02]), permissions: [.readable])
         let reportMap = CBMutableCharacteristic(
             type: CBUUID(string: "2A4B"), properties: [.read],
-            value: Data(HIDReportMap.descriptor), permissions: [.readEncryptionRequired])
+            value: nil, permissions: [.readEncryptionRequired])
+        reportMaps[ObjectIdentifier(reportMap)] = HIDReportMap.descriptor(for: reports)
         let control = CBMutableCharacteristic(
             type: CBUUID(string: "2A4C"), properties: [.writeWithoutResponse],
             value: nil, permissions: [.writeEncryptionRequired])
-        controlPoint = control
         let mode = CBMutableCharacteristic(
             type: CBUUID(string: "2A4E"), properties: [.read, .writeWithoutResponse],
             value: nil, permissions: [.readable, .writeable])
-        protocolMode = mode
 
         var characteristics: [CBMutableCharacteristic] = [info, reportMap, control, mode]
-        for id in [ReportID.keyboard, .absolutePointer, .relativeMouse, .consumer] {
+        for id in reports {
             let report = CBMutableCharacteristic(
                 type: CBUUID(string: "2A4D"), properties: [.read, .notify],
                 value: nil, permissions: [.readEncryptionRequired])
@@ -437,14 +437,16 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
             inputs[id] = report
             characteristics.append(report)
         }
-        let output = CBMutableCharacteristic(
-            type: CBUUID(string: "2A4D"), properties: [.read, .write, .writeWithoutResponse],
-            value: nil, permissions: [.readEncryptionRequired, .writeEncryptionRequired])
-        output.descriptors = [
-            CBMutableDescriptor(type: CBUUID(string: "2908"), value: Data([ReportID.keyboard.rawValue, 2]))
-        ]
-        keyboardOutput = output
-        characteristics.append(output)
+        if reports.contains(.keyboard) {
+            let output = CBMutableCharacteristic(
+                type: CBUUID(string: "2A4D"), properties: [.read, .write, .writeWithoutResponse],
+                value: nil, permissions: [.readEncryptionRequired, .writeEncryptionRequired])
+            output.descriptors = [
+                CBMutableDescriptor(type: CBUUID(string: "2908"), value: Data([ReportID.keyboard.rawValue, 2]))
+            ]
+            keyboardOutput = output
+            characteristics.append(output)
+        }
 
         let hid = CBMutableService(type: Self.sig("1812"), primary: true)
         hid.characteristics = characteristics
@@ -547,6 +549,13 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
         }
         let value: Data
         switch request.characteristic.uuid {
+        case CBUUID(string: "2A4B"):
+            guard let descriptor = reportMaps[ObjectIdentifier(request.characteristic)] else {
+                peripheral.respond(to: request, withResult: .attributeNotFound)
+                return
+            }
+            value = Data(descriptor)
+            log("HID report map read: \(descriptor.count) bytes, offset=\(request.offset)")
         case CBUUID(string: "2A4E"): value = Data([0x01])
         case CBUUID(string: "2A19"): value = Data([100])
         case CBUUID(string: "2A4D"): value = Data(count: reportLength(request.characteristic))
@@ -569,7 +578,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
         }
         for request in requests {
             remember(request.central)
-            if request.characteristic.uuid == controlPoint?.uuid {
+            if request.characteristic.uuid == CBUUID(string: "2A4C") {
                 log("control point write \(request.value.map { [UInt8]($0) } ?? []) from \(request.central.identifier)")
                 recoverStaleCacheIfNeeded(request.central)
             }
@@ -675,7 +684,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
         var blockedHosts: Set<UUID> = []
         while let (index, report) = connections.nextPendingReportIndex(excludingHosts: blockedHosts) {
             guard let characteristic = characteristic(for: report.channel), let central = centrals[report.host] else {
-                connections.removePending(at: index)
+                connections.removePending(at: index, accepted: false)
                 continue
             }
             let sent = manager.updateValue(report.data, for: characteristic, onSubscribedCentrals: [central])

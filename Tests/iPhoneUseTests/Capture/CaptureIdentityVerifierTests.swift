@@ -3,6 +3,29 @@ import XCTest
 @testable import iPhoneUse
 
 final class CaptureIdentityVerifierTests: XCTestCase {
+    func testFailedIdentityRecoveryDoesNotExpireAndBacksOff() {
+        XCTAssertEqual((0..<6).map { CaptureIdentityRecovery.delay(attempt: $0) }, [3, 10, 30, 30, 30, 30])
+        for state in [ScreenCaptureIdentityState.failed, .partiallyVerified] {
+            XCTAssertTrue(
+                CaptureIdentityRecovery.permitsRetry(
+                    stopped: false, expected: 7, current: 7, sourceCount: 2, state: state))
+        }
+        for state in [ScreenCaptureIdentityState.verified, .singleDevice, .pending, .unavailable] {
+            XCTAssertFalse(
+                CaptureIdentityRecovery.permitsRetry(
+                    stopped: false, expected: 7, current: 7, sourceCount: 2, state: state))
+        }
+        XCTAssertFalse(
+            CaptureIdentityRecovery.permitsRetry(
+                stopped: true, expected: 7, current: 7, sourceCount: 2, state: .failed))
+        XCTAssertFalse(
+            CaptureIdentityRecovery.permitsRetry(
+                stopped: false, expected: 7, current: 8, sourceCount: 2, state: .failed))
+        XCTAssertFalse(
+            CaptureIdentityRecovery.permitsRetry(
+                stopped: false, expected: 7, current: 7, sourceCount: 1, state: .failed))
+    }
+
     private func image(inverted: Bool = false) -> CaptureIdentityImage {
         CaptureIdentityImage(
             aspectRatio: 750.0 / 1334,
