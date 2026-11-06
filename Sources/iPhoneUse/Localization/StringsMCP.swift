@@ -37,6 +37,7 @@ struct StringsMCP: LocalizedTable {
     let toolSwitchTrackMode: String
     let toolGetTrackStatus: String
     let toolGetAXTree: String
+    let toolDecideTrack: String
 
     // MCPToolRequest / MCPKeyboardSequence validation
     let unknownTool: (String) -> String
@@ -106,6 +107,7 @@ struct StringsMCP: LocalizedTable {
         toolSwitchTrackMode: "切换控制轨道模式：standard（普通零售通道，仅蓝牙 HID + USB 视频流，最接近真人外设）、enhanced（开发者增强通道，零校准多点触控 + 完整 AX 树，适合深度开发与页面抓取）或 auto（默认自动优先增强通道，失败时无感降级到普通通道）。",
         toolGetTrackStatus: "查询当前手机的双轨控制模式（standard / enhanced / auto）、激活通道状态及降级原因。",
         toolGetAXTree: "通过开发者增强通道获取当前界面的完整 Accessibility（AX）层级元素树、标签与坐标。",
+        toolDecideTrack: "使用 TypeSafe Jev System One 决策引擎根据任务提示词与目标应用智能选择最优控制轨道（standard / enhanced / auto），可选自动切换（apply=true）。",
         unknownTool: { "未知工具 \($0)" },
         coordinateFinite: { "\($0) 必须是有限且非负的截图坐标" },
         hidCountRange: { "\($0) 必须是 -32...32 内的整数 HID 计数" },
@@ -176,6 +178,7 @@ struct StringsMCP: LocalizedTable {
         toolSwitchTrackMode: "Switch control track mode: 'standard' (retail BLE HID + USB video only, safest for sensitive apps), 'enhanced' (Developer Mode CoreDevice UniversalHID + AX hierarchy), or 'auto' (default, prefers enhanced and gracefully degrades to standard on failure).",
         toolGetTrackStatus: "Get the current dual-track control mode ('standard', 'enhanced', or 'auto'), active track state, and any degradation reason.",
         toolGetAXTree: "Inspect the live iOS Accessibility (AX) hierarchy tree via the enhanced developer track.",
+        toolDecideTrack: "Use the TypeSafe Jev System One decision engine to evaluate task intent and target app, returning the optimal control track ('standard', 'enhanced', or 'auto') with rationale; set apply=true to switch immediately.",
         unknownTool: { "unknown tool \($0)" },
         coordinateFinite: { "\($0) must be a finite, nonnegative screenshot coordinate" },
         hidCountRange: { "\($0) must be an integer HID count in -32...32" },

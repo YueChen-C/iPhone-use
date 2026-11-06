@@ -141,7 +141,7 @@ final class LocalizationTests: XCTestCase {
         let required: Set<String> = [
             "list_devices", "screenshot", "ocr_screen", "tap_text", "move_pointer", "adjust_pointer", "click_pointer",
             "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home", "act",
-            "switch_track_mode", "get_track_status", "get_ax_tree",
+            "switch_track_mode", "get_track_status", "get_ax_tree", "decide_track",
         ]
         func names(_ tools: [[String: Any]]) -> Set<String> {
             Set(tools.compactMap { $0["name"] as? String })

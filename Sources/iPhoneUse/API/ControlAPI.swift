@@ -142,6 +142,27 @@ enum ControlAPI {
                 out["ok"] = true
                 out["device"] = device.id
                 return .json(out)
+            case ("POST", "/track/decide"):
+                let prompt = ((body["prompt"] as? String) ?? (body["intent"] as? String) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !prompt.isEmpty else {
+                    throw DeviceError("Missing 'prompt' or 'intent' for track decision.")
+                }
+                let appName = (body["app"] as? String) ?? (body["bundle_id"] as? String)
+                let apply = (body["apply"] as? Bool) ?? false
+                let decision = JevTrackRouter.shared.decide(prompt: prompt, appName: appName)
+                var appliedDevice: String?
+                if apply {
+                    let targetDevice = try DeviceRegistry.shared.find(deviceQuery)
+                    DeviceRegistry.shared.coordinator(for: targetDevice).switchMode(decision.mode)
+                    appliedDevice = targetDevice.id
+                }
+                return .json([
+                    "ok": true,
+                    "decision": decision.json,
+                    "applied": apply && appliedDevice != nil,
+                    "device": appliedDevice as Any,
+                ])
             default:
                 guard request.method == "POST", let action = Action(rawValue: request.path) else {
                     return .error("not found", status: 404)

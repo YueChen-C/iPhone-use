@@ -295,7 +295,7 @@ final class MCPOCRTests: XCTestCase {
 final class MCPKeyboardAliasTests: XCTestCase {
     func testEveryToolAdvertisesDeviceAliasAndOriginalWins() throws {
         let tools = MCPToolCatalog.tools(for: .en)
-        XCTAssertEqual(tools.count, 18)
+        XCTAssertEqual(tools.count, 19)
         for tool in tools {
             let schema = try XCTUnwrap(tool["inputSchema"] as? [String: Any])
             let properties = try XCTUnwrap(schema["properties"] as? [String: Any])

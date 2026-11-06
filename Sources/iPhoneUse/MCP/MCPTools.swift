@@ -131,6 +131,17 @@ enum MCPToolCatalog {
                     "device": device,
                 ],
                 readOnly: true),
+            tool(
+                "decide_track",
+                table.toolDecideTrack,
+                [
+                    "prompt": ["type": "string"],
+                    "app": ["type": "string"],
+                    "apply": ["type": "boolean"],
+                    "device": device,
+                ],
+                required: ["prompt"],
+                readOnly: true),
         ]
     }
 
@@ -308,6 +319,12 @@ struct MCPToolRequest {
             var body: [String: Any] = [:]
             if let off = arguments["include_offscreen"] { body["include_offscreen"] = off }
             return MCPToolRequest(path: "/ax_tree", body: withDevice(body, device))
+        case "decide_track":
+            var body: [String: Any] = [:]
+            if let prompt = arguments["prompt"] { body["prompt"] = prompt }
+            if let app = arguments["app"] { body["app"] = app }
+            if let apply = arguments["apply"] { body["apply"] = apply }
+            return MCPToolRequest(path: "/track/decide", body: withDevice(body, device))
         default:
             return nil
         }
