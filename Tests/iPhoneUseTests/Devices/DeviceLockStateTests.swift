@@ -4,6 +4,45 @@ import XCTest
 @testable import iPhoneUse
 
 final class DeviceLockStateTests: XCTestCase {
+    func testConfirmedLockRetriesMatchingOnlyOnceAfterUnlock() throws {
+        var states = DeviceLockObservations()
+        let captures = captures("phone")
+        for (state, time) in [(DeviceLockState.suspected, 10.0), (.suspected, 12), (.unknown, 14)] {
+            XCTAssertFalse(
+                states.complete(
+                    try XCTUnwrap(states.requests(for: captures).first), state: state, now: time))
+        }
+        XCTAssertTrue(
+            states.complete(
+                try XCTUnwrap(states.requests(for: captures).first), state: .notDetected, now: 16))
+        XCTAssertFalse(
+            states.complete(
+                try XCTUnwrap(states.requests(for: captures).first), state: .notDetected, now: 18))
+    }
+
+    func testSingleLockFalsePositiveDoesNotRestartMatching() throws {
+        var states = DeviceLockObservations()
+        let captures = captures("phone")
+        XCTAssertFalse(
+            states.complete(
+                try XCTUnwrap(states.requests(for: captures).first), state: .suspected, now: 10))
+        XCTAssertFalse(
+            states.complete(
+                try XCTUnwrap(states.requests(for: captures).first), state: .notDetected, now: 12))
+    }
+
+    func testRestoredFrameRetryIsScopedToTheCaptureAndPhone() throws {
+        var states = DeviceLockObservations()
+        var captures = captures("a", "b")
+        for request in states.requests(for: captures) {
+            XCTAssertFalse(states.complete(request, state: .paused, now: 10))
+        }
+        captures["a"] = UUID()
+        for request in states.requests(for: captures) {
+            XCTAssertEqual(states.complete(request, state: .notDetected, now: 12), request.physicalID == "b")
+        }
+    }
+
     private func captures(_ ids: String...) -> [String: UUID] {
         Dictionary(uniqueKeysWithValues: ids.map { ($0, UUID()) })
     }

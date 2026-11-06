@@ -351,34 +351,26 @@ final class HIDConnectionStateTests: XCTestCase {
         var tracker = HIDReconnectTracker()
         _ = tracker.updateTargets([saved], activeSessions: [], resetExhausted: true)
 
-        // Attempt 1 fails -> backoff 2s.
-        _ = tracker.beginConnecting(saved)
-        guard
-            case .scheduleBackoff(let token1, let delay1) = tracker.handleTermination(
-                host: saved, hasActiveSession: false)
-        else {
-            return XCTFail("expected first backoff")
-        }
-        XCTAssertEqual(delay1, 2.0)
-        XCTAssertEqual(tracker.reconnectingHosts(activeSessions: []), [saved])
-        XCTAssertTrue(tracker.completeBackoff(host: saved, token: token1, hasActiveSession: false))
-
-        // Attempt 2 fails -> backoff 6s.
-        _ = tracker.beginConnecting(saved)
-        guard
-            case .scheduleBackoff(let token2, let delay2) = tracker.handleTermination(
-                host: saved, hasActiveSession: false)
-        else {
-            return XCTFail("expected second backoff")
-        }
-        XCTAssertEqual(delay2, 6.0)
-        XCTAssertTrue(tracker.completeBackoff(host: saved, token: token2, hasActiveSession: false))
-
-        // Attempt 3 fails -> budget exhausted; no endless 12-second loop.
-        _ = tracker.beginConnecting(saved)
+        XCTAssertEqual(HIDReconnectTracker.attemptTimeout, 20)
+        XCTAssertEqual(HIDReconnectTracker.maxAutomaticAttempts, 6)
+        // Six attempts span about 190 seconds including per-attempt timeouts.
         XCTAssertEqual(
-            tracker.handleTermination(host: saved, hasActiveSession: false),
-            .notifyChanged)
+            Double(HIDReconnectTracker.maxAutomaticAttempts) * HIDReconnectTracker.attemptTimeout
+                + HIDReconnectTracker.retryDelays.reduce(0, +), 190)
+        for delay in [2.0, 6, 12, 20, 30] {
+            XCTAssertEqual(tracker.connectableHosts(activeSessions: []), [saved])
+            _ = tracker.beginConnecting(saved)
+            guard
+                case .scheduleBackoff(let token, let actualDelay) = tracker.handleTermination(
+                    host: saved, hasActiveSession: false)
+            else { return XCTFail("expected finite reconnect backoff") }
+            XCTAssertEqual(actualDelay, delay)
+            XCTAssertEqual(tracker.reconnectingHosts(activeSessions: []), [saved])
+            XCTAssertTrue(tracker.completeBackoff(host: saved, token: token, hasActiveSession: false))
+        }
+        _ = tracker.beginConnecting(saved)
+        XCTAssertEqual(tracker.handleTermination(host: saved, hasActiveSession: false), .notifyChanged)
+        XCTAssertEqual(tracker.attemptsUsed[saved], 6)
         XCTAssertTrue(tracker.reconnectingHosts(activeSessions: []).isEmpty)
         XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
 

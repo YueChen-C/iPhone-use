@@ -17,7 +17,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
     private var lifecyclePolicy = HIDLifecyclePolicy()
     private var reconnectTracker = HIDReconnectTracker()
     private var reconnectingPeripherals: [UUID: CBPeripheral] = [:]
-    private let reconnectTimeout: TimeInterval = 12
+    private let reconnectTimeout = HIDReconnectTracker.attemptTimeout
     private var servicesToAdd: [CBMutableService] = []
     private var serviceBeingAdded: CBMutableService?
     private var published = false

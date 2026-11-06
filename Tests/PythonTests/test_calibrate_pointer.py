@@ -143,7 +143,7 @@ class CalibrationIOTests(unittest.TestCase):
             response.read.assert_called_once_with()
 
     def test_save_replaces_host_profile_with_existing_json_format(self):
-        profile = {'host': 'aa:bb', 'distances': [0.0, 1.0], 'reportInterval': 0.03}
+        profile = {'host': 'aa:bb', 'screenID': '00008030-001A690E2EC3802E', 'distances': [0.0, 1.0], 'reportInterval': 0.03}
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             calibration.save_profile(Path(directory), 'aa:bb', profile)
             destination = Path(directory) / 'pointer-calibration' / 'AA:BB.json'
@@ -153,29 +153,29 @@ class CalibrationIOTests(unittest.TestCase):
     def test_latest_template_is_stable_across_bluetooth_identity_changes(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             root = Path(directory)
-            first = {'host': 'old-host', 'screenID': 'phone-a', 'distances': [0, 1, 3]}
-            latest = {'host': 'new-host', 'screenID': 'phone-a', 'distances': [0, 2, 5]}
+            first = {'host': 'old-host', 'screenID': '00008030-001A690E2EC3802E', 'distances': [0, 1, 3]}
+            latest = {'host': 'new-host', 'screenID': '00008030-001A690E2EC3802E', 'distances': [0, 2, 5]}
             calibration.save_profile(root, 'old-host', first)
             calibration.save_profile(root, 'new-host', latest)
-            template = root / 'pointer-calibration/by-screen/70686f6e652d61.json'
+            template = root / 'pointer-calibration/by-screen/30303030383033302d30303141363930453245433338303245.json'
             self.assertEqual(json.loads(template.read_text()), latest)
             self.assertEqual(json.loads((root / 'pointer-calibration/OLD-HOST.json').read_text()), first)
             self.assertFalse(template.with_suffix('.tmp').exists())
 
 
 class AutomaticCalibrationTests(unittest.TestCase):
-    device = {'id': 'phone-a', 'width': 750, 'height': 1334}
+    device = {'id': '00008030-001A690E2EC3802E', 'width': 750, 'height': 1334}
 
     def test_auto_navigation_replaces_the_entire_safari_address(self):
         api = calibration.PhoneAPI('http://127.0.0.1:7390')
         with patch.object(api, 'post') as post, patch.object(calibration.time, 'sleep'):
-            api.open_safari('phone-a', 'http://192.0.2.1:7391/token')
+            api.open_safari('00008030-001A690E2EC3802E', 'http://192.0.2.1:7391/token')
         from unittest.mock import call
         self.assertEqual(post.call_args_list[-4:], [
-            call('/key', 'phone-a', key='l', modifiers=['cmd']),
-            call('/key', 'phone-a', key='a', modifiers=['cmd']),
-            call('/type', 'phone-a', text='http://192.0.2.1:7391/token'),
-            call('/key', 'phone-a', key='enter'),
+            call('/key', '00008030-001A690E2EC3802E', key='l', modifiers=['cmd']),
+            call('/key', '00008030-001A690E2EC3802E', key='a', modifiers=['cmd']),
+            call('/type', '00008030-001A690E2EC3802E', text='http://192.0.2.1:7391/token'),
+            call('/key', '00008030-001A690E2EC3802E', key='enter'),
         ])
 
     def test_mapping_verification_accepts_browser_offsets_and_rejects_wrong_gain(self):
@@ -183,9 +183,9 @@ class AutomaticCalibrationTests(unittest.TestCase):
         # Physical screen positions minus a fixed browser chrome offset.
         observed = [(225, 433.6), (450, 700.4), (300, 567)]
         self.assertTrue(calibration.verify_mapping(api, self.device, Mock(side_effect=observed)))
-        api.nudge.assert_called_once_with('phone-a', 1, 0)
+        api.nudge.assert_called_once_with('00008030-001A690E2EC3802E', 1, 0)
         self.assertEqual(api.post.call_count, 3)
-        api.post.assert_any_call('/move', 'phone-a', x=0.6, y=0.6, fraction=True)
+        api.post.assert_any_call('/move', '00008030-001A690E2EC3802E', x=0.6, y=0.6, fraction=True)
         for incorrect in [[(0, 0)] * 3, [(x * .8, y * .8) for x, y in observed],
                           [(225, 433.6), (float('nan'), 700.4), (300, 567)]]:
             self.assertFalse(calibration.verify_mapping(api, self.device, Mock(side_effect=incorrect)))
@@ -208,7 +208,7 @@ class AutomaticCalibrationTests(unittest.TestCase):
                 patch.object(calibration, 'PointerCalibration') as measure, \
                 patch.object(calibration, 'save_profile') as save, contextlib.redirect_stdout(io.StringIO()):
             calibration.run_calibration(args, api, self.device, Path('/unused'), 'host', measurements, '192.0.2.2', '/token')
-        api.open_safari.assert_called_once_with('phone-a', 'http://192.0.2.2:7391/token')
+        api.open_safari.assert_called_once_with('00008030-001A690E2EC3802E', 'http://192.0.2.2:7391/token')
         measure.assert_not_called()
         save.assert_not_called()
 
@@ -229,26 +229,57 @@ class AutomaticCalibrationTests(unittest.TestCase):
             calibration.run_calibration(args, api, self.device, Path('/unused'), 'host', measurements, '192.0.2.2', '/token')
             self.assertEqual(apply.call_args.args[1:5], (self.device, Path('/unused'), 'host', {'distances': [0, 1, 3]}))
 
-    def test_baseline_rebinds_identity_but_never_scales_different_resolutions(self):
+    def test_baseline_keeps_bound_ownership_and_never_scales_resolutions(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'baseline.json'
-            path.write_text(json.dumps({'reference': {'screenWidth': 750, 'screenHeight': 1334},
-                                       'host': 'old-host', 'screenID': 'old-phone',
-                                       'distances': [0, 1, 8], 'reportInterval': .03}))
+            source = {'reference': {'screenWidth': 750, 'screenHeight': 1334},
+                      'host': 'old-host', 'screenID': 'old-phone',
+                      'distances': [0, 1, 8], 'reportInterval': .03}
+            path.write_text(json.dumps(source))
+            before = path.read_bytes()
+            self.assertIsNone(calibration.baseline_profile(path, self.device, 'new-host'))
+            self.assertEqual(path.read_bytes(), before)
+            source['screenID'] = self.device['id']
+            path.write_text(json.dumps(source))
             profile = calibration.baseline_profile(path, self.device, 'new-host')
             self.assertEqual(profile['host'], 'new-host')
-            self.assertEqual(profile['screenID'], 'phone-a')
+            self.assertEqual(profile['screenID'], self.device['id'])
             self.assertEqual(profile['distances'], [0, 1, 8])
             self.assertIsNone(calibration.baseline_profile(path, dict(self.device, width=1080), 'new-host'))
-            source = json.loads(path.read_text())
+            del source['screenID']
+            path.write_text(json.dumps(source))
+            self.assertIsNone(calibration.baseline_profile(path, self.device, 'new-host'))
+            source['kind'] = 'relative-pointer-baseline'
+            path.write_text(json.dumps(source))
+            self.assertEqual(calibration.baseline_profile(path, self.device, 'new-host')['screenID'], self.device['id'])
             source['distances'] = [0, 4, 2]
             path.write_text(json.dumps(source))
             with self.assertRaisesRegex(RuntimeError, 'Invalid pointer baseline'):
                 calibration.baseline_profile(path, self.device, 'new-host')
 
+    def test_foreign_or_unowned_candidate_never_writes_or_reloads(self):
+        for identity, host in [('other-phone', 'new'), (None, 'new'), ('', 'new'),
+                               ('A312CBE4-758D-50EE-CD7A-67F6FD40ACE4', 'new'),
+                               (self.device['id'], 'wrong-route')]:
+            with tempfile.TemporaryDirectory() as directory:
+                api = Mock()
+                profile = {'host': host, 'screenID': identity, 'distances': [0, 1, 3]}
+                root = Path(directory)
+                with self.assertRaises(RuntimeError):
+                    calibration.apply_verified_profile(api, self.device, root, 'new', profile, Mock())
+                self.assertEqual(list(root.iterdir()), [])
+                api.post.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory:
+            api = Mock()
+            foreign = {'host': 'new', 'screenID': '8bdbe135bcd781e8215eb391f48b2848608b292c'}
+            with self.assertRaisesRegex(RuntimeError, 'does not match the selected iPhone'):
+                calibration.apply_verified_profile(api, self.device, Path(directory), 'new', foreign, Mock())
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            api.post.assert_not_called()
+
     def test_failed_candidate_restores_both_files_and_live_input(self):
         api = Mock()
-        profile = {'host': 'new', 'screenID': 'phone-a', 'distances': [0, 1, 3]}
+        profile = {'host': 'new', 'screenID': '00008030-001A690E2EC3802E', 'distances': [0, 1, 3]}
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             root = Path(directory)
             calibration.save_profile(root, 'new', dict(profile, distances=[0, 2, 5]))
@@ -258,7 +289,7 @@ class AutomaticCalibrationTests(unittest.TestCase):
                 self.assertFalse(calibration.apply_verified_profile(api, self.device, root, 'new', profile, Mock()))
             self.assertEqual({path: path.read_bytes() for path in paths}, before)
             self.assertEqual(api.post.call_count, 2)  # load candidate, then restore old input
-            api.post.assert_called_with('/calibration/reload', 'phone-a')
+            api.post.assert_called_with('/calibration/reload', '00008030-001A690E2EC3802E')
 
     def test_failed_first_candidate_leaves_no_unverified_profile(self):
         api = Mock()
@@ -267,7 +298,7 @@ class AutomaticCalibrationTests(unittest.TestCase):
             root = Path(directory)
             with self.assertRaisesRegex(RuntimeError, 'connection lost'):
                 calibration.apply_verified_profile(api, self.device, root, 'new',
-                    {'host': 'new', 'screenID': 'phone-a', 'distances': [0, 1, 3]}, Mock())
+                    {'host': 'new', 'screenID': '00008030-001A690E2EC3802E', 'distances': [0, 1, 3]}, Mock())
             self.assertEqual(list(root.rglob('*.json')), [])
 
     def test_successful_baseline_reuse_skips_measurement(self):

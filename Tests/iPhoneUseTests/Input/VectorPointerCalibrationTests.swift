@@ -20,7 +20,7 @@ final class VectorPointerCalibrationTests: XCTestCase {
         RelativePointerCalibration(
             host: UUID(), screenWidth: 750, screenHeight: 1334,
             reportInterval: 0.03, distances: measuredDistances,
-            screenID: "phone-a", vectorModel: model)
+            screenID: "00008030-001A690E2EC3802E", vectorModel: model)
     }
 
     func testVerifiedRadialReportUsesWholeVectorMagnitude() throws {
@@ -137,19 +137,19 @@ final class VectorPointerCalibrationTests: XCTestCase {
 
         let matched = try XCTUnwrap(
             RelativePointerCalibration.loadMatchingScreen(
-                host: newHost, screenSize: CGSize(width: 750, height: 1334), screenID: "phone-a", directory: directory))
+                host: newHost, screenSize: CGSize(width: 750, height: 1334), screenID: "00008030-001A690E2EC3802E",
+                directory: directory))
         XCTAssertEqual(matched.vectorModel, .radialQuantized)
         XCTAssertEqual(matched.host, newHost)
 
-        let rebound = try XCTUnwrap(
-            RelativePointerCalibration.rebind(
-                from: calibration.host, to: newHost, screenID: "phone-a", directory: directory))
-        XCTAssertEqual(rebound.vectorModel, .radialQuantized)
-        let persisted = try JSONDecoder().decode(
-            RelativePointerCalibration.self,
-            from: Data(contentsOf: directory.appendingPathComponent(newHost.uuidString + ".json")))
-        XCTAssertEqual(persisted.vectorModel, .radialQuantized)
-        XCTAssertEqual(persisted.distances, calibration.distances)
+        XCTAssertEqual(matched.screenID, calibration.screenID)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                RelativePointerCalibration.self, from: Data(contentsOf: originalURL)), calibration)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath:
+                    directory.appendingPathComponent(newHost.uuidString + ".json").path))
     }
 
     private func trajectory(

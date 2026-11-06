@@ -14,6 +14,46 @@ final class RelativePointerScreenMatcherTests: XCTestCase {
         return pixels
     }
 
+    func testClosedRectangleMeasuresAllFourSessionOrientations() {
+        for orientation in RelativePointerScreenMatcher.Orientation.allCases {
+            let points = [(0, 0), (20, 0), (20, 20), (0, 20), (0, 0)].map {
+                let delta = orientation.screenDelta(dx: $0.0, dy: $0.1)
+                return (80 + delta.dx, 160 + delta.dy)
+            }
+            let frames = points.map { frame($0.0, $0.1) }
+            XCTAssertEqual(RelativePointerScreenMatcher.orientation(frames), orientation)
+            XCTAssertEqual(DevicePairingRecovery.probeResult(for: frames), .hit)
+            let fullFrames = frames.map { PointerMotionObservation.Frame(width: 180, height: 320, pixels: $0) }
+            XCTAssertEqual(
+                PointerMotionObservation.closedRectangleOrigin(fullFrames, orientation: orientation),
+                CGPoint(x: 80.5, y: 160.5))
+            for delta in [(8, 0), (0, 8), (-12, 16)] {
+                let report = orientation.reportDelta(dx: delta.0, dy: delta.1)
+                let screen = orientation.screenDelta(dx: report.dx, dy: report.dy)
+                XCTAssertEqual(screen.dx, delta.0)
+                XCTAssertEqual(screen.dy, delta.1)
+            }
+        }
+    }
+
+    func testMultipleSimultaneousRotatedPathsCannotProveOneOrientation() {
+        let frames = (0..<5).map { index -> [UInt8] in
+            var pixels = frame(30, 80)
+            for orientation in [RelativePointerScreenMatcher.Orientation.identity, .counterclockwise] {
+                let delta = [(0, 0), (20, 0), (20, 20), (0, 20), (0, 0)][index]
+                let point = orientation.screenDelta(dx: delta.0, dy: delta.1)
+                let origin = orientation == .identity ? (40, 140) : (120, 240)
+                for dy in -4...4 {
+                    for dx in -4...4 where dx * dx + dy * dy <= 16 {
+                        pixels[(origin.1 + point.dy + dy) * 180 + origin.0 + point.dx + dx] = 100
+                    }
+                }
+            }
+            return pixels
+        }
+        XCTAssertNil(RelativePointerScreenMatcher.orientation(frames))
+    }
+
     func testRectangleIdentifiesLightAndDarkPointersWithoutARequiredGain() {
         for inverted in [false, true] {
             for distance in [8, 20, 35] {
@@ -40,7 +80,7 @@ final class RelativePointerScreenMatcherTests: XCTestCase {
 
     func testClippedMovementWrongDirectionAndFailedReturnDoNotMatch() {
         for points in [
-            [(30, 80), (30, 100), (50, 100), (50, 80), (30, 80)],
+            [(30, 80), (30, 100), (50, 100), (30, 100), (30, 80)],
             [(30, 80), (50, 80), (50, 80), (30, 80), (30, 80)],
             [(30, 80), (50, 80), (50, 100), (30, 100), (35, 80)],
         ] {
