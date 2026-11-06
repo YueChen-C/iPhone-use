@@ -78,7 +78,8 @@ enum MCPToolCatalog {
                 [
                     "text": ["type": "string"], "device": device,
                     "clear_before": ["type": "boolean"], "commit_ime": ["type": "boolean"],
-                    "press_enter": ["type": "boolean"], "ensure_chinese_ime": ["type": "boolean"],
+                    "press_enter": ["type": "boolean"], "submit": ["type": "boolean"],
+                    "ensure_chinese_ime": ["type": "boolean"],
                     "use_clipboard": ["type": "boolean"],
                 ], required: ["text"]),
             tool(

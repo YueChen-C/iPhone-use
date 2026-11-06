@@ -7,7 +7,13 @@ final class DeviceInput {
     let session: UUID?
     private let lifecycleLock = NSLock()
     private var retired = false
+    private var lastActivityUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
     var isRetired: Bool { lifecycleLock.withLock { retired } }
+    var lastInputUptime: TimeInterval { lifecycleLock.withLock { lastActivityUptime } }
+
+    func recordInputActivity(at uptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        lifecycleLock.withLock { lastActivityUptime = uptime }
+    }
 
     var isCurrentSession: Bool {
         guard !isRetired, let session else { return false }
@@ -160,6 +166,13 @@ final class DeviceInput {
 // MARK: - Pointer gestures
 
 extension DeviceInput {
+    enum ScrollDirection: String, CaseIterable {
+        case up
+        case down
+        case left
+        case right
+    }
+
     /// Coordinates are fractions of the screen, 0...1 from the top-left corner.
     func tap(x: Double, y: Double, hold: TimeInterval = 0.08) throws {
         try performCoordinateGesture {
@@ -169,6 +182,174 @@ extension DeviceInput {
             pause(hold)
             button(down: false)
             pause(step)
+        }
+    }
+
+    /// Double-clicks at one point with no pointer movement between clicks.
+    func doubleTap(
+        x: Double, y: Double,
+        hold: TimeInterval = 0.22,
+        gap: TimeInterval = 0.12
+    ) throws {
+        try multiTap(x: x, y: y, clicks: 2, hold: hold, gap: gap)
+    }
+
+    /// Triple-clicks at one point with no pointer movement between clicks.
+    func tripleTap(
+        x: Double, y: Double,
+        hold: TimeInterval = 0.22,
+        gap: TimeInterval = 0.12
+    ) throws {
+        try multiTap(x: x, y: y, clicks: 3, hold: hold, gap: gap)
+    }
+
+    private func multiTap(
+        x: Double, y: Double,
+        clicks: Int,
+        hold: TimeInterval,
+        gap: TimeInterval
+    ) throws {
+        try performCoordinateGesture {
+            guard x.isFinite, y.isFinite, (0...1).contains(x), (0...1).contains(y),
+                hold.isFinite, hold > 0, gap.isFinite, gap >= 0, clicks >= 2
+            else {
+                throw InputError.invalidSwipe(StringsAPI.current.swipeReasonPoints)
+            }
+            pointer(x, y)
+            pause(step * 2)
+            for clickIndex in 0..<clicks {
+                button(down: true)
+                pause(hold)
+                button(down: false)
+                if clickIndex + 1 < clicks {
+                    pause(gap)
+                } else {
+                    pause(step)
+                }
+            }
+        }
+    }
+
+    /// Long-presses at one point without sending intermediate reports while held.
+    /// `duration` must be in `0.1...10.0` seconds (`100...10000` ms).
+    func hold(x: Double, y: Double, duration: TimeInterval = 1.0) throws {
+        try performCoordinateGesture {
+            guard x.isFinite, y.isFinite, (0...1).contains(x), (0...1).contains(y) else {
+                throw InputError.invalidSwipe(StringsAPI.current.swipeReasonPoints)
+            }
+            guard duration.isFinite, (0.1...10.0).contains(duration) else {
+                throw InputError.invalidHoldDuration
+            }
+            pointer(x, y)
+            pause(step * 2)
+            button(down: true)
+            pause(duration)
+            button(down: false)
+            pause(step)
+        }
+    }
+
+    /// Moves to `from`, presses the button down, stays completely still for `holdDuration`
+    /// (`0.1...10.0` s), then drags smoothly to `to` over `dragDuration` (`0.016...10.0` s)
+    /// while keeping the button held, and finally releases.
+    func holdDrag(
+        from: (Double, Double),
+        to: (Double, Double),
+        holdDuration: TimeInterval = 1.0,
+        dragDuration: TimeInterval = 1.0
+    ) throws {
+        try performCoordinateGesture {
+            let table = StringsAPI.current
+            guard from.0.isFinite, from.1.isFinite, (0...1).contains(from.0), (0...1).contains(from.1),
+                to.0.isFinite, to.1.isFinite, (0...1).contains(to.0), (0...1).contains(to.1)
+            else {
+                throw InputError.invalidSwipe(table.swipeReasonPoints)
+            }
+            guard holdDuration.isFinite, (0.1...10.0).contains(holdDuration) else {
+                throw InputError.invalidHoldDuration
+            }
+            guard dragDuration.isFinite, (0.016...10.0).contains(dragDuration) else {
+                throw InputError.invalidSwipe(table.swipeReasonDuration)
+            }
+            let reportCount = dragDuration / step
+            guard step.isFinite, step > 0, (step * 2).isFinite,
+                reportCount.isFinite, reportCount < Double(Int.max)
+            else {
+                throw InputError.invalidSwipe(table.swipeReasonReportCount)
+            }
+
+            pointer(from.0, from.1)
+            pause(step * 2)
+            beginEstimatedDrag(x: from.0, y: from.1)
+            button(down: true)
+            // Stay completely still while holding: no movement reports are emitted.
+            pause(holdDuration)
+            let steps = max(2, Int(dragDuration / step))
+            let interval = dragDuration / Double(steps)
+            for i in 1...steps {
+                let t = Double(i) / Double(steps)
+                let x = from.0 + (to.0 - from.0) * t
+                let y = from.1 + (to.1 - from.1) * t
+                if calibration != nil {
+                    dragMove(x, y, sequence: nil)
+                    pause(interval)
+                } else {
+                    let movementWait = moveEstimatedDragPointer(x, y, sequence: nil)
+                    if interval > movementWait {
+                        pause(interval - movementWait)
+                    }
+                }
+            }
+            button(down: false)
+            pause(step)
+            endEstimatedDrag()
+        }
+    }
+
+    /// Moves the pointer to `at` (defaulting to screen center `(0.5, 0.5)`) and sends
+    /// `ticks` (`1...1000`) wheel reports in `direction` (`up`, `down`, `left`, `right`).
+    func scroll(
+        direction: ScrollDirection,
+        ticks: Int = 5,
+        at: (Double, Double) = (0.5, 0.5)
+    ) throws {
+        try performCoordinateGesture {
+            guard at.0.isFinite, at.1.isFinite, (0...1).contains(at.0), (0...1).contains(at.1) else {
+                throw InputError.invalidSwipe(StringsAPI.current.swipeReasonPoints)
+            }
+            guard (1...1000).contains(ticks) else {
+                throw InputError.invalidScrollTicks
+            }
+            pointer(at.0, at.1)
+            pause(step * 2)
+            let wheelStep: Int
+            let usesHorizontalShift: Bool
+            switch direction {
+            case .up:
+                wheelStep = 1
+                usesHorizontalShift = false
+            case .down:
+                wheelStep = -1
+                usesHorizontalShift = false
+            case .left:
+                wheelStep = 1
+                usesHorizontalShift = true
+            case .right:
+                wheelStep = -1
+                usesHorizontalShift = true
+            }
+            if usesHorizontalShift {
+                send(.keyboard, HIDReportPayload.keyboard(modifiers: 0x02))
+                pause(step)
+            }
+            for _ in 0..<ticks {
+                send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 0, dx: 0, dy: 0, wheel: wheelStep))
+                pause(step)
+            }
+            if usesHorizontalShift {
+                send(.keyboard, HIDReportPayload.keyboard())
+                pause(step)
+            }
         }
     }
 
@@ -559,6 +740,7 @@ extension DeviceInput {
 
     @discardableResult
     private func advanceMotionSequence() -> UInt64 {
+        recordInputActivity()
         backgroundSequence.advance()
         return motionSequence.advance()
     }
@@ -645,6 +827,9 @@ extension DeviceInput {
 
     /// A named key with optional modifiers, e.g. key("h", modifiers: ["cmd"]).
     func key(_ name: String, modifiers: [String]) throws {
+        if name.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare("mute") == .orderedSame {
+            throw InputError.muteKeyRequiresMuteCommand
+        }
         guard let code = KeyboardMap.code(for: name)
         else { throw InputError.unknownKey(name) }
         var mask: UInt8 = 0
@@ -663,6 +848,21 @@ extension DeviceInput {
             pause(0.08)
             send(.consumer, HIDReportPayload.consumer(0))
             pause(step)
+        }
+    }
+
+    /// Sends a harmless Left Control modifier tap (`0x01` down then `0x00` up)
+    /// to reset iOS's idle dim/lock timer without affecting UI state.
+    @discardableResult
+    func sendControlKeepAlive() -> Bool {
+        queue.sync {
+            guard !isRetired, inputIsAllowed(), !windowDragging, buttons == 0,
+                reportReadiness(.keyboard, host, session)
+            else { return false }
+            reportSender(.keyboard, HIDReportPayload.keyboard(modifiers: 0x01, code: 0))
+            pause(step)
+            reportSender(.keyboard, HIDReportPayload.keyboard(modifiers: 0x00, code: 0))
+            return true
         }
     }
 
@@ -925,12 +1125,15 @@ extension DeviceInput {
 }
 
 extension DeviceInput {
-    enum InputError: Error, CustomStringConvertible {
+    enum InputError: Error, CustomStringConvertible, Equatable {
         case untypeable(Character)
         case unknownKey(String)
+        case muteKeyRequiresMuteCommand
         case pointerBusy
         case calibrationMismatch
         case invalidSwipe(String)
+        case invalidHoldDuration
+        case invalidScrollTicks
         case pairingProbeUnavailable
 
         var description: String {
@@ -938,9 +1141,13 @@ extension DeviceInput {
             return switch self {
             case .untypeable(let c): table.untypeable(String(reflecting: c))
             case .unknownKey(let k): table.unknownKey(k)
+            case .muteKeyRequiresMuteCommand:
+                "mute is excluded from key; use mute or unmute so ringer state is verified over USB"
             case .pointerBusy: table.pointerBusy
             case .calibrationMismatch: table.calibrationMismatch
             case .invalidSwipe(let reason): table.invalidSwipePrefix(reason)
+            case .invalidHoldDuration: "hold duration must be within 100...10000 ms (0.1...10.0 seconds)"
+            case .invalidScrollTicks: "scroll ticks must be within 1...1000"
             case .pairingProbeUnavailable: table.pairingProbeUnavailable
             }
         }

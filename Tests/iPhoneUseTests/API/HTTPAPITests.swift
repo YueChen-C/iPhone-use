@@ -553,6 +553,28 @@ final class TypeTextRequestTests: XCTestCase {
         }
     }
 
+    func testSubmitOptionEmitsOrderedCommitAndEnterReports() throws {
+        // Plain ASCII text: submit presses enter directly without redundant IME commit space.
+        var asciiReports: [[UInt8]] = []
+        let asciiInput = DeviceInput(
+            host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
+            reportSender: { _, bytes in asciiReports.append(bytes) })
+        try TypeTextRequest(["text": "hi", "submit": true]).perform(on: asciiInput)
+        let asciiPressed = asciiReports.filter { $0.dropFirst(2).contains(where: { $0 != 0 }) }
+        // 'h'=11, 'i'=12, enter=40
+        XCTAssertEqual(asciiPressed.map { $0[2] }, [11, 12, 40])
+
+        // Hanzi text: submit automatically inserts space to commit IME candidate before enter.
+        var hanziReports: [[UInt8]] = []
+        let hanziInput = DeviceInput(
+            host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
+            reportSender: { _, bytes in hanziReports.append(bytes) })
+        try TypeTextRequest(["text": "好", "submit": true]).perform(on: hanziInput)
+        let hanziPressed = hanziReports.filter { $0.dropFirst(2).contains(where: { $0 != 0 }) }
+        // 'h'=11, 'a'=4, 'o'=18, pinyin word end space=44, commit IME space=44, enter=40
+        XCTAssertEqual(hanziPressed.suffix(2).map { $0[2] }, [44, 40])
+    }
+
     func testPinyinPreservesUmlautAsVBeforeStrippingTones() {
         let cases = [
             "女": "nv ", "吕": "lv ", "绿": "lv ", "绿色": "lvse ", "略": "lve ", "虐": "nve ",

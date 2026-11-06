@@ -3,7 +3,7 @@ import CoreFoundation
 import Foundation
 
 enum TextEntry {
-    static let textOptions = ["clear_before", "commit_ime", "press_enter", "ensure_chinese_ime", "use_clipboard"]
+    static let textOptions = ["clear_before", "commit_ime", "press_enter", "submit", "ensure_chinese_ime", "use_clipboard"]
 
     static func isBoolean(_ value: Any?) -> Bool {
         guard let number = value as? NSNumber else { return false }
@@ -69,8 +69,12 @@ struct TypeTextRequest {
             actions += [key("a", ["command"]), key("backspace")]
         }
         actions.append(clipboard ? .clipboard(text) : .text(text, ensureIME: body["ensure_chinese_ime"] as? Bool))
-        if body["commit_ime"] as? Bool == true { actions.append(key("space")) }
-        if body["press_enter"] as? Bool == true { actions.append(key("enter")) }
+        let submit = body["submit"] as? Bool == true
+        let commitIME = (body["commit_ime"] as? Bool == true) || (submit && !clipboard && KeyboardMap.containsHanzi(text))
+        let pressEnter = (body["press_enter"] as? Bool == true) || submit
+
+        if commitIME { actions.append(key("space")) }
+        if pressEnter { actions.append(key("enter")) }
         self.actions = actions
         ensureChineseIME = !clipboard && ((body["ensure_chinese_ime"] as? Bool) ?? KeyboardMap.containsHanzi(text))
     }

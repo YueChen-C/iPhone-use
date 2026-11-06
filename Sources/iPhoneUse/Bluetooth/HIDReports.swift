@@ -84,8 +84,16 @@ enum HIDReportPayload {
         [buttons, UInt8(x & 0xFF), UInt8(x >> 8), UInt8(y & 0xFF), UInt8(y >> 8)]
     }
 
-    static func relativeMouse(buttons: UInt8, dx: Int = 0, dy: Int = 0) -> [UInt8] {
-        [buttons, UInt8(bitPattern: Int8(dx)), UInt8(bitPattern: Int8(dy)), 0]
+    static func relativeMouse(buttons: UInt8, dx: Int = 0, dy: Int = 0, wheel: Int = 0) -> [UInt8] {
+        let clampedX = max(-127, min(127, dx))
+        let clampedY = max(-127, min(127, dy))
+        let clampedWheel = max(-127, min(127, wheel))
+        return [
+            buttons,
+            UInt8(bitPattern: Int8(clampedX)),
+            UInt8(bitPattern: Int8(clampedY)),
+            UInt8(bitPattern: Int8(clampedWheel)),
+        ]
     }
 
     static func consumer(_ usage: UInt16) -> [UInt8] {
