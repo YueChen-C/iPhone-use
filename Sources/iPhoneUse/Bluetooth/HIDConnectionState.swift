@@ -132,8 +132,9 @@ struct HIDConnectionState {
 /// so late cancellation callbacks cannot drop a newer connection attempt and mid-session
 /// disconnects recover within a finite retry budget without infinite loops.
 struct HIDReconnectTracker {
-    static let maxAutomaticAttempts = 3
-    static let retryDelays: [TimeInterval] = [2.0, 6.0]
+    static let retryDelays: [TimeInterval] = [2, 6, 12, 20, 30]
+    static let maxAutomaticAttempts = retryDelays.count + 1
+    static let attemptTimeout: TimeInterval = 20
 
     enum Phase: Equatable {
         case connecting(attempt: UInt64)

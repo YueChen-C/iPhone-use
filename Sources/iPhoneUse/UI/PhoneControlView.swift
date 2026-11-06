@@ -459,9 +459,9 @@ final class PhoneControlView: NSView {
     }
 
     private func preemptBackgroundPointerMotion() {
-        guard let device else { return }
-        // A new phone may still be undergoing discovery and have no input
-        // cached for its screen. Cancel the registry's whole discovery round.
+        // Mouse clicks, keys and shortcuts can arrive while the overlay blocks
+        // input. Such ignored events must not cancel discovery or its retry.
+        guard connectionStatus?.permitsBackgroundMotionPreemption == true, let device else { return }
         DeviceRegistry.shared.cancelBackgroundMotion(for: device)
     }
 

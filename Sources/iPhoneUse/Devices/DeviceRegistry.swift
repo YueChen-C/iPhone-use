@@ -781,9 +781,8 @@ final class DeviceRegistry {
         if all().contains(where: { $0.host == nil }) { scheduleProbingRetryIfNeeded() }
     }
 
-    /// A newly connected phone may be locked or lack its first USB frame. Give
-    /// that topology one delayed retry, then wait for a reconnect or explicit
-    /// match. Failed image recognition must never cause endless pointer motion.
+    /// Wait progressively longer for slow subscriptions, first frames or unlock.
+    /// The finite retry schedule never polls continuously with pointer motion.
     private func scheduleProbingRetryIfNeeded() {
         guard probingMayContinue() else { return }
         let screens = ScreenCaptureManager.shared.associationScreens
@@ -794,10 +793,10 @@ final class DeviceRegistry {
         guard !freeScreens.isEmpty else { return }
         guard hosts.contains(where: { !matchedHosts.contains($0) }) else { return }
 
-        guard let token = probeSchedule.scheduleRetry() else { return }
+        guard let token = probeSchedule.scheduleRetry(), let delay = probeSchedule.pendingRetryDelay else { return }
         let activity = probeActivities?.map { $0.value } ?? []
         let generation = probingGeneration
-        matchQueue.asyncAfter(deadline: .now() + 20) {
+        matchQueue.asyncAfter(deadline: .now() + delay) {
             guard self.probeSchedule.beginRetry(token) else { return }
             guard self.lock.withLock({ self.backgroundMotionGeneration == generation }),
                 activity.allSatisfy({ $0.input.inputActivitySequence == $0.sequence })
