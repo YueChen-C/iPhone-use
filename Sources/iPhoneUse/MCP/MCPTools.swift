@@ -107,6 +107,30 @@ enum MCPToolCatalog {
                     "steps": actSteps,
                     "device": device,
                 ], required: ["steps"]),
+            tool(
+                "switch_track_mode",
+                table.toolSwitchTrackMode,
+                [
+                    "mode": [
+                        "type": "string",
+                        "enum": ["standard", "enhanced", "auto"],
+                    ],
+                    "device": device,
+                ],
+                required: ["mode"]),
+            tool(
+                "get_track_status",
+                table.toolGetTrackStatus,
+                ["device": device],
+                readOnly: true),
+            tool(
+                "get_ax_tree",
+                table.toolGetAXTree,
+                [
+                    "include_offscreen": ["type": "boolean"],
+                    "device": device,
+                ],
+                readOnly: true),
         ]
     }
 
@@ -274,6 +298,16 @@ struct MCPToolRequest {
                 body: withDevice(["key": arguments["key"] ?? "", "modifiers": arguments["modifiers"] ?? []], device))
         case "home":
             return MCPToolRequest(path: "/home", body: withDevice([:], device))
+        case "switch_track_mode":
+            var body: [String: Any] = [:]
+            if let mode = arguments["mode"] { body["mode"] = mode }
+            return MCPToolRequest(path: "/track/switch", body: withDevice(body, device))
+        case "get_track_status":
+            return MCPToolRequest(path: "/track/status", body: withDevice([:], device))
+        case "get_ax_tree":
+            var body: [String: Any] = [:]
+            if let off = arguments["include_offscreen"] { body["include_offscreen"] = off }
+            return MCPToolRequest(path: "/ax_tree", body: withDevice(body, device))
         default:
             return nil
         }
