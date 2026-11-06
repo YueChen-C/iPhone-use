@@ -231,6 +231,16 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     private var lifecycleGeneration: UInt64 = 0
     private var usbDemandRevision: UInt64 = 0
     private var isStopped = false
+    private var retainsIdleUSBDemand = false
+    private let restoreAllUSB: (TimeInterval) -> Bool
+
+    init(
+        restoreAllUSB: @escaping (TimeInterval) -> Bool = {
+            USBValeriaConfigurator.restorePreviousConfigurations(deadlineUptime: $0)
+        }
+    ) {
+        self.restoreAllUSB = restoreAllUSB
+    }
 
     /// Called when a phone's screen appears or goes away.
     var onScreensChanged: (() -> Void)?
@@ -241,6 +251,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         let hasPendingSwitches = USBValeriaConfigurator.requiresStartupReconciliation
         let (generation, needsAsyncReconcile) = lock.withLock { () -> (UInt64, Bool) in
             isStopped = false
+            retainsIdleUSBDemand = false
             captureDiscoveryEnabled = false
             lifecycleGeneration &+= 1
             let gen = lifecycleGeneration
@@ -253,6 +264,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             runStartupReconciliationAttempt(generation: generation)
         } else {
             enableCaptureDiscoveryIfNeeded(generation: generation)
+            refresh()
         }
 
         // CoreMediaIO can publish the iPhone capture device shortly after USB trust,
@@ -333,10 +345,54 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
 
     @discardableResult
     func stop(waitTimeout: TimeInterval = 0) -> ScreenCaptureStopResult {
+        stop(waitTimeout: waitTimeout, retainingIdleUSBDemand: { _ in false })
+    }
+
+    @discardableResult
+    func suspendForIdle(
+        waitTimeout: TimeInterval = 0,
+        observeUSBTopology: () -> USBValeriaConfigurator.IOSUSBTopologyObservation =
+            USBValeriaConfigurator.currentIOSUSBTopology
+    ) -> ScreenCaptureStopResult {
+        // USB topology queries must stay outside the manager lock (USB queue lock order).
+        let observation = observeUSBTopology()
+        return stop(
+            waitTimeout: waitTimeout,
+            retainingIdleUSBDemand: { hasActiveCapture in
+                switch observation {
+                case .observed(let topology):
+                    return !topology.attachedEntryIDs.isEmpty
+                case .unavailable:
+                    return hasActiveCapture
+                }
+            })
+    }
+
+    @discardableResult
+    func clearIdleUSBDemandIfUnplugged(
+        observeUSBTopology: () -> USBValeriaConfigurator.IOSUSBTopologyObservation =
+            USBValeriaConfigurator.currentIOSUSBTopology
+    ) -> Bool {
+        guard lock.withLock({ isStopped && retainsIdleUSBDemand }),
+            observeUSBTopology().confirmsNoAttachedDevices
+        else { return false }
+        return lock.withLock {
+            guard isStopped, retainsIdleUSBDemand else { return false }
+            retainsIdleUSBDemand = false
+            return true
+        }
+    }
+
+    private func stop(
+        waitTimeout: TimeInterval,
+        retainingIdleUSBDemand: (_ hasActiveCapture: Bool) -> Bool = { _ in false }
+    ) -> ScreenCaptureStopResult {
         refreshTimer?.invalidate()
         refreshTimer = nil
         let (observers, activeSources) = lock.withLock {
+            let hadActiveCapture = !sources.isEmpty || !screens.isEmpty || retainsIdleUSBDemand
             isStopped = true
+            retainsIdleUSBDemand = retainingIdleUSBDemand(hadActiveCapture)
             captureDiscoveryEnabled = false
             startupReconciliationGate.reset()
             lifecycleGeneration &+= 1
@@ -357,9 +413,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             waitTimeout: waitTimeout,
             activeSources: activeSources,
             notifyQueue: shutdownQueue,
-            restoreAllUSB: { deadline in
-                USBValeriaConfigurator.restorePreviousConfigurations(deadlineUptime: deadline)
-            })
+            restoreAllUSB: restoreAllUSB)
     }
 
     private func allowScreenCaptureDevices() {
@@ -390,10 +444,20 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
 
     /// Captures a linearizable snapshot of present USB screens together with a strictly
     /// monotonic revision minted under `lock`, preventing out-of-order demand updates.
-    func sampleScreensWithRevision() -> (screens: [ScreenCaptureSession], revision: UInt64) {
+    func sampleScreensWithRevision() -> (screens: [ScreenCaptureSession], retainsUSBDemand: Bool, revision: UInt64) {
         lock.withLock {
             usbDemandRevision &+= 1
-            return (screens.values.sorted { $0.name < $1.name }, usbDemandRevision)
+            return (
+                screens.values.sorted { $0.name < $1.name }, !screens.isEmpty || retainsIdleUSBDemand,
+                usbDemandRevision
+            )
+        }
+    }
+
+    func mintUSBDemandRevision() -> UInt64 {
+        lock.withLock {
+            usbDemandRevision &+= 1
+            return usbDemandRevision
         }
     }
 
@@ -445,7 +509,8 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     }
 
     private func refresh() {
-        guard !lock.withLock({ isStopped }) else { return }
+        let generation = lock.withLock { isStopped ? nil : lifecycleGeneration }
+        guard let generation else { return }
         let devices = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.external], mediaType: .muxed, position: .unspecified
         ).devices.filter { $0.modelID.contains("iOS") && $0.isConnected }
@@ -472,7 +537,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         var refreshLifecycle: UInt64 = 0
         var job: (UInt64, [String: ScreenCaptureSource])?
         let didRun = lock.withLock { () -> Bool in
-            guard !isStopped else { return false }
+            guard !isStopped, lifecycleGeneration == generation else { return false }
             refreshLifecycle = lifecycleGeneration
             var newlyClaimedSwitches: [CaptureValeriaRecoveryTracker.ScheduledPostSwitchCheck] = []
             for (id, source) in sources where !present.contains(id) {

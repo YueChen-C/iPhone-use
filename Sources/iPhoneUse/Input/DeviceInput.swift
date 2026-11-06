@@ -212,7 +212,8 @@ extension DeviceInput {
     }
 
     /// Follow a polyline with one press and release. `duration` is the total
-    /// movement wait; positioning, button pacing and calibrated HID reports
+    /// movement wait; estimated report pacing counts toward it. Positioning,
+    /// button pacing and calibrated HID reports
     /// retain their own intervals. Segment waits follow physical screen distance.
     func swipe(points: [(Double, Double)], duration: TimeInterval) throws {
         try performCoordinateGesture {
@@ -255,14 +256,20 @@ extension DeviceInput {
                 let steps = max(2, Int(segmentDuration / step))
                 for i in 1...steps {
                     let t = Double(i) / Double(steps)
-                    let started = monotonicTime()
-                    dragMove(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t, sequence: nil)
-                    // Measured relative reports already wait at the calibration cadence.
-                    // Count that time toward this path interval, rather than
-                    // slowing reports a second time and changing iOS acceleration.
-                    let spent = measuredDragCurve == nil ? 0 : monotonicTime() - started
-                    let remaining = segmentDuration / Double(steps) - spent
-                    if remaining > 0 { pause(remaining) }
+                    let x = from.0 + (to.0 - from.0) * t
+                    let y = from.1 + (to.1 - from.1) * t
+                    let interval = segmentDuration / Double(steps)
+                    if calibration != nil {
+                        dragMove(x, y, sequence: nil)
+                        pause(interval)
+                    } else {
+                        let started = monotonicTime()
+                        let movementWait = moveEstimatedDragPointer(x, y, sequence: nil)
+                        // Preserve the measured cadence while counting report waits
+                        // toward the path interval, including the built-in fallback.
+                        let spent = measuredDragCurve == nil ? movementWait : max(movementWait, monotonicTime() - started)
+                        if interval > spent { pause(interval - spent) }
+                    }
                 }
             }
             if let last = points.last { refineDragEndpoint(x: last.0, y: last.1) }
@@ -699,10 +706,11 @@ extension DeviceInput {
     }
 
     func type(_ text: String) throws {
-        let strokes = try text.map { character -> KeyboardMap.Stroke in
-            guard let stroke = KeyboardMap.stroke(for: character) else { throw InputError.untypeable(character) }
-            return stroke
+        guard let keyboardText = KeyboardMap.keyboardText(for: text) else {
+            let invalid = text.first { KeyboardMap.stroke(for: $0) == nil } ?? "?"
+            throw InputError.untypeable(invalid)
         }
+        let strokes = keyboardText.compactMap { KeyboardMap.stroke(for: $0) }
         if !strokes.isEmpty { discardPendingMotion() }
         queue.sync {
             for stroke in strokes {
@@ -1038,48 +1046,44 @@ extension DeviceInput {
     /// value in the built-in curve.
     static let estimatedDragMaxCount = 32
 
-    /// Follows the drag target with relative reports, one axis per report like
-    /// unverified calibrated profiles. Each report picks the count whose
-    /// curve-predicted distance best covers the remaining error, so slow and
-    /// fast drags track the mouse at the same fidelity; each new target
-    /// corrects whatever the real curve did differently.
-    fileprivate func moveEstimatedDragPointer(_ x: Double, _ y: Double, sequence: UInt64?) {
+    /// Measured curves use their verified single-axis cadence. The built-in
+    /// fallback retains combined X/Y reports for responsive diagonal dragging.
+    @discardableResult
+    fileprivate func moveEstimatedDragPointer(_ x: Double, _ y: Double, sequence: UInt64?) -> TimeInterval {
         guard shouldContinueMotion(sequence),
             let size = screenSize?(),
             var position = dragPosition
-        else { return }
+        else { return 0 }
         let target = CGPoint(
             x: max(0, min(size.width - 1, x * size.width)),
             y: max(0, min(size.height - 1, y * size.height)))
         let curve = measuredDragSize == size ? measuredDragCurve : nil
         let distances = curve ?? Self.estimatedDragCurve
         let scale = curve == nil ? size.width / Self.estimatedDragReferenceWidth : 1
-        let tolerance = distances[1] * scale / 2
-        while shouldContinueMotion(sequence) {
+        let verticalScale = curve == nil ? 1 : measuredDragVerticalScale
+        let toleranceX = distances[1] * scale / 2
+        let toleranceY = toleranceX * verticalScale
+        var movementWait: TimeInterval = 0
+        while shouldContinueMotion(sequence), dragWindowSequence.map(windowSequence.isCurrent) ?? true {
             let remainingX = target.x - position.x
             let remainingY = target.y - position.y
-            guard abs(remainingX) > tolerance || abs(remainingY) > tolerance else { break }
-            let preferredAxis: Int
-            if let last = lastEstimatedMovement {
-                preferredAxis = last.dx != 0 ? 1 : 0
-            } else {
-                preferredAxis = abs(remainingX) >= abs(remainingY) ? 0 : 1
-            }
+            guard abs(remainingX) > toleranceX || abs(remainingY) > toleranceY else { break }
+            let preferredAxis = lastEstimatedMovement.map { $0.dx != 0 ? 1 : 0 }
+                ?? (abs(remainingX) >= abs(remainingY) ? 0 : 1)
+            let axes = curve == nil ? [0, 1] : [preferredAxis, 1 - preferredAxis]
             var report = (dx: 0, dy: 0)
-            for axis in [preferredAxis, 1 - preferredAxis] {
+            for axis in axes {
                 let error = axis == 0 ? remainingX : remainingY
+                let tolerance = axis == 0 ? toleranceX : toleranceY
                 guard abs(error) > tolerance else { continue }
-                // Largest count whose predicted distance still fits the error,
-                // so the estimate never overshoots its own prediction.
-                let axisScale = scale * (axis == 1 && curve != nil ? measuredDragVerticalScale : 1)
-                var count = 1
+                let axisScale = scale * (axis == 1 ? verticalScale : 1)
+                var count = 0
                 for candidate in 1..<distances.count
                 where distances[candidate] * axisScale <= abs(error) + tolerance {
                     count = candidate
                 }
-                let distance =
-                    distances[count] * scale
-                    * (axis == 1 && curve != nil ? measuredDragVerticalScale : 1)
+                guard count > 0 else { continue }
+                let distance = distances[count] * axisScale
                 if axis == 0 {
                     report.dx = error < 0 ? -count : count
                     position.x = max(0, min(size.width - 1, position.x + (error < 0 ? -distance : distance)))
@@ -1087,22 +1091,31 @@ extension DeviceInput {
                     report.dy = error < 0 ? -count : count
                     position.y = max(0, min(size.height - 1, position.y + (error < 0 ? -distance : distance)))
                 }
-                break
+                if curve != nil { break }
             }
-            guard report.dx != 0 || report.dy != 0 else { break }
+            // A bad or numerically unrepresentable model must never keep a
+            // touch held while monopolizing this phone's serial input queue.
+            guard report.dx != 0 || report.dy != 0,
+                abs(target.x - position.x) + abs(target.y - position.y) < abs(remainingX) + abs(remainingY)
+            else {
+                button(down: false)
+                windowDragging = false
+                endEstimatedDrag()
+                return movementWait
+            }
             relative(report.dx, report.dy)
             lastEstimatedMovement = RelativePointerCalibration.Movement(dx: report.dx, dy: report.dy)
             pause(step)
+            movementWait += step
         }
         dragPosition = position
-        // Keep the absolute bookkeeping where the phone most likely shows the
-        // pointer, so a later hover or cancellation does not jump it.
         let unit = Double(HIDReportMap.absoluteMax)
         let raw = pointerTurn.rawPoint(for: CGPoint(x: position.x / size.width, y: position.y / size.height))
         absolutePointerPosition = (
             UInt16(max(0, min(unit, (raw.x * unit).rounded()))),
             UInt16(max(0, min(unit, (raw.y * unit).rounded())))
         )
+        return movementWait
     }
 
     fileprivate func shouldContinueMotion(_ sequence: UInt64?) -> Bool {

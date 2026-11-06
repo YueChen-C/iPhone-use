@@ -169,6 +169,7 @@ When multiple phones are connected, specify the full device ID: use `?device=<id
 | [Architecture (中文)](docs/architecture.md) | Modules, shared state, queues, and maintenance constraints |
 | [Agent skill (中文)](codex/skills/iphone-use/SKILL.md) | Reusable phone workflows for Codex |
 | [Release guide (中文)](docs/releasing.md) | Automated GitHub Releases, universal packaging, versions, and signing |
+| [Changelog](CHANGELOG.md) | Features, fixes, and behavior changes in each release |
 
 ## Development
 
@@ -180,6 +181,14 @@ python3 -B scripts/check-mcp.py
 ```
 
 Hardware changes also need real-device checks for pairing, USB reconnection, pointer accuracy, and window interaction. See the [architecture guide](docs/architecture.md) for formatting and maintenance conventions.
+
+## Disclaimer
+
+- **Authorization and compliance:** Use this project only on devices you own or have explicit permission to control. Follow applicable laws and the terms of the relevant apps and platforms. Do not use it for unauthorized access, privacy violations, or other unlawful activities.
+- **Operational risks:** Mouse, keyboard, script, and AI agent actions may produce unintended results. Review and manually confirm sensitive actions such as payments, sending messages, deleting data, or changing account settings. Back up important data before use.
+- **Privacy and data:** Screen mirroring, screenshots, and automation may expose personal information, verification codes, and other sensitive content. Before connecting a third-party MCP client or AI service, review its data handling policies and manage access permissions and the content you share.
+- **No warranty and limitation of liability:** This project is provided "as is," without guarantees of compatibility, stability, accuracy, or fitness for a particular purpose. To the extent permitted by applicable law, the authors and contributors are not liable for losses arising from its use. See the [MIT License](LICENSE) for the governing terms.
+- **Independent project:** This is an independent open-source project and is not officially approved, sponsored, or endorsed by Apple Inc. Apple, iPhone, macOS, and other names and trademarks belong to their respective owners.
 
 ## License
 

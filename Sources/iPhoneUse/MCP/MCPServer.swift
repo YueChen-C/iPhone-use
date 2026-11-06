@@ -4,7 +4,7 @@ import Foundation
 /// Screenshots are scaled so the long edge is at most `longEdge`; tap and swipe
 /// coordinates are read in that scaled image's pixels.
 enum MCPServer {
-    static let longEdge = 1200
+    static let longEdge = 1000
     static var base = URL(string: "http://127.0.0.1:7390")!
 
     /// This process's language, fetched from the app's /config because the stdio
@@ -13,6 +13,32 @@ enum MCPServer {
     /// predate the endpoint. Fetched once per process at initialize/tools/list.
     static var language: AppLanguage = .en
     private static var languageLoaded = false
+    private static var devicesCache = DeviceListCache()
+
+    struct DeviceListCache {
+        private var data: Data?
+        private var expires: TimeInterval = 0
+        private var origin: String = ""
+
+        mutating func invalidate() { data = nil }
+
+        func isValid(origin: String, now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+            data != nil && self.origin == origin && now < expires
+        }
+
+        mutating func load(
+            origin: String, now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+            fresh: Bool = false, fetch: () throws -> Data
+        ) throws -> Data {
+            if !fresh, self.origin == origin, now < expires, let data { return data }
+            invalidate()
+            let loaded = try fetch()
+            data = loaded
+            self.origin = origin
+            expires = now + 2
+            return loaded
+        }
+    }
 
     private static var client: MCPHTTPClient { MCPHTTPClient(base: base, language: language) }
 
@@ -83,7 +109,20 @@ enum MCPServer {
     private static func call(_ name: String, _ arguments: [String: Any]) -> [String: Any] {
         let table = StringsMCP(language: language)
         do {
-            let actions: [MCPToolRequest]
+            let observe = arguments["observe"] as? String ?? "full"
+            guard arguments["observe"] == nil || arguments["observe"] is String,
+                ["full", "ocr_diff", "none"].contains(observe)
+            else { throw MCPError("observe must be full, ocr_diff or none") }
+            let includeImage: Bool
+            if let raw = arguments["include_image"] {
+                guard let value = raw as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else {
+                    throw MCPError(StringsAPI(language: language).ocrParameterInvalid("include_image"))
+                }
+                includeImage = value.boolValue
+            } else {
+                includeImage = true
+            }
+            let actions: [MCPKeyboardAction]
             if name == "keyboard_sequence" {
                 actions = try MCPKeyboardSequence.actions(arguments: arguments, language: language)
             } else {
@@ -92,20 +131,43 @@ enum MCPServer {
                 guard name == "list_devices" || name == "screenshot" || action != nil else {
                     return failure(table.unknownTool(name))
                 }
-                actions = action.map { [$0] } ?? []
+                actions = action.map { [.request($0)] } ?? []
             }
             return try MCPAccess.withService(port: base.port ?? 7390, language: language) {
-                let (data, _) = try client.get("/devices")
+                let usedCache = name != "list_devices" && devicesCache.isValid(origin: base.absoluteString)
+                let data = try devicesCache.load(origin: base.absoluteString, fresh: name == "list_devices") {
+                    try client.get("/devices").0
+                }
                 if name == "list_devices" {
                     return ["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]]]
                 }
-                let device = try resolveDevice(arguments["device"] as? String, data: data)
+                let query = (arguments["device"] as? String) ?? (arguments["device_id"] as? String)
+                let device: String
+                do {
+                    device = try resolveDevice(query, data: data)
+                } catch {
+                    devicesCache.invalidate()
+                    guard usedCache else { throw error }
+                    let fresh = try devicesCache.load(origin: base.absoluteString) { try client.get("/devices").0 }
+                    device = try resolveDevice(query, data: fresh)
+                }
                 return try MCPAccess.withDevice(port: base.port ?? 7390, id: device, language: language) {
-                    for (index, action) in actions.enumerated() {
+                    if name == "ocr_screen", case .request(let action) = actions.first {
                         var body = action.body
                         body["device"] = device
+                        let data = try client.post(action.path, body)
+                        return ["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]]]
+                    }
+                    for (index, action) in actions.enumerated() {
                         do {
-                            try client.post(action.path, body)
+                            switch action {
+                            case .delay(let seconds):
+                                Thread.sleep(forTimeInterval: seconds)
+                            case .request(let request):
+                                var body = request.body
+                                body["device"] = device
+                                try client.post(request.path, body)
+                            }
                         } catch {
                             guard name == "keyboard_sequence" else { throw error }
                             throw MCPError(
@@ -116,16 +178,63 @@ enum MCPServer {
                             Thread.sleep(forTimeInterval: 0.15)
                         }
                     }
-                    if !actions.isEmpty {
-                        // Keep the lock through settling and confirmation, so another
-                        // chat's input cannot replace this action's result screenshot.
-                        Thread.sleep(forTimeInterval: 0.6)
+                    if observe == "none"
+                        || (name == "keyboard_sequence" && arguments["include_image"] as? Bool == false
+                            && arguments["observe"] == nil)
+                    {
+                        return ["content": [["type": "text", "text": "{\"ok\":true}"]]]
                     }
-                    return try screenshot(device)
+                    if !actions.isEmpty {
+                        // Keep the device lock through settling and final observation.
+                        waitForStableFrame { remaining in
+                            let encoded =
+                                device.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? device
+                            guard
+                                let data = try? client.get(
+                                    "/screenshot?maxEdge=64&device=\(encoded)&stability=1", timeout: remaining
+                                ).0
+                            else { return nil }
+                            let hash = ScreenOCR.stabilitySignature(data)
+                            return hash.isEmpty ? nil : hash
+                        }
+                    }
+                    if observe == "ocr_diff" {
+                        return try screenshot(device, includeImage: false, diff: true)
+                    }
+                    return try screenshot(device, includeImage: includeImage)
                 }
             }
         } catch {
+            devicesCache.invalidate()
             return failure("\(error)")
+        }
+    }
+
+    /// Bounded accumulated delays keep injected no-op sleep closures deterministic.
+    static func waitForStableFrame(
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        frame: (TimeInterval) -> String?
+    ) {
+        let start = now()
+        sleep(0.15)
+        var elapsed = max(0.15, now() - start)
+        guard elapsed < 0.6 else { return }
+        var previous = frame(0.6 - elapsed)
+        elapsed = max(elapsed, now() - start)
+        if previous == nil {
+            sleep(max(0, min(0.1, 0.6 - elapsed)))
+            return
+        }
+        while elapsed < 0.6 {
+            let interval = min(0.08, 0.6 - elapsed)
+            sleep(interval)
+            elapsed = max(elapsed + interval, now() - start)
+            guard elapsed < 0.6 else { return }
+            let current = frame(0.6 - elapsed)
+            if let current, current == previous { return }
+            previous = current
+            elapsed = max(elapsed, now() - start)
         }
     }
 
@@ -153,24 +262,42 @@ enum MCPServer {
         return id
     }
 
-    private static func screenshot(_ device: String?) throws -> [String: Any] {
+    private static func screenshot(_ device: String?, includeImage: Bool, diff: Bool = false) throws -> [String: Any] {
         var path = "/screenshot?maxEdge=\(longEdge)"
         if let device, let encoded = device.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
             path += "&device=\(encoded)"
         }
+        path += "&ocr=1"
         let (image, response) = try client.get(path)
         let width = response.value(forHTTPHeaderField: "X-Image-Width") ?? "?"
         let height = response.value(forHTTPHeaderField: "X-Image-Height") ?? "?"
         let id = response.value(forHTTPHeaderField: "X-Device") ?? ""
-        return [
-            "content": [
-                ["type": "image", "data": image.base64EncodedString(), "mimeType": "image/jpeg"],
-                [
-                    "type": "text",
-                    "text": StringsMCP(language: language).screenshotCaption(id, width, height),
-                ],
-            ]
-        ]
+        let serverOCR = response.value(forHTTPHeaderField: "X-Screen-OCR")
+            .flatMap { Data(base64Encoded: $0) }.flatMap(ScreenOCR.decode)
+        let ocr = serverOCR ?? ScreenOCR.recognize(image, device: id)
+        if diff {
+            guard !ocr.screenHash.isEmpty else { throw MCPError("OCR observation unavailable") }
+            return ["content": [["type": "text", "text": ScreenOCR.summaryDiff(for: ocr, device: id)]]]
+        }
+        if !ocr.screenHash.isEmpty { _ = ScreenOCR.diff(device: id, current: ocr) }
+        return screenshotContent(
+            image: image, device: id, width: width, height: height,
+            includeImage: includeImage, ocr: ocr,
+            mimeType: response.value(forHTTPHeaderField: "Content-Type") ?? "image/jpeg")
+    }
+
+    /// Shared by image and text-only screenshots; OCR describes these exact bytes.
+    static func screenshotContent(
+        image: Data, device: String, width: String, height: String,
+        includeImage: Bool, ocr: ScreenOCR.Result, mimeType: String = "image/jpeg"
+    ) -> [String: Any] {
+        var content: [[String: Any]] = []
+        if includeImage {
+            content.append(["type": "image", "data": image.base64EncodedString(), "mimeType": mimeType])
+        }
+        let caption = StringsMCP(language: language).screenshotCaption(device, width, height)
+        content.append(["type": "text", "text": caption + (ocr.items.isEmpty ? "" : ocr.summary)])
+        return ["content": content]
     }
 
     private static func write(_ object: [String: Any]) {
@@ -208,6 +335,20 @@ private struct MCPHTTPClient {
         return try self.request(request, timeout: 60).0
     }
 
+    private static func check(_ data: Data, status: Int, language: AppLanguage) -> MCPServer.MCPError {
+        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let message = body?["error"] as? String ?? "HTTP \(status)"
+        guard let body, body["failed_step"] != nil || body["completed"] != nil else {
+            return MCPServer.MCPError(message)
+        }
+        var progress: [String: Any] = ["error": message]
+        progress["failed_step"] = body["failed_step"]
+        progress["completed"] = body["completed"]
+        let encoded = try? JSONSerialization.data(withJSONObject: progress, options: [.sortedKeys])
+        let details = encoded.map { String(decoding: $0, as: UTF8.self) } ?? message
+        return MCPServer.MCPError(details + "\n" + StringsMCP(language: language).actStopped)
+    }
+
     private func request(_ request: URLRequest, timeout: TimeInterval) throws -> (Data, HTTPURLResponse) {
         let table = StringsMCP(language: language)
         var result: Result<(Data, HTTPURLResponse), Error> = .failure(MCPServer.MCPError(table.noResponse))
@@ -221,8 +362,7 @@ private struct MCPHTTPClient {
                 if http.statusCode == 200 {
                     result = .success((data, http))
                 } else {
-                    let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"]
-                    result = .failure(MCPServer.MCPError(message as? String ?? "HTTP \(http.statusCode)"))
+                    result = .failure(Self.check(data, status: http.statusCode, language: language))
                 }
             }
             done.signal()

@@ -120,6 +120,7 @@ final class ControlWindowCoordinator {
         }
         refresh(reason: .discovery)
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard !QuietModeActivityController.shared.isSuspended else { return }
             self?.refresh(reason: .discovery)
         }
         self.timer = timer
@@ -141,6 +142,7 @@ final class ControlWindowCoordinator {
     }
 
     func showAllDevices() {
+        QuietModeActivityController.shared.setOpenWindows(true)
         refresh(reason: .userRequest)
         let windows = controllers.sorted { $0.key < $1.key }.compactMap { $0.value.window }
         for window in windows {
@@ -216,6 +218,8 @@ final class ControlWindowCoordinator {
             self.waitingController = nil
         }
 
+        QuietModeActivityController.shared.setOpenWindows(!controllers.isEmpty || waitingController != nil)
+
         let shouldMakeFirstAddedKey: Bool
         switch reason {
         case .userRequest:
@@ -260,6 +264,7 @@ final class ControlWindowCoordinator {
         } else {
             waitingController = nil
         }
+        QuietModeActivityController.shared.setOpenWindows(!controllers.isEmpty || waitingController != nil)
         if state.close(deviceID: deviceID) { NSApplication.shared.terminate(nil) }
     }
 }

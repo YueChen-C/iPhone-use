@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreFoundation
 import Foundation
 
@@ -25,9 +26,26 @@ enum ControlAPI {
     }
 
     static func handle(_ request: HTTPRequest) -> HTTPResponse {
+        handle(request, ocrCapture: captureTextScreen, ocrTap: tapTextPoint)
+    }
+
+    static func handle(
+        _ request: HTTPRequest,
+        ocrCapture: (String?, Int?) throws -> (String, Data),
+        ocrTap: (String, Double, Double, Double) throws -> Void = tapTextPoint,
+        activity: QuietModeActivityController = .shared
+    ) -> HTTPResponse {
+        let passive = request.method == "GET" && request.query["wake"] == "0"
+        let wasSuspended = passive ? false : activity.requestStarted()
+        defer { if !passive { activity.requestFinished() } }
         let body = request.body
         // A body selector takes precedence over the query-string selector.
-        let deviceQuery = (body["device"] as? String) ?? request.query["device"]
+        let deviceQuery = deviceSelector(body: body, query: request.query)
+        if !passive {
+            waitForWake(
+                request: request, deviceQuery: deviceQuery,
+                wasSuspended: wasSuspended || activity.isWithinWakeGraceWindow)
+        }
         do {
             switch (request.method, request.path) {
             case ("GET", "/viewer"), ("GET", "/viewer/"):
@@ -54,6 +72,37 @@ enum ControlAPI {
                         device, retry: true, verifyOnly: (body["verifyOnly"] as? Bool) ?? false)
                 }
                 return status()
+            case ("GET", "/ocr"), ("POST", "/ocr"):
+                var options: [String: Any] = request.query
+                if let raw = request.query["maxEdge"] {
+                    guard let value = Int(raw), value > 0 else {
+                        throw DeviceError(StringsAPI.current.ocrParameterInvalid("maxEdge"))
+                    }
+                    options["maxEdge"] = value
+                }
+                options.merge(body) { _, value in value }
+                let (id, data) = try ocrCapture(deviceQuery, OCRRequest.maxEdge(options))
+                return .json(ScreenOCR.recognize(data, device: id).json(device: id))
+            case ("POST", "/act"):
+                return try ActRequest(body).perform(
+                    device: try DeviceRegistry.shared.find(deviceQuery).id, capture: ocrCapture,
+                    execute: { path, body, device in
+                        handle(
+                            HTTPRequest(
+                                method: "POST", path: path, query: [:],
+                                body: body.merging(
+                                    device.map { ["device": $0] } ?? [:]
+                                ) { _, selected in selected }),
+                            ocrCapture: ocrCapture, ocrTap: ocrTap, activity: activity)
+                    })
+            case ("POST", "/tap_text"):
+                let tap = try TextTapRequest(body)
+                let (id, data) = try ocrCapture(deviceQuery, OCRRequest.maxEdge(body))
+                let result = ScreenOCR.recognize(data, device: id)
+                let match = try tap.match(result)
+                try ocrTap(
+                    id, Double(match.x) / Double(result.width), Double(match.y) / Double(result.height), tap.hold)
+                return .json(["ok": true, "device": id, "text": match.text, "x": match.x, "y": match.y])
             case ("GET", "/screenshot"):
                 return try screenshot(request.query, deviceQuery: deviceQuery)
             default:
@@ -67,6 +116,62 @@ enum ControlAPI {
         } catch {
             return .error("\(error)")
         }
+    }
+
+    final class WakeWindow {
+        private let lock = NSLock()
+        private var lastWakeUptime: TimeInterval = -.infinity
+
+        func deadline(wasSuspended: Bool, now: TimeInterval) -> TimeInterval {
+            lock.lock()
+            defer { lock.unlock() }
+            if wasSuspended { lastWakeUptime = now }
+            return lastWakeUptime + 6
+        }
+    }
+
+    private static let wakeWindow = WakeWindow()
+
+    private static func waitForWake(request: HTTPRequest, deviceQuery: String?, wasSuspended: Bool) {
+        let deadline = wakeWindow.deadline(wasSuspended: wasSuspended, now: ProcessInfo.processInfo.systemUptime)
+        guard ProcessInfo.processInfo.systemUptime < deadline else { return }
+        let screenPaths: Set<String> = ["/devices", "/status", "/", "/screenshot", "/ocr"]
+        let controlPaths: Set<String> = [
+            "/move", "/tap", "/tap_text", "/swipe", "/type", "/key", "/home", "/power", "/nudge", "/act",
+        ]
+        guard screenPaths.contains(request.path) || controlPaths.contains(request.path) else { return }
+        waitUntilReady(deadline: deadline) {
+            if let target = try? DeviceRegistry.shared.find(deviceQuery) {
+                let frameReady = ScreenCaptureManager.shared.all.contains {
+                    $0.id == target.screen.id && $0.size != nil
+                }
+                guard controlPaths.contains(request.path) else { return frameReady }
+                return frameReady && target.host != nil
+                    && (try? DeviceRegistry.shared.input(for: target).isPointerReady) == true
+            }
+            return deviceQuery == nil && !controlPaths.contains(request.path)
+                && !ScreenCaptureManager.shared.all.isEmpty
+                && ScreenCaptureManager.shared.all.allSatisfy { $0.size != nil }
+        }
+    }
+
+    static func waitUntilReady(
+        deadline: TimeInterval, now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        ready: () -> Bool
+    ) {
+        var elapsed = now()
+        while elapsed < deadline {
+            if ready() { return }
+            let delay = min(0.05, deadline - elapsed)
+            sleep(delay)
+            elapsed = max(elapsed + delay, now())
+        }
+    }
+
+    /// Body selectors retain precedence; the original name wins within each source.
+    static func deviceSelector(body: [String: Any], query: [String: String]) -> String? {
+        (body["device"] as? String) ?? (body["device_id"] as? String) ?? query["device"] ?? query["device_id"]
     }
 
     /// The viewer follows the app's language unless ?lang=zh|en pins one. Invalid
@@ -111,6 +216,7 @@ enum ControlAPI {
     private static func captureStatus() -> [String: Any] {
         let manager = ScreenCaptureManager.shared
         return [
+            "idleSuspended": QuietModeActivityController.shared.isSuspended,
             "identityState": manager.identityState.rawValue,
             "permitsPointerAssociation": manager.permitsPointerAssociation,
             "screens": manager.all.map { screen -> [String: Any] in
@@ -149,7 +255,8 @@ enum ControlAPI {
 
     private static func screenshot(_ query: [String: String], deviceQuery: String?) throws -> HTTPResponse {
         let device = try DeviceRegistry.shared.find(deviceQuery)
-        let png = query["format"] == "png"
+        let includeOCR = query["ocr"] == "1"
+        let png = query["format"] == "png" || includeOCR
         let maxWidth = query["maxWidth"].flatMap(Int.init)
         let maxEdge = query["maxEdge"].flatMap(Int.init)
         guard let size = device.screen.size,
@@ -162,14 +269,41 @@ enum ControlAPI {
             return .error(StringsAPI.current.noFrameFromDevice(device.screen.name), status: 503)
         }
         let image = RequestCoordinates.imageSize(size, maxWidth: maxWidth, maxEdge: maxEdge)
-        return HTTPResponse(
-            contentType: png ? "image/png" : "image/jpeg",
-            headers: [
-                "X-Device": device.id,
-                "X-Screen-Width": "\(Int(size.width))", "X-Screen-Height": "\(Int(size.height))",
-                "X-Image-Width": "\(image.0)", "X-Image-Height": "\(image.1)",
-            ],
-            body: data)
+        var headers = [
+            "X-Device": device.id,
+            "X-Screen-Width": "\(Int(size.width))", "X-Screen-Height": "\(Int(size.height))",
+            "X-Image-Width": "\(image.0)", "X-Image-Height": "\(image.1)",
+        ]
+        if includeOCR {
+            // Return OCR of these exact bytes from the app's cache. The stdio process
+            // must not repeat Vision work already done here by tap_text.
+            let ocr = ScreenOCR.recognize(data, device: device.id)
+            headers["X-Screen-OCR"] = try JSONSerialization.data(withJSONObject: ocr.json(device: device.id))
+                .base64EncodedString()
+        }
+        return HTTPResponse(contentType: png ? "image/png" : "image/jpeg", headers: headers, body: data)
+    }
+
+    private static func captureTextScreen(_ query: String?, _ maxEdge: Int?) throws -> (String, Data) {
+        let device = try DeviceRegistry.shared.find(query)
+        guard let data = device.screen.snapshot(png: true, maxEdge: maxEdge) else {
+            if let error = device.screen.captureError {
+                throw DeviceError(StringsAPI.current.captureFailedFromDevice(device.screen.name, error))
+            }
+            throw DeviceError(StringsAPI.current.noFrameFromDevice(device.screen.name))
+        }
+        return (device.id, data)
+    }
+
+    private static func tapTextPoint(_ id: String, _ x: Double, _ y: Double, _ hold: Double) throws {
+        let device = try DeviceRegistry.shared.find(id)
+        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+        let input = try DeviceRegistry.shared.input(for: device)
+        guard input.isPointerReady else {
+            input.invalidatePointerEstimate()
+            throw DeviceError(StringsAPI.current.pointerNotReady)
+        }
+        try input.tap(x: x, y: y, hold: hold)
     }
 
     private static func perform(
@@ -204,7 +338,13 @@ enum ControlAPI {
                 click: (body["click"] as? Bool) ?? false)
         case .type:
             guard let text = body["text"] as? String else { return .error(StringsAPI.current.textRequired) }
-            try input.type(text)
+            var parameters = body
+            parameters["text"] = text
+            try TypeTextRequest(parameters, language: AppLanguageStore.shared.language).perform(
+                on: input,
+                ocr: {
+                    device.screen.snapshot(png: false, maxEdge: 1600).map { ScreenOCR.recognize($0, device: device.id) }
+                })
         case .key:
             guard let key = body["key"] as? String else { return .error(StringsAPI.current.keyRequired) }
             try input.key(key, modifiers: (body["modifiers"] as? [String]) ?? [])
@@ -326,5 +466,177 @@ enum RequestCoordinates {
 
     private static func number(_ value: Any?) -> Double? {
         (value as? NSNumber)?.doubleValue
+    }
+}
+
+/// Validate OCR dimensions before the capture pipeline converts them to integers.
+enum OCRRequest {
+    static func number(_ raw: Any?) -> Double? {
+        guard let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+            value.doubleValue.isFinite
+        else { return nil }
+        return value.doubleValue
+    }
+
+    static func maxEdge(_ body: [String: Any], table: StringsAPI = .current) throws -> Int? {
+        guard let raw = body["maxEdge"] else { return nil }
+        guard let value = number(raw), value >= 1, value < Double(Int.max), value.rounded() == value else {
+            throw DeviceError(table.ocrParameterInvalid("maxEdge"))
+        }
+        return Int(value)
+    }
+}
+
+struct TextTapRequest {
+    let text: String
+    let exact: Bool
+    let index: Int
+    let hold: Double
+
+    init(_ body: [String: Any], table: StringsAPI = .current) throws {
+        guard let text = body["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DeviceError(table.ocrParameterInvalid("text"))
+        }
+        self.text = text
+        if let raw = body["exact"] {
+            guard let value = raw as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else {
+                throw DeviceError(table.ocrParameterInvalid("exact"))
+            }
+            exact = value.boolValue
+        } else {
+            exact = false
+        }
+        if let raw = body["index"] {
+            guard let value = OCRRequest.number(raw), value >= 0, value < Double(Int.max), value.rounded() == value
+            else {
+                throw DeviceError(table.ocrParameterInvalid("index"))
+            }
+            index = Int(value)
+        } else {
+            index = 0
+        }
+        if let raw = body["hold"] {
+            guard let value = OCRRequest.number(raw), value >= 0, value <= 60 else {
+                throw DeviceError(table.ocrParameterInvalid("hold"))
+            }
+            hold = value
+        } else {
+            hold = 0.08
+        }
+    }
+
+    func match(_ result: ScreenOCR.Result) throws -> ScreenOCR.Item {
+        let matches = result.items.filter {
+            exact ? $0.text == text : $0.text.range(of: text, options: .caseInsensitive) != nil
+        }
+        guard result.width > 0, result.height > 0, index < matches.count else {
+            throw DeviceError(StringsAPI.current.ocrTextNotFound)
+        }
+        return matches[index]
+    }
+}
+
+/// A bounded, fully validated batch. A failed step stops the batch without replay.
+struct ActRequest {
+    let steps: [[String: Any]]
+
+    init(_ body: [String: Any]) throws {
+        guard let steps = body["steps"] as? [[String: Any]], (1...16).contains(steps.count) else {
+            throw DeviceError("steps must contain 1...16 actions")
+        }
+        var waitBudget = 0.0
+        for step in steps {
+            guard let type = step["type"] as? String,
+                ["tap", "tap_text", "swipe", "type", "key", "home", "delay", "wait_text"].contains(type),
+                step["device"] == nil, step["device_id"] == nil
+            else { throw DeviceError("Invalid act step or nested device selector") }
+            _ = try OCRRequest.maxEdge(step)
+            if let fraction = step["fraction"], !TextEntry.isBoolean(fraction) {
+                throw DeviceError("fraction must be a boolean")
+            }
+            for key in ["width", "height"] where step[key] != nil {
+                guard let value = OCRRequest.number(step[key]), value > 0 else {
+                    throw DeviceError("Invalid coordinate dimensions")
+                }
+            }
+            switch type {
+            case "type": _ = try TypeTextRequest(step)
+            case "tap_text", "wait_text":
+                _ = try TextTapRequest(step)
+                _ = try OCRRequest.maxEdge(step)
+            case "tap":
+                let point = try RequestCoordinates.point(
+                    step, "x", "y", screenSize: CGSize(width: 1, height: 1), screenName: "")
+                guard point.0.isFinite, point.1.isFinite else { throw DeviceError("Invalid tap dimensions") }
+                guard OCRRequest.number(step["x"]) != nil, OCRRequest.number(step["y"]) != nil else {
+                    throw DeviceError("tap coordinates must be finite numbers")
+                }
+                _ = try TextTapRequest(step.merging(["text": "tap"]) { _, value in value })
+            case "swipe":
+                _ = try SwipeRequest(step, screenSize: CGSize(width: 1, height: 1), screenName: "")
+            case "key":
+                guard let key = step["key"] as? String,
+                    KeyboardMap.named[key.lowercased()] != nil || key.count == 1,
+                    KeyboardMap.code(for: key) != nil,
+                    step["modifiers"] == nil || step["modifiers"] is [String],
+                    KeyboardMap.modifierMask(for: step["modifiers"] as? [String] ?? []) != nil
+                else { throw DeviceError("Invalid key or modifiers") }
+            default: break
+            }
+            if type == "delay" || type == "wait_text" {
+                let raw = step[type == "delay" ? "seconds" : "timeout"] ?? (type == "delay" ? 0 : 6)
+                guard let seconds = OCRRequest.number(raw), (0...6).contains(seconds) else {
+                    throw DeviceError("delay/timeout must be in 0...6 seconds")
+                }
+                waitBudget += seconds
+            }
+        }
+        guard waitBudget <= 30 else { throw DeviceError("act wait budget exceeds 30 seconds") }
+        self.steps = steps
+    }
+
+    func perform(
+        device: String?, capture: (String?, Int?) throws -> (String, Data),
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        execute: (String, [String: Any], String?) throws -> HTTPResponse
+    ) throws -> HTTPResponse {
+        for (index, step) in steps.enumerated() {
+            do {
+                let type = step["type"] as! String
+                if type == "delay" {
+                    sleep((step["seconds"] as? NSNumber)?.doubleValue ?? 0)
+                } else if type == "wait_text" {
+                    let match = try TextTapRequest(step)
+                    let timeout = (step["timeout"] as? NSNumber)?.doubleValue ?? 6
+                    let start = now()
+                    var elapsed = 0.0
+                    while true {
+                        let (id, data) = try capture(device, OCRRequest.maxEdge(step))
+                        if (try? match.match(ScreenOCR.recognize(data, device: id))) != nil { break }
+                        elapsed = max(elapsed, now() - start)
+                        guard elapsed < timeout else { throw DeviceError("wait_text timed out") }
+                        let delay = min(0.1, timeout - elapsed)
+                        sleep(delay)
+                        elapsed += delay
+                    }
+                } else {
+                    let response = try execute("/" + type, step, device)
+                    if response.status != 200 {
+                        let body = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any]
+                        let message = body?["error"] as? String ?? String(decoding: response.body, as: UTF8.self)
+                        return .json(
+                            [
+                                "ok": false, "failed_step": index + 1, "completed": index,
+                                "error": message,
+                            ], status: response.status)
+                    }
+                }
+            } catch {
+                return .json(
+                    ["ok": false, "failed_step": index + 1, "completed": index, "error": "\(error)"], status: 400)
+            }
+        }
+        return .json(["ok": true, "completed": steps.count])
     }
 }

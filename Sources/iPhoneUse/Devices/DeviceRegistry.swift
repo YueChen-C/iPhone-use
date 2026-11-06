@@ -78,7 +78,7 @@ final class DeviceRegistry {
     /// Persisted identities are candidates until motion confirms the physical
     /// phone and Bluetooth session. A continuously present phone retains that
     /// proof across capture remaps; separate capture verification gates input.
-    private struct Association: Hashable {
+    struct Association: Hashable {
         let screen: UUID
         let host: UUID
         let session: UUID
@@ -98,7 +98,13 @@ final class DeviceRegistry {
         HIDPeripheral.shared.onHostsChanged = { [weak self] in
             // Dispatch off HIDPeripheral.queue before querying queue-synchronized readers.
             self?.matchQueue.async {
-                self?.reconnectSavedBluetoothHostsIfNeeded(resetExhausted: false)
+                guard let self else { return }
+                let screens = ScreenCaptureManager.shared.all
+                let sessions = self.currentHostSessions()
+                self.lock.withLock {
+                    self.promoteVerifiedAssociationsLocked(screens: screens, sessions: sessions)
+                }
+                self.reconnectSavedBluetoothHosts(for: screens, resetExhausted: false)
             }
             self?.scheduleMatch()
         }
@@ -111,8 +117,31 @@ final class DeviceRegistry {
     private func syncBluetoothForCurrentScreens(resetExhausted: Bool) {
         dispatchPrecondition(condition: .onQueue(matchQueue))
         let snapshot = ScreenCaptureManager.shared.sampleScreensWithRevision()
-        HIDPeripheral.shared.setUSBScreenDemand(!snapshot.screens.isEmpty, revision: snapshot.revision)
+        let sessions = currentHostSessions()
+        lock.withLock {
+            promoteVerifiedAssociationsLocked(screens: snapshot.screens, sessions: sessions)
+        }
+        HIDPeripheral.shared.setUSBScreenDemand(snapshot.retainsUSBDemand, revision: snapshot.revision)
         reconnectSavedBluetoothHosts(for: snapshot.screens, resetExhausted: resetExhausted)
+    }
+
+    /// Reconnects hosts that unexpectedly disconnected during idle, in parallel with USB resume.
+    /// Normally the retained USB demand keeps the existing Bluetooth session alive.
+    func prewakeBluetoothForIdleResume(
+        observeUSBTopology: @escaping () -> USBValeriaConfigurator.IOSUSBTopologyObservation =
+            USBValeriaConfigurator.currentIOSUSBTopology
+    ) {
+        matchQueue.async { [weak self] in
+            guard let self else { return }
+            guard observeUSBTopology().hasAttachedDevices else { return }
+            let pairings = self.lock.withLock { self.pairings }
+            guard !pairings.isEmpty else { return }
+            let revision = ScreenCaptureManager.shared.mintUSBDemandRevision()
+            HIDPeripheral.shared.setUSBScreenDemand(true, revision: revision)
+            let connected = Set(HIDPeripheral.shared.connectedHosts)
+            let targets = Set(pairings.values).subtracting(connected)
+            HIDPeripheral.shared.reconnectKnownHosts(targets, resetExhausted: true)
+        }
     }
 
     func all() -> [Device] {
@@ -120,11 +149,8 @@ final class DeviceRegistry {
     }
 
     private func buildDevices(from screens: [ScreenCaptureSession]) -> [Device] {
-        let sessions = Dictionary(
-            uniqueKeysWithValues: HIDPeripheral.shared.hostDetails.compactMap { detail in
-                detail.session.map { (detail.host, $0) }
-            })
-        let (pairings, verified) = lock.withLock { (self.pairings, verifiedAssociations) }
+        let sessions = currentHostSessions()
+        let (pairings, verified) = lock.withLock { (self.pairings, self.verifiedAssociations) }
         return screens.map { screen in
             let host = pairings[screen.id].flatMap { host -> UUID? in
                 guard ScreenCaptureManager.shared.isCurrent(screen), let session = sessions[host],
@@ -136,6 +162,51 @@ final class DeviceRegistry {
             let state = DeviceBluetoothState.resolve(
                 screenID: screen.id, matchedHost: host, pairings: pairings, connectedHosts: Set(sessions.keys))
             return Device(screen: screen, host: host, bluetoothState: state)
+        }
+    }
+
+    private func currentHostSessions() -> [UUID: UUID] {
+        Dictionary(
+            uniqueKeysWithValues: HIDPeripheral.shared.hostDetails.compactMap { detail in
+                detail.session.map { (detail.host, $0) }
+            })
+    }
+
+    /// The caller holds `lock`; readers must never mint authorization as a side effect.
+    private func promoteVerifiedAssociationsLocked(screens: [ScreenCaptureSession], sessions: [UUID: UUID]) {
+        Self.promoteVerifiedAssociations(
+            &verifiedAssociations,
+            screenIdentities: Dictionary(uniqueKeysWithValues: screens.map { ($0.id, $0.associationIdentity) }),
+            pairings: pairings, sessions: sessions)
+    }
+
+    /// Value-only transitions keep authorization tests independent of USB and Bluetooth hardware.
+    static func promoteVerifiedAssociations(
+        _ verified: inout Set<Association>, screenIdentities: [String: UUID],
+        pairings: [String: UUID], sessions: [UUID: UUID]
+    ) {
+        for (id, identity) in screenIdentities {
+            guard let host = pairings[id], let session = sessions[host],
+                verified.contains(where: { $0.screen == identity && $0.host == host })
+            else { continue }
+            verified.insert(Association(screen: identity, host: host, session: session))
+        }
+    }
+
+    static func invalidateReplacedAssociations(
+        _ verified: inout Set<Association>, screenID: String, host: UUID,
+        screenIdentities: [String: UUID], pairings: [String: UUID]
+    ) {
+        let replacedHost = pairings[screenID].flatMap { $0 == host ? nil : $0 }
+        let replacedScreens = Set(
+            pairings.compactMap { id, existing in
+                existing == host && id != screenID ? screenIdentities[id] : nil
+            })
+        let identity = screenIdentities[screenID]
+        verified = verified.filter {
+            $0.host != replacedHost && !replacedScreens.contains($0.screen)
+                && ($0.host != host || $0.screen == identity)
+                && ($0.screen != identity || $0.host == host)
         }
     }
 
@@ -629,11 +700,14 @@ final class DeviceRegistry {
     }
 
     private func verifySavedAssociations(screens: [ScreenCaptureSession], hosts: [UUID]) {
-        let saved = lock.withLock { pairings }
         let sessions = Dictionary(
             uniqueKeysWithValues: hosts.compactMap { host in
                 HIDPeripheral.shared.connectionSession(for: host).map { (host, $0) }
             })
+        let saved = lock.withLock {
+            promoteVerifiedAssociationsLocked(screens: screens, sessions: sessions)
+            return pairings
+        }
         var found: [String: UUID] = [:]
         for screen in screens {
             guard probingMayContinue() else { break }
@@ -1213,6 +1287,10 @@ final class DeviceRegistry {
                 if migrateCalibrationProfiles, let oldHost = pairings[id], oldHost != host {
                     migrateCalibration(from: oldHost, to: host, screenID: id)
                 }
+                Self.invalidateReplacedAssociations(
+                    &verifiedAssociations, screenID: id, host: host,
+                    screenIdentities: Dictionary(uniqueKeysWithValues: screens.map { ($0.id, $0.associationIdentity) }),
+                    pairings: pairings)
                 for (other, existing) in pairings where existing == host { pairings[other] = nil }
                 pairings[id] = host
                 if motionVerified, let screen = screens.first(where: { $0.id == id }), let session = sessions[host] {
