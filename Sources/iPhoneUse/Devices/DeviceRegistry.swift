@@ -18,6 +18,8 @@ struct Device {
             info["width"] = Int(size.width)
             info["height"] = Int(size.height)
         }
+        let coord = DeviceRegistry.shared.coordinator(for: self)
+        info["track"] = coord.status.json
         return info
     }
 }
@@ -51,6 +53,7 @@ final class DeviceRegistry {
         case recovered([String: UUID])
     }
     private var inputs: [UUID: CachedInput] = [:]
+    private var coordinators: [String: DualTrackInputCoordinator] = [:]
     private var matchPending = false
     private var usableScreenRetries: Set<String> = []
     private let matchQueue = DispatchQueue(label: "iphone-use.match")
@@ -141,6 +144,15 @@ final class DeviceRegistry {
         }
         HIDPeripheral.shared.setUSBScreenDemand(snapshot.retainsUSBDemand, revision: snapshot.revision)
         reconnectSavedBluetoothHosts(for: snapshot.screens, resetExhausted: resetExhausted)
+    }
+
+    /// Public trigger to force immediate BLE reconnect attempt for saved paired hosts.
+    func reconnectBluetooth(resetExhausted: Bool = true) {
+        matchQueue.async { [weak self] in
+            guard let self else { return }
+            let screens = ScreenCaptureManager.shared.all
+            self.reconnectSavedBluetoothHosts(for: screens, resetExhausted: resetExhausted)
+        }
     }
 
     /// Reconnects hosts that unexpectedly disconnected during idle, in parallel with USB resume.
@@ -323,6 +335,28 @@ final class DeviceRegistry {
             inputs[host] = CachedInput(
                 input: input, screenID: screenID, screenObject: screen.map(ObjectIdentifier.init))
             return input
+        }
+    }
+
+    func coordinator(for device: Device) -> DualTrackInputCoordinator {
+        inputLock.withLock {
+            let devID = device.id
+            if let existing = coordinators[devID] {
+                return existing
+            }
+            let coordinator = DualTrackInputCoordinator(
+                udid: devID,
+                mode: .auto,
+                standardInputResolver: { [weak self] in
+                    guard let self else {
+                        throw DeviceError("Device registry unavailable")
+                    }
+                    let dev = try self.find(devID)
+                    return try self.input(for: dev)
+                }
+            )
+            coordinators[devID] = coordinator
+            return coordinator
         }
     }
 

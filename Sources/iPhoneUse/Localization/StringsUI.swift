@@ -71,6 +71,10 @@ struct StringsUI: LocalizedTable {
     /// controller name when iOS may show it instead of the advertised name.
     let pairingInstructions: (String, String?) -> String
     let overlayHelp: String
+    let overlayButtonReconnect: String
+    let overlayButtonViewOnly: String
+    let overlayPillTitle: String
+    let overlayPillShowGuidance: String
 
     // Canvas waiting message (PhoneControlView.swift)
     let canvasWaitingText: String
@@ -150,6 +154,10 @@ struct StringsUI: LocalizedTable {
         },
         overlayHelp:
             "连接失败时，可打开 Mac「系统设置 → 蓝牙」检查状态及配对提示，再从 iPhone 重试。若找不到设备，请检查 Mac「隐私与安全性 → 蓝牙」中 iPhone Use 的权限。",
+        overlayButtonReconnect: "重新连接蓝牙",
+        overlayButtonViewOnly: "仅看画面 (只读)",
+        overlayPillTitle: "仅投屏模式（蓝牙未连接）",
+        overlayPillShowGuidance: "展开指引",
         canvasWaitingText: "等待 iPhone 画面…\n请解锁手机并确认已配对 Bluetooth")
 
     static let en = StringsUI(
@@ -231,5 +239,9 @@ struct StringsUI: LocalizedTable {
         },
         overlayHelp:
             "If pairing fails, open the Mac's System Settings → Bluetooth to check its state and pairing prompts, then retry from the iPhone. If the device is missing, check iPhone Use's Bluetooth permission in System Settings → Privacy & Security.",
+        overlayButtonReconnect: "Reconnect Bluetooth",
+        overlayButtonViewOnly: "View Screen (Read-Only)",
+        overlayPillTitle: "View-only mode (Bluetooth disconnected)",
+        overlayPillShowGuidance: "Show Setup",
         canvasWaitingText: "Waiting for iPhone screen…\nUnlock the phone and confirm Bluetooth is paired")
 }

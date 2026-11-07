@@ -152,7 +152,9 @@ enum MCPServer {
                     device = try resolveDevice(query, data: fresh)
                 }
                 return try MCPAccess.withDevice(port: base.port ?? 7390, id: device, language: language) {
-                    if name == "ocr_screen", case .request(let action) = actions.first {
+                    if ["ocr_screen", "switch_track_mode", "get_track_status", "get_ax_tree", "decide_track"].contains(name),
+                        case .request(let action) = actions.first
+                    {
                         var body = action.body
                         body["device"] = device
                         let data = try client.post(action.path, body)

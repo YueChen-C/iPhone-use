@@ -34,6 +34,10 @@ struct StringsMCP: LocalizedTable {
     let toolPressKey: String
     let toolKeyboardSequence: String
     let toolHome: String
+    let toolSwitchTrackMode: String
+    let toolGetTrackStatus: String
+    let toolGetAXTree: String
+    let toolDecideTrack: String
 
     // MCPToolRequest / MCPKeyboardSequence validation
     let unknownTool: (String) -> String
@@ -94,12 +98,16 @@ struct StringsMCP: LocalizedTable {
         toolLongPress: "长按某个点，例如打开上下文菜单。",
         toolSwipe: "沿至少两个点的有序路径持续拖动，直到最后一个点才抬起。默认使用最新截图像素；normalized=true 时每轴使用 0...1000。",
         toolTypeText:
-            "通过蓝牙键盘输入 ASCII 或中文（中文转拼音并以空格选择首个候选词）。clear_before 先全选清空；commit_ime 在文字后按空格提交输入法候选词；press_enter 最后按回车；ensure_chinese_ime 使用屏幕 OCR 尝试切换中文输入法。",
+            "通过蓝牙键盘输入 ASCII 或中文（中文转拼音并以空格选择首个候选词）。clear_before 先全选清空；commit_ime 在文字后按空格提交输入法候选词；press_enter 最后按回车；submit 提交/发送文字（中文自动 commit 候选词并按回车提交，避免文字停留在输入框）；ensure_chinese_ime 使用屏幕 OCR 尝试切换中文输入法。",
         toolPressKey:
             "按下按键，可带修饰键。按键：enter、escape、backspace、tab、space、up、down、left、right 或单个字符。修饰键：cmd、shift、alt、ctrl。cmd+space 打开聚焦搜索。",
         toolKeyboardSequence:
             "在当前应用中执行一段简短、已知的键盘序列，最后返回一张截图。所有步骤在输入前完成校验；同一手机的 MCP 锁覆盖整个序列。出错即停止且不会重放。需要查看中间画面时请拆分为多次调用。支持 steps/actions 别名、可选 type 字段及 0...5 秒的 delay/wait 步骤。文字步骤支持 clear_before、commit_ime、press_enter、ensure_chinese_ime。最多 16 步、文字总量 256 字符；中文转拼音并选择首个候选词。",
         toolHome: "回到主屏幕。",
+        toolSwitchTrackMode: "切换控制轨道模式：standard（普通零售通道，仅蓝牙 HID + USB 视频流，最接近真人外设）、enhanced（开发者增强通道，零校准多点触控 + 完整 AX 树，适合深度开发与页面抓取）或 auto（默认自动优先增强通道，失败时无感降级到普通通道）。",
+        toolGetTrackStatus: "查询当前手机的双轨控制模式（standard / enhanced / auto）、激活通道状态及降级原因。",
+        toolGetAXTree: "通过开发者增强通道获取当前界面的完整 Accessibility（AX）层级元素树、标签与坐标。",
+        toolDecideTrack: "使用 TypeSafe Jev System One 决策引擎根据任务提示词与目标应用智能选择最优控制轨道（standard / enhanced / auto），可选自动切换（apply=true）。",
         unknownTool: { "未知工具 \($0)" },
         coordinateFinite: { "\($0) 必须是有限且非负的截图坐标" },
         hidCountRange: { "\($0) 必须是 -32...32 内的整数 HID 计数" },
@@ -161,12 +169,16 @@ struct StringsMCP: LocalizedTable {
         toolSwipe:
             "Drag continuously through an ordered path of at least two points, keeping contact until the last point. Coordinates default to pixels of the latest screenshot; normalized=true uses 0...1000 per axis.",
         toolTypeText:
-            "Type ASCII or Chinese with the Bluetooth keyboard (Hanzi becomes pinyin and selects the first candidate). clear_before selects all and deletes first; commit_ime presses space after text; press_enter presses enter last; ensure_chinese_ime uses screen OCR to attempt switching to a Chinese IME.",
+            "Type ASCII or Chinese with the Bluetooth keyboard (Hanzi becomes pinyin and selects the first candidate). clear_before selects all and deletes first; commit_ime presses space after text; press_enter presses enter last; submit commits IME candidate and presses enter to send/submit text atomically; ensure_chinese_ime uses screen OCR to attempt switching to a Chinese IME.",
         toolPressKey:
             "Press a key, optionally with modifiers. Keys: enter, escape, backspace, tab, space, up, down, left, right, or a character. Modifiers: cmd, shift, alt, ctrl. cmd+space opens Spotlight.",
         toolKeyboardSequence:
             "Run a short, known keyboard sequence in the current app with one final screenshot. All steps are validated before input; the same-phone MCP lock covers the whole sequence. Stops on error without replay. Use separate calls when an intermediate screen needs inspection. Accepts steps/actions aliases, optional type tags and delay/wait steps of 0...5 seconds. Text steps accept clear_before, commit_ime, press_enter and ensure_chinese_ime. Up to 16 steps and 256 total characters; Hanzi becomes pinyin and selects the first candidate.",
         toolHome: "Go to the Home Screen.",
+        toolSwitchTrackMode: "Switch control track mode: 'standard' (retail BLE HID + USB video only, safest for sensitive apps), 'enhanced' (Developer Mode CoreDevice UniversalHID + AX hierarchy), or 'auto' (default, prefers enhanced and gracefully degrades to standard on failure).",
+        toolGetTrackStatus: "Get the current dual-track control mode ('standard', 'enhanced', or 'auto'), active track state, and any degradation reason.",
+        toolGetAXTree: "Inspect the live iOS Accessibility (AX) hierarchy tree via the enhanced developer track.",
+        toolDecideTrack: "Use the TypeSafe Jev System One decision engine to evaluate task intent and target app, returning the optimal control track ('standard', 'enhanced', or 'auto') with rationale; set apply=true to switch immediately.",
         unknownTool: { "unknown tool \($0)" },
         coordinateFinite: { "\($0) must be a finite, nonnegative screenshot coordinate" },
         hidCountRange: { "\($0) must be an integer HID count in -32...32" },
