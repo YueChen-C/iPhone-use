@@ -6,6 +6,9 @@ enum ControlConnectionStatus {
 
     var showsOverlay: Bool { self != .connected && self != .verifyingScreen }
 
+    /// An ignored event must not cancel the discovery needed to enable input.
+    var permitsBackgroundMotionPreemption: Bool { self == .connected }
+
     static func resolve(
         hasScreen: Bool, hasMatchedHost: Bool, bluetoothState: DeviceBluetoothState,
         inputIsCurrent: Bool, inputIsReady: Bool, screenPermitsInput: Bool

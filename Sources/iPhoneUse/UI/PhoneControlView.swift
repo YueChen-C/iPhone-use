@@ -130,9 +130,10 @@ final class PhoneControlView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         if !dragging {
-            if canSendPointerInput { preemptBackgroundPointerMotion() }
+            let ready = canSendPointerInput && input?.isPointerReady == true
+            if ready { preemptBackgroundPointerMotion() }
             mousePosition.reset()
-            input?.cancelPointer()
+            input?.cancelPointer(preservingBackgroundMotion: !ready)
         }
     }
 
@@ -204,10 +205,10 @@ final class PhoneControlView: NSView {
 
     // MARK: Gesture and shortcut coordination
 
-    func cancelInteraction() {
+    func cancelInteraction(preservingBackgroundMotion: Bool = false) {
         dragging = false
         mousePosition.reset()
-        input?.cancelPointer()
+        input?.cancelPointer(preservingBackgroundMotion: preservingBackgroundMotion)
     }
 
     func performShortcut(_ shortcut: ControlShortcut) {
@@ -370,7 +371,7 @@ final class PhoneControlView: NSView {
             screenPermitsInput: device.map { ScreenCaptureManager.shared.permitsPointerAssociation(for: $0.screen) }
                 ?? false)
         guard connectionStatus != status else { return }
-        cancelInteraction()
+        cancelInteraction(preservingBackgroundMotion: status == .connected)
         if status != .connected { input?.invalidatePointerEstimate() }
         shortcutFeedback = nil
         connectionStatus = status
@@ -382,8 +383,11 @@ final class PhoneControlView: NSView {
         guard ready != pointerReady else { return }
         // Keyboard subscriptions can arrive before the pointer reports. Reset
         // the observed position so readiness triggers fresh positioning.
-        cancelInteraction()
-        if !ready { input?.invalidatePointerEstimate() }
+        // A readiness notification is not user activity. In particular, the
+        // first ready tick must not cancel connection-time curve verification.
+        // Background jobs already check capture/session ownership themselves.
+        cancelInteraction(preservingBackgroundMotion: true)
+        if !ready { input?.invalidatePointerEstimate(preservingBackgroundMotion: true) }
         pointerReady = ready
     }
 
@@ -438,7 +442,7 @@ final class PhoneControlView: NSView {
         }
         // Hovering a disabled connection overlay cannot steer this phone.
         // Do not let tracking-area events cancel the discovery that enables it.
-        if canSendPointerInput { preemptBackgroundPointerMotion() }
+        if canSendPointerInput && input?.isPointerReady == true { preemptBackgroundPointerMotion() }
         updatePointerReadiness()
         guard canSendPointerInput, activeShortcut == nil, pointerReady, let device,
             let point = normalizedPoint(event.locationInWindow, device: device, clamp: clampToImage)
@@ -455,9 +459,9 @@ final class PhoneControlView: NSView {
     }
 
     private func preemptBackgroundPointerMotion() {
-        guard let device else { return }
-        // A new phone may still be undergoing discovery and have no input
-        // cached for its screen. Cancel the registry's whole discovery round.
+        // Mouse clicks, keys and shortcuts can arrive while the overlay blocks
+        // input. Such ignored events must not cancel discovery or its retry.
+        guard connectionStatus?.permitsBackgroundMotionPreemption == true, let device else { return }
         DeviceRegistry.shared.cancelBackgroundMotion(for: device)
     }
 

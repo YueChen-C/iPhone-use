@@ -130,24 +130,35 @@ final class DevicePairingTests: XCTestCase {
         XCTAssertEqual(verified, [association])
     }
 
-    func testFailedDiscoveryCannotRearmAnEndlessProbeTimer() throws {
+    func testFailedDiscoveryUsesFourSpacedRetriesWithoutAnEndlessProbeTimer() throws {
         let capture = NSObject()
         let topology = DevicePairingProbeSchedule.Topology(
             screens: ["phone": ObjectIdentifier(capture)], sessions: [UUID(): UUID()])
         var schedule = DevicePairingProbeSchedule()
         XCTAssertTrue(schedule.update(topology))
-        let token = try XCTUnwrap(schedule.scheduleRetry())
+        XCTAssertNil(schedule.pendingRetryDelay)
+        var previousToken: UInt64?
+        for delay in [20.0, 40, 60, 90] {
+            let token = try XCTUnwrap(schedule.scheduleRetry())
+            XCTAssertEqual(schedule.pendingRetryDelay, delay)
+            XCTAssertNil(schedule.scheduleRetry())
+            XCTAssertFalse(schedule.update(topology))
+            if let previousToken { XCTAssertFalse(schedule.beginRetry(previousToken)) }
+            XCTAssertTrue(schedule.beginRetry(token))
+            XCTAssertNil(schedule.pendingRetryDelay)
+            XCTAssertFalse(schedule.beginRetry(token))
+            previousToken = token
+        }
         XCTAssertNil(schedule.scheduleRetry())
+        // Repeated notifications must not reset the exhausted budget.
         XCTAssertFalse(schedule.update(topology))
-        XCTAssertTrue(schedule.beginRetry(token))
         XCTAssertNil(schedule.scheduleRetry())
-        // A redundant subscription notification must not restart discovery.
-        XCTAssertFalse(schedule.update(topology))
-        XCTAssertNil(schedule.scheduleRetry())
-        XCTAssertFalse(schedule.beginRetry(token))
+        XCTAssertTrue(schedule.update(topology, restart: true))
+        XCTAssertNotNil(schedule.scheduleRetry())
+        XCTAssertEqual(schedule.pendingRetryDelay, 20)
     }
 
-    func testReconnectInvalidatesOldProbeTimerAndAllowsOneFreshRetry() throws {
+    func testReconnectInvalidatesOldProbeTimerAndRestartsTheRetryWindow() throws {
         let oldCapture = NSObject()
         let newCapture = NSObject()
         let host = UUID()
@@ -161,10 +172,14 @@ final class DevicePairingTests: XCTestCase {
         let usbToken = try XCTUnwrap(schedule.scheduleRetry())
         XCTAssertFalse(schedule.beginRetry(oldToken))
         XCTAssertTrue(schedule.beginRetry(usbToken))
-        XCTAssertNil(schedule.scheduleRetry())
+        XCTAssertNotNil(schedule.scheduleRetry())
+        XCTAssertEqual(schedule.pendingRetryDelay, 40)
         XCTAssertTrue(
             schedule.update(.init(screens: ["phone": ObjectIdentifier(newCapture)], sessions: [host: UUID()])))
-        XCTAssertNotNil(schedule.scheduleRetry())
+        let bleToken = try XCTUnwrap(schedule.scheduleRetry())
+        XCTAssertEqual(schedule.pendingRetryDelay, 20)
+        XCTAssertFalse(schedule.beginRetry(usbToken))
+        XCTAssertTrue(schedule.beginRetry(bleToken))
     }
 
     func testUserInputCancelsPendingRetryUntilReconnectOrExplicitMatch() throws {

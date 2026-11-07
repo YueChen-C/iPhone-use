@@ -297,12 +297,12 @@ enum ControlAPI {
 
     private static func tapTextPoint(_ id: String, _ x: Double, _ y: Double, _ hold: Double) throws {
         let device = try DeviceRegistry.shared.find(id)
-        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
         let input = try DeviceRegistry.shared.input(for: device)
         guard input.isPointerReady else {
-            input.invalidatePointerEstimate()
+            input.invalidatePointerEstimate(preservingBackgroundMotion: true)
             throw DeviceError(StringsAPI.current.pointerNotReady)
         }
+        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
         try input.tap(x: x, y: y, hold: hold)
     }
 
@@ -310,17 +310,17 @@ enum ControlAPI {
         _ action: Action, body: [String: Any], deviceQuery: String?
     ) throws -> HTTPResponse {
         let device = try DeviceRegistry.shared.find(deviceQuery)
-        // Real input takes priority over background probes and measurement.
-        // Cancel before resolving/queuing input, so it cannot wait behind the
-        // very measurement that the user is trying to interrupt.
-        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+        // Reject unverified coordinates before cancellation so retrying clients
+        // cannot repeatedly interrupt the calibration needed to serve them.
+        // Ready gestures and keyboard/raw input still preempt background work.
         let input = try DeviceRegistry.shared.input(for: device)
         if action.requiresPointer, !input.isPointerReady {
             // Keep readiness ahead of parameter parsing. API callers may have no window
             // polling readiness, and a lost subscription or screen change invalidates origin.
-            input.invalidatePointerEstimate()
+            input.invalidatePointerEstimate(preservingBackgroundMotion: true)
             return .error(StringsAPI.current.pointerNotReady, status: 503)
         }
+        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
 
         switch action {
         case .tap:

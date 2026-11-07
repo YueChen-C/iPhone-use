@@ -15,6 +15,7 @@ struct DeviceLockObservations {
         var state: DeviceLockState = .unknown
         var consecutiveMatches = 0
         var observedAt: TimeInterval?
+        var awaitingUsableFrame = false
     }
     private var entries: [String: Entry] = [:]
     private var generation: UInt64 = 0
@@ -34,15 +35,22 @@ struct DeviceLockObservations {
         }
     }
 
-    mutating func complete(_ request: Request, state: DeviceLockState, now: TimeInterval) {
+    /// A confirmed lock or paused capture gets one discovery retry when a
+    /// usable unlocked frame returns, rather than polling with pointer motion.
+    @discardableResult
+    mutating func complete(_ request: Request, state: DeviceLockState, now: TimeInterval) -> Bool {
         guard var entry = entries[request.physicalID], entry.generation == request.generation, entry.pending
-        else { return }
+        else { return false }
         entry.pending = false
         let fresh = entry.observedAt.map { now - $0 < 8 } ?? false
         entry.consecutiveMatches = state == .suspected ? (fresh ? min(2, entry.consecutiveMatches + 1) : 1) : 0
         entry.state = state == .suspected && entry.consecutiveMatches < 2 ? .unknown : state
         entry.observedAt = now
+        if entry.state == .suspected || entry.state == .paused { entry.awaitingUsableFrame = true }
+        let retryMatching = entry.awaitingUsableFrame && state == .notDetected
+        if retryMatching { entry.awaitingUsableFrame = false }
         entries[request.physicalID] = entry
+        return retryMatching
     }
 
     func state(for physicalID: String, captureID: UUID? = nil, now: TimeInterval) -> DeviceLockState {
@@ -60,6 +68,7 @@ final class DeviceLockMonitor {
     private var observations = DeviceLockObservations()
     private var timer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "iphone-use.device-lock-monitor", qos: .utility)
+    var onUsableFrameRestored: ((String) -> Void)?
 
     func start() {
         guard timer == nil else { return }
@@ -87,9 +96,10 @@ final class DeviceLockMonitor {
                 } else {
                     state = .unknown
                 }
-                self.lock.withLock {
+                let retryMatching = self.lock.withLock {
                     self.observations.complete(request, state: state, now: ProcessInfo.processInfo.systemUptime)
                 }
+                if retryMatching { self.onUsableFrameRestored?(request.physicalID) }
             }
         }
         self.timer = timer

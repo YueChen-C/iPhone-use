@@ -6,6 +6,43 @@ final class HIDConnectionStateTests: XCTestCase {
     private let host = UUID()
     private let other = UUID()
 
+    func testPointerReportMapsAreIsolatedWithoutChangingPayloadIDs() {
+        XCTAssertEqual(HIDReportMap.primaryReports, [.keyboard, .relativeMouse, .consumer])
+        XCTAssertEqual(HIDReportMap.absoluteReports, [.absolutePointer])
+        XCTAssertEqual(
+            HIDReportMap.descriptor(for: HIDReportMap.primaryReports),
+            HIDReportMap.keyboard + HIDReportMap.relativeMouse + HIDReportMap.consumer)
+        XCTAssertEqual(HIDReportMap.descriptor(for: HIDReportMap.absoluteReports), HIDReportMap.absolutePointer)
+        XCTAssertEqual(ReportID.absolutePointer.rawValue, 2)
+        XCTAssertEqual(ReportID.relativeMouse.rawValue, 3)
+    }
+
+    func testAbsoluteReleaseUsesLastAcceptedPositionAfterIdentityInvalidation() throws {
+        var state = HIDConnectionState()
+        state.subscribe(.report(.absolutePointer), host: host)
+        let session = try XCTUnwrap(state.sessions[host])
+        var allowed = true
+        state.enqueue(.report(.absolutePointer), data: Data([1, 10, 0, 20, 0]), host: host, session: session)
+        state.removeFirst()  // Accepted by BLE.
+        state.enqueue(
+            .report(.absolutePointer), data: Data([1, 90, 0, 90, 0]), host: host,
+            session: session, isAllowed: { allowed })
+        state.enqueue(
+            .report(.absolutePointer), data: Data([0, 90, 0, 90, 0]), host: host,
+            session: session, isAllowed: { allowed }, absoluteRelease: true)
+        allowed = false
+        let release = try XCTUnwrap(state.nextPendingReport())
+        XCTAssertEqual(release.data, Data([0, 10, 0, 20, 0]))
+        state.removeFirst()
+        XCTAssertNil(state.nextPendingReport())
+        state.unsubscribe(.report(.absolutePointer), host: host)
+        state.subscribe(.report(.absolutePointer), host: host)
+        state.enqueue(
+            .report(.absolutePointer), data: Data([0, 10, 0, 20, 0]), host: host,
+            session: session, absoluteRelease: true)
+        XCTAssertNil(state.nextPendingReport(), "stale session releases cannot reach a new connection")
+    }
+
     func testKeyboardConnectionIsNotReadyForPointerUntilItsReportsSubscribe() throws {
         var state = HIDConnectionState()
         state.subscribe(.report(.keyboard), host: host)
@@ -157,7 +194,7 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertEqual(
             state.pending.map(\.data),
             [
-                Data([0, 2, 0, 2, 0]), Data([1, 0, 0, 0]), Data([1, 4, 0, 4, 0]),
+                Data([0, 2, 0, 2, 0]), Data([1, 0, 0, 0]), Data([1, 3, 0, 3, 0]), Data([1, 4, 0, 4, 0]),
                 Data([0, 0, 0, 0]), Data([0, 0, 4, 0, 0, 0, 0, 0]), Data(repeating: 0, count: 8),
             ])
     }
@@ -351,34 +388,26 @@ final class HIDConnectionStateTests: XCTestCase {
         var tracker = HIDReconnectTracker()
         _ = tracker.updateTargets([saved], activeSessions: [], resetExhausted: true)
 
-        // Attempt 1 fails -> backoff 2s.
-        _ = tracker.beginConnecting(saved)
-        guard
-            case .scheduleBackoff(let token1, let delay1) = tracker.handleTermination(
-                host: saved, hasActiveSession: false)
-        else {
-            return XCTFail("expected first backoff")
-        }
-        XCTAssertEqual(delay1, 2.0)
-        XCTAssertEqual(tracker.reconnectingHosts(activeSessions: []), [saved])
-        XCTAssertTrue(tracker.completeBackoff(host: saved, token: token1, hasActiveSession: false))
-
-        // Attempt 2 fails -> backoff 6s.
-        _ = tracker.beginConnecting(saved)
-        guard
-            case .scheduleBackoff(let token2, let delay2) = tracker.handleTermination(
-                host: saved, hasActiveSession: false)
-        else {
-            return XCTFail("expected second backoff")
-        }
-        XCTAssertEqual(delay2, 6.0)
-        XCTAssertTrue(tracker.completeBackoff(host: saved, token: token2, hasActiveSession: false))
-
-        // Attempt 3 fails -> budget exhausted; no endless 12-second loop.
-        _ = tracker.beginConnecting(saved)
+        XCTAssertEqual(HIDReconnectTracker.attemptTimeout, 20)
+        XCTAssertEqual(HIDReconnectTracker.maxAutomaticAttempts, 6)
+        // Six attempts span about 190 seconds including per-attempt timeouts.
         XCTAssertEqual(
-            tracker.handleTermination(host: saved, hasActiveSession: false),
-            .notifyChanged)
+            Double(HIDReconnectTracker.maxAutomaticAttempts) * HIDReconnectTracker.attemptTimeout
+                + HIDReconnectTracker.retryDelays.reduce(0, +), 190)
+        for delay in [2.0, 6, 12, 20, 30] {
+            XCTAssertEqual(tracker.connectableHosts(activeSessions: []), [saved])
+            _ = tracker.beginConnecting(saved)
+            guard
+                case .scheduleBackoff(let token, let actualDelay) = tracker.handleTermination(
+                    host: saved, hasActiveSession: false)
+            else { return XCTFail("expected finite reconnect backoff") }
+            XCTAssertEqual(actualDelay, delay)
+            XCTAssertEqual(tracker.reconnectingHosts(activeSessions: []), [saved])
+            XCTAssertTrue(tracker.completeBackoff(host: saved, token: token, hasActiveSession: false))
+        }
+        _ = tracker.beginConnecting(saved)
+        XCTAssertEqual(tracker.handleTermination(host: saved, hasActiveSession: false), .notifyChanged)
+        XCTAssertEqual(tracker.attemptsUsed[saved], 6)
         XCTAssertTrue(tracker.reconnectingHosts(activeSessions: []).isEmpty)
         XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
 

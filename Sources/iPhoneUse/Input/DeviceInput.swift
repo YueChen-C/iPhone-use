@@ -8,11 +8,20 @@ final class DeviceInput {
     private let lifecycleLock = NSLock()
     private var retired = false
     private var lastActivityUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    private var calibrationRejected: Bool
     var isRetired: Bool { lifecycleLock.withLock { retired } }
     var lastInputUptime: TimeInterval { lifecycleLock.withLock { lastActivityUptime } }
+    var hasRejectedCalibration: Bool { lifecycleLock.withLock { calibrationRejected } }
+    var pointerOrientation: RelativePointerScreenMatcher.Orientation {
+        lifecycleLock.withLock { relativePointerOrientation }
+    }
 
     func recordInputActivity(at uptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         lifecycleLock.withLock { lastActivityUptime = uptime }
+    }
+
+    func rejectCalibration() {
+        lifecycleLock.withLock { calibrationRejected = true }
     }
 
     var isCurrentSession: Bool {
@@ -32,17 +41,15 @@ final class DeviceInput {
     }
 
     var needsCalibration: Bool {
+        if hasRejectedCalibration { return true }
         if calibrationRequired && calibration == nil { return true }
         if let calibration, let size = screenSize?() { return !calibration.matches(size) }
         return false
     }
 
-    /// Absolute hosts position through the absolute collection, but iOS only
-    /// synthesizes a touch from relative button reports, so every press and
-    /// all drag movement run on the relative collection. Calibrated hosts
-    /// use the relative collection for everything.
+    /// Press, motion and release stay on the same HID service for each mode.
     private var pointerReports: [ReportID] {
-        calibration != nil || calibrationRequired ? [.relativeMouse] : [.absolutePointer, .relativeMouse]
+        calibration != nil || calibrationRequired ? [.relativeMouse] : [.absolutePointer]
     }
 
     // Gesture state is confined to this queue. Only motion supersession is
@@ -51,8 +58,9 @@ final class DeviceInput {
     private let hid = HIDPeripheral.shared
     private let reportReadiness: (ReportID, UUID, UUID?) -> Bool
     private let inputIsAllowed: () -> Bool
+    private let calibrationIsVerified: () -> Bool
     private var buttons: UInt8 = 0
-    private let reportSender: (ReportID, [UInt8]) -> Void
+    private let reportSender: (ReportID, [UInt8], Bool) -> Void
     private let sleep: (TimeInterval) -> Void
     private var windowDragging = false
     let calibration: RelativePointerCalibration?
@@ -61,10 +69,8 @@ final class DeviceInput {
     /// Queue-confined progress lets fresh hover targets share one homing path.
     /// Cancelling the interaction or invalidating its mapping starts a new path.
     private var relativeHomingReportIndex = 0
+    private var relativePointerOrientation: RelativePointerScreenMatcher.Orientation
     private var lastTrackingMovement: RelativePointerCalibration.Movement?
-    /// Predicted pointer position in physical pixels while an uncalibrated
-    /// drag runs on the relative collection. Nil outside a drag.
-    private var dragPosition: CGPoint?
     private let motionSequence = PointerMotionSequence()
     // Background cancellation must not supersede a foreground hover already
     // submitted by the timer for the same AppKit mouse event.
@@ -91,6 +97,8 @@ final class DeviceInput {
         var calibrationInfo: [String: Any] = [
             "filePresent": calibrationFilePresent,
             "loaded": calibration != nil,
+            "responseRejected": hasRejectedCalibration,
+            "sessionVerified": calibration == nil || calibrationIsVerified(),
             "mode": mode,
         ]
         if let currentSize {
@@ -113,13 +121,14 @@ final class DeviceInput {
             "ready": isPointerReady,
             "needsCalibration": needsCalibration,
             "sessionCurrent": isCurrentSession,
+            "relativePointerOrientation": pointerOrientation.rawValue,
             "coordinateMappingAvailable": coordinateMappingAvailable,
             "calibration": calibrationInfo,
         ]
     }
 
     private var coordinateMappingAvailable: Bool {
-        if isRetired || !inputIsAllowed() { return false }
+        if isRetired || hasRejectedCalibration || !inputIsAllowed() { return false }
         if calibrationRequired && calibration == nil { return false }
         if let calibration, let screenSize {
             guard let size = screenSize(), calibration.matches(size) else { return false }
@@ -133,6 +142,9 @@ final class DeviceInput {
         calibration: RelativePointerCalibration? = nil,
         calibrationRequired: Bool = false,
         calibrationFilePresent: Bool? = nil,
+        calibrationRejected: Bool = false,
+        calibrationIsVerified: @escaping () -> Bool = { true },
+        relativePointerOrientation: RelativePointerScreenMatcher.Orientation = .identity,
         screenSize: (() -> CGSize?)? = nil,
         inputIsAllowed: @escaping () -> Bool = { true },
         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
@@ -144,17 +156,26 @@ final class DeviceInput {
         self.calibration = calibration
         self.calibrationRequired = calibrationRequired
         self.calibrationFilePresent = calibrationFilePresent ?? calibrationRequired
+        self.calibrationRejected = calibrationRejected
         self.screenSize = screenSize
         self.inputIsAllowed = inputIsAllowed
+        self.calibrationIsVerified = calibrationIsVerified
+        self.relativePointerOrientation = relativePointerOrientation
         self.sleep = sleep
         self.reportReadiness =
             reportReadiness ?? {
                 HIDPeripheral.shared.isReady(report: $0, host: $1, session: $2)
             }
-        self.reportSender =
-            reportSender ?? { id, bytes in
-                HIDPeripheral.shared.send(id, bytes, to: host, session: session, isAllowed: inputIsAllowed)
+        self.reportSender = { id, bytes, release in
+            if let reportSender {
+                reportSender(id, bytes)
+            } else {
+                // An explicit release uses the last sent absolute position, not
+                // a stale window target. Still enforce the host/session in HID.
+                HIDPeripheral.shared.send(
+                    id, bytes, to: host, session: session, isAllowed: inputIsAllowed, absoluteRelease: release)
             }
+        }
         queue = DispatchQueue(label: "iphone-use.input.\(host)")
     }
 
@@ -280,9 +301,7 @@ extension DeviceInput {
 
             pointer(from.0, from.1)
             pause(step * 2)
-            beginEstimatedDrag(x: from.0, y: from.1)
             button(down: true)
-            // Stay completely still while holding: no movement reports are emitted.
             pause(holdDuration)
             let steps = max(2, Int(dragDuration / step))
             let interval = dragDuration / Double(steps)
@@ -290,19 +309,12 @@ extension DeviceInput {
                 let t = Double(i) / Double(steps)
                 let x = from.0 + (to.0 - from.0) * t
                 let y = from.1 + (to.1 - from.1) * t
-                if calibration != nil {
-                    dragMove(x, y, sequence: nil)
-                    pause(interval)
-                } else {
-                    let movementWait = moveEstimatedDragPointer(x, y, sequence: nil)
-                    if interval > movementWait {
-                        pause(interval - movementWait)
-                    }
-                }
+                dragMove(x, y, sequence: nil)
+                pause(interval)
             }
+            if calibration == nil { pause(step * 2) }
             button(down: false)
             pause(step)
-            endEstimatedDrag()
         }
     }
 
@@ -354,8 +366,7 @@ extension DeviceInput {
     }
 
     /// Follow a polyline with one press and release. `duration` is the total
-    /// movement wait; estimated report pacing counts toward it. Positioning,
-    /// button pacing and calibrated HID reports
+    /// movement wait. Positioning, button pacing and calibrated HID reports
     /// retain their own intervals. Segment waits follow physical screen distance.
     func swipe(points: [(Double, Double)], duration: TimeInterval) throws {
         try performCoordinateGesture {
@@ -376,13 +387,9 @@ extension DeviceInput {
             else { throw InputError.invalidSwipe(table.swipeReasonReportCount) }
 
             let durations = swipeSegmentDurations(points: points, duration: duration)
-            // iOS synthesizes the touch on the relative collection only, and
-            // absolute movement cannot move a held touch. Uncalibrated hosts
-            // position through one absolute report, then drag with estimated
-            // relative counts; calibrated hosts drag on their measured curve.
+            // Position and hold through the same pointer report throughout.
             pointer(points[0].0, points[0].1)
             pause(step * 2)
-            beginEstimatedDrag(x: points[0].0, y: points[0].1)
             button(down: true)
             pause(step)
             for (index, segmentDuration) in durations.enumerated() {
@@ -395,18 +402,13 @@ extension DeviceInput {
                     let x = from.0 + (to.0 - from.0) * t
                     let y = from.1 + (to.1 - from.1) * t
                     let interval = segmentDuration / Double(steps)
-                    if calibration != nil {
-                        dragMove(x, y, sequence: nil)
-                        pause(interval)
-                    } else {
-                        let movementWait = moveEstimatedDragPointer(x, y, sequence: nil)
-                        if interval > movementWait { pause(interval - movementWait) }
-                    }
+                    dragMove(x, y, sequence: nil)
+                    pause(interval)
                 }
             }
+            if calibration == nil { pause(step * 2) }
             button(down: false)
             pause(step)
-            endEstimatedDrag()
         }
     }
 
@@ -437,9 +439,12 @@ extension DeviceInput {
 
     /// Reload only an idle input; queued work from the old configuration must
     /// not send reports after the registry publishes its replacement.
-    func retireForCalibrationReload() throws {
+    func retireForCalibrationReload(ifActivityUnchanged activity: UInt64? = nil) throws {
         try queue.sync {
             try requireIdlePointer()
+            if let activity, !backgroundSequence.isCurrent(activity) {
+                throw InputError.pairingProbeUnavailable
+            }
             advanceMotionSequence()
             clearPointerEstimate()
             lifecycleLock.withLock { retired = true }
@@ -465,7 +470,8 @@ extension DeviceInput {
                     guard isReady(), backgroundSequence.isCurrent(sequence) else {
                         throw InputError.pairingProbeUnavailable
                     }
-                    relative(dx, dy)
+                    // Discovery observes raw HID axes before applying a transform.
+                    send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 0, dx: dx, dy: dy))
                     pause(step)
                 }
             }
@@ -499,6 +505,15 @@ extension DeviceInput {
         }
     }
 
+    /// Adopt only a transform proven by this session's closed discovery path.
+    /// Registry cache rebuilds receive the same proof explicitly; files are unchanged.
+    func adoptRelativePointerOrientation(_ orientation: RelativePointerScreenMatcher.Orientation) {
+        queue.sync {
+            lifecycleLock.withLock { relativePointerOrientation = orientation }
+            clearPointerEstimate()
+        }
+    }
+
     /// A completed visual trajectory can establish the current origin without
     /// touching an edge. Keep it only on this exact screen/profile/input queue;
     /// cancellation or unrelated foreground activity invalidates the sample.
@@ -524,11 +539,14 @@ extension DeviceInput {
     /// cancellation invalidate the entire result before it can be saved.
     func measureRelativePointer(
         screenID: String, size: CGSize,
+        activity: UInt64? = nil,
+        reuseExisting: Bool = false,
         isReady: @escaping () -> Bool,
         capture: @escaping () -> [UInt8]?,
+        onMismatch: @escaping () -> Void = {},
         progress: @escaping (Int) -> Void = { _ in }
-    ) throws -> RelativePointerCalibration {
-        let sequence = backgroundSequence.current
+    ) throws -> AutomaticPointerCalibration.Resolution {
+        let sequence = activity ?? backgroundSequence.current
         return try queue.sync {
             try requireIdlePointer()
             guard size.width.isFinite, size.height.isFinite,
@@ -541,15 +559,20 @@ extension DeviceInput {
             defer { clearPointerEstimate() }
             func requireCurrent() throws {
                 guard !self.isRetired, isReady(), self.backgroundSequence.isCurrent(sequence) else {
-                    throw InputError.pairingProbeUnavailable
+                    throw DeviceError(
+                        "pointer measurement interrupted (retired=\(self.isRetired), ready=\(isReady()), activityCurrent=\(self.backgroundSequence.isCurrent(sequence)))"
+                    )
                 }
             }
+            try requireCurrent()
+            let reportInterval = reuseExisting ? (calibration?.reportInterval ?? 0.03) : 0.03
             let measurement = AutomaticPointerCalibration(
                 host: host, screenID: screenID, width: Int(size.width), height: Int(size.height),
+                reportInterval: reportInterval,
                 send: { dx, dy in
                     try requireCurrent()
                     self.relative(dx, dy)
-                    self.pause(0.03)
+                    self.pause(reportInterval)
                 },
                 capture: {
                     self.pause(0.4)
@@ -558,7 +581,33 @@ extension DeviceInput {
                     return PointerMotionObservation.Frame(
                         width: Int(size.width), height: Int(size.height), pixels: pixels)
                 }, progress: progress)
-            return try measurement.measure()
+            if reuseExisting {
+                var rejected = false
+                do {
+                    let result = try measurement.resolve(existing: calibration) {
+                        rejected = true
+                        onMismatch()
+                    }
+                    try requireCurrent()
+                    // Publish rejection before releasing this queue: a waiting
+                    // click must not use the old curve during registry publication.
+                    self.lifecycleLock.withLock {
+                        if result.reused {
+                            self.calibrationRejected = false
+                        } else if rejected {
+                            self.calibrationRejected = true
+                        }
+                    }
+                    return result
+                } catch {
+                    // Publishing a readiness change while reports are still
+                    // running makes the control window cancel this very job.
+                    // Block a rejected curve only once recovery has stopped.
+                    if rejected { self.lifecycleLock.withLock { self.calibrationRejected = true } }
+                    throw error
+                }
+            }
+            return AutomaticPointerCalibration.Resolution(profile: try measurement.measure(), reused: false)
         }
     }
 
@@ -676,12 +725,10 @@ extension DeviceInput {
         queue.async {
             guard !self.windowDragging, self.coordinateMappingAvailable else { return }
             self.windowDragging = true
-            // Position through the absolute collection, then press on the
-            // relative collection: iOS synthesizes the touch there.
+            // Hover and held motion use the same report and coordinate space.
             self.pointer(x, y)
             // Use the same positioning interval as the coordinate tap API.
             self.pause(self.step * 2)
-            self.beginEstimatedDrag(x: x, y: y)
             self.button(down: true)
         }
     }
@@ -701,38 +748,29 @@ extension DeviceInput {
         queue.async {
             guard self.windowDragging else { return }
             self.dragMove(x, y, sequence: nil)
+            if self.calibration == nil { self.pause(self.step * 2) }
             self.button(down: false)
             self.windowDragging = false
-            self.endEstimatedDrag()
         }
     }
 
     /// Always clear the phone-side button state when the window loses focus or
     /// the mouse interaction is cancelled outside the view.
-    func cancelPointer() {
-        discardPendingMotion()
+    func cancelPointer(preservingBackgroundMotion: Bool = false) {
+        if preservingBackgroundMotion { motionSequence.advance() } else { discardPendingMotion() }
         queue.async {
             self.windowDragging = false
-            self.endEstimatedDrag()
             if self.estimatedPosition == nil { self.relativeHomingReportIndex = 0 }
             guard self.buttons != 0 else { return }
             self.button(down: false)
-            // The drag positioned the pointer through the absolute collection.
-            // Clear that collection at its last position so no cancellation
-            // path can leave a held button behind on either collection.
-            if let position = self.absolutePointerPosition {
-                self.send(
-                    .absolutePointer,
-                    HIDReportPayload.absolutePointer(buttons: 0, x: position.x, y: position.y))
-            }
         }
     }
 
     /// A report subscription can disappear while a calibrated movement is being
     /// sent. Drop the predicted landing so the first movement after reconnect
     /// establishes a fresh origin instead of trusting reports that were lost.
-    func invalidatePointerEstimate() {
-        discardPendingMotion()
+    func invalidatePointerEstimate(preservingBackgroundMotion: Bool = false) {
+        if preservingBackgroundMotion { motionSequence.advance() } else { discardPendingMotion() }
         queue.async {
             self.clearPointerEstimate()
         }
@@ -760,7 +798,10 @@ extension DeviceInput {
         if dx != 0 || dy != 0 || click { discardPendingMotion() }
         try queue.sync {
             try requireIdlePointer()
-            if dx != 0 || dy != 0 { clearPointerEstimate() }
+            if dx != 0 || dy != 0 {
+                clearPointerEstimate()
+                absolutePointerPosition = nil
+            }
             var remainingX = dx
             var remainingY = dy
             while remainingX != 0 || remainingY != 0 {
@@ -772,9 +813,15 @@ extension DeviceInput {
                 pause(step)
             }
             if click {
-                send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 1))
-                pause(0.08)
-                send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 0))
+                if calibration == nil, absolutePointerPosition != nil {
+                    button(down: true)
+                    pause(0.08)
+                    button(down: false)
+                } else {
+                    send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 1))
+                    pause(0.08)
+                    send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 0))
+                }
                 pause(step)
             }
         }
@@ -859,9 +906,9 @@ extension DeviceInput {
             guard !isRetired, inputIsAllowed(), !windowDragging, buttons == 0,
                 reportReadiness(.keyboard, host, session)
             else { return false }
-            reportSender(.keyboard, HIDReportPayload.keyboard(modifiers: 0x01, code: 0))
+            send(.keyboard, HIDReportPayload.keyboard(modifiers: 0x01, code: 0))
             pause(step)
-            reportSender(.keyboard, HIDReportPayload.keyboard(modifiers: 0x00, code: 0))
+            send(.keyboard, HIDReportPayload.keyboard(modifiers: 0x00, code: 0))
             return true
         }
     }
@@ -933,104 +980,9 @@ extension DeviceInput {
         send(.absolutePointer, HIDReportPayload.absolutePointer(buttons: buttons, x: px, y: py))
     }
 
-    /// Movement while the pointer button is held: calibrated hosts follow
-    /// their measured curve, uncalibrated hosts the estimated relative drag.
-    /// Absolute reports can never carry this movement: iOS pins the touch to
-    /// the relative collection, and absolute pointer moves — with or without
-    /// button bits — do not move it (verified on iOS 26).
+    /// Held movement uses the same coordinates and report as hover/press.
     fileprivate func dragMove(_ x: Double, _ y: Double, sequence: UInt64?) {
-        if let calibration {
-            moveCalibratedPointer(x, y, calibration: calibration, sequence: sequence)
-        } else {
-            moveEstimatedDragPointer(x, y, sequence: sequence)
-        }
-    }
-
-    /// Anchors the uncalibrated drag estimate at the press position.
-    fileprivate func beginEstimatedDrag(x: Double, y: Double) {
-        guard calibration == nil, let size = screenSize?() else { return }
-        dragPosition = CGPoint(x: x * size.width, y: y * size.height)
-    }
-
-    fileprivate func endEstimatedDrag() {
-        dragPosition = nil
-    }
-
-    /// Built-in acceleration prior for drags without a measured curve:
-    /// physical pixels per sustained report of each relative count, measured
-    /// on a 750-pixel 2x iPhone. iOS pointer acceleration is superlinear, so
-    /// a flat pixels-per-count guess makes fast drags overshoot badly. The
-    /// prior is scaled by the live screen's width against the reference;
-    /// a saved calibration always replaces it.
-    static let estimatedDragCurve: [Double] = [
-        0, 0.53125, 1.28125, 2.1875, 3.28125, 4.5625, 6.03125, 7.65625,
-        9.5, 11.508771929824562, 13.708333333333334, 16.1, 18.647058823529413,
-        21.4, 24.37037037037037, 27.47826086956522, 30.761904761904763,
-        34.31578947368421, 38, 41.86666666666667, 46, 50.15384615384615,
-        54.72727272727273, 59.2, 64.2, 69.11111111111111, 74.25, 79.75,
-        85.42857142857143, 91.14285714285714, 97.33333333333333, 103.33333333333333,
-        109.6,
-    ]
-    /// Screen width the built-in drag curve was measured on.
-    private static let estimatedDragReferenceWidth = 750.0
-    /// Largest relative count per estimated drag report; the largest measured
-    /// value in the built-in curve.
-    static let estimatedDragMaxCount = 32
-
-    /// Follows the drag target with combined relative X/Y reports. Each axis picks the count whose
-    /// curve-predicted distance best covers the remaining error, so slow and
-    /// fast drags track the mouse at the same fidelity; each new target
-    /// corrects whatever the real curve did differently.
-    @discardableResult
-    fileprivate func moveEstimatedDragPointer(_ x: Double, _ y: Double, sequence: UInt64?) -> TimeInterval {
-        guard shouldContinueMotion(sequence),
-            let size = screenSize?(),
-            var position = dragPosition
-        else { return 0 }
-        let target = CGPoint(
-            x: max(0, min(size.width - 1, x * size.width)),
-            y: max(0, min(size.height - 1, y * size.height)))
-        let scale = size.width / Self.estimatedDragReferenceWidth
-        let tolerance = Self.estimatedDragCurve[1] * scale / 2
-        var movementWait: TimeInterval = 0
-        while shouldContinueMotion(sequence) {
-            let remainingX = target.x - position.x
-            let remainingY = target.y - position.y
-            guard abs(remainingX) > tolerance || abs(remainingY) > tolerance else { break }
-            var report = (dx: 0, dy: 0)
-            for axis in 0...1 {
-                let error = axis == 0 ? remainingX : remainingY
-                guard abs(error) > tolerance else { continue }
-                // Largest count whose predicted distance still fits the error,
-                // so the estimate never overshoots its own prediction.
-                var count = 1
-                for candidate in 1...Self.estimatedDragMaxCount
-                where Self.estimatedDragCurve[candidate] * scale <= abs(error) + tolerance {
-                    count = candidate
-                }
-                let distance = Self.estimatedDragCurve[count] * scale
-                if axis == 0 {
-                    report.dx = error < 0 ? -count : count
-                    position.x = max(0, min(size.width - 1, position.x + (error < 0 ? -distance : distance)))
-                } else {
-                    report.dy = error < 0 ? -count : count
-                    position.y = max(0, min(size.height - 1, position.y + (error < 0 ? -distance : distance)))
-                }
-            }
-            guard report.dx != 0 || report.dy != 0 else { break }
-            relative(report.dx, report.dy)
-            pause(step)
-            movementWait += step
-        }
-        dragPosition = position
-        // Keep the absolute bookkeeping where the phone most likely shows the
-        // pointer, so a later hover or cancellation does not jump it.
-        let unit = Double(HIDReportMap.absoluteMax)
-        absolutePointerPosition = (
-            UInt16(max(0, min(unit, (position.x / size.width * unit).rounded()))),
-            UInt16(max(0, min(unit, (position.y / size.height * unit).rounded())))
-        )
-        return movementWait
+        pointer(x, y, sequence: sequence)
     }
 
     fileprivate func shouldContinueMotion(_ sequence: UInt64?) -> Bool {
@@ -1070,14 +1022,20 @@ extension DeviceInput {
     }
 
     fileprivate func relative(_ dx: Int, _ dy: Int) {
-        send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: buttons, dx: dx, dy: dy))
+        let report = relativePointerOrientation.reportDelta(dx: dx, dy: dy)
+        send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: buttons, dx: report.dx, dy: report.dy))
     }
 
     fileprivate func button(down: Bool) {
         buttons = down ? 1 : 0
-        // Buttons live on the relative collection: iOS synthesizes touches
-        // from relative button reports, never from absolute pointer buttons.
-        send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: buttons))
+        if calibration == nil, !calibrationRequired, let position = absolutePointerPosition {
+            send(
+                .absolutePointer,
+                HIDReportPayload.absolutePointer(buttons: buttons, x: position.x, y: position.y),
+                release: !down)
+        } else {
+            send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: buttons))
+        }
     }
 
     /// Coordinate APIs share the same validation order and queue boundary.
@@ -1096,7 +1054,6 @@ extension DeviceInput {
         estimatedPosition = nil
         relativeHomingReportIndex = 0
         lastTrackingMovement = nil
-        dragPosition = nil
     }
 
     fileprivate func requireIdlePointer() throws {
@@ -1114,12 +1071,12 @@ extension DeviceInput {
         sleep(seconds)
     }
 
-    fileprivate func send(_ id: ReportID, _ bytes: [UInt8]) {
+    fileprivate func send(_ id: ReportID, _ bytes: [UInt8], release: Bool = false) {
         guard !isRetired else { return }
         // A capture can be invalidated while an input is queued. Stop stale
         // movement and presses, while still releasing any held button or key.
-        guard inputIsAllowed() || (id != .absolutePointer && bytes.allSatisfy { $0 == 0 }) else { return }
-        reportSender(id, bytes)
+        guard release || inputIsAllowed() || (id != .absolutePointer && bytes.allSatisfy { $0 == 0 }) else { return }
+        reportSender(id, bytes, release)
     }
 
 }

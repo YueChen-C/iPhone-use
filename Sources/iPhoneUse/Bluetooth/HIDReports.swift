@@ -13,8 +13,22 @@ enum HIDReportMap {
     /// Largest value of the absolute pointer's X and Y axes.
     static let absoluteMax: Int = 32767
 
-    // Keep the descriptor order stable for hosts that cache the GATT service.
-    static let descriptor: [UInt8] = keyboard + absolutePointer + relativeMouse + consumer
+    // Separate HID services keep relative axes/buttons out of the absolute
+    // pointer's report map. iOS otherwise routes its held touch as relative input.
+    // Older hosts need the relative mouse on the first HID service.
+    static let primaryReports: [ReportID] = [.keyboard, .relativeMouse, .consumer]
+    static let absoluteReports: [ReportID] = [.absolutePointer]
+
+    static func descriptor(for reports: [ReportID]) -> [UInt8] {
+        reports.flatMap { id in
+            switch id {
+            case .keyboard: keyboard
+            case .absolutePointer: absolutePointer
+            case .relativeMouse: relativeMouse
+            case .consumer: consumer
+            }
+        }
+    }
 
     // 8-byte input: modifiers, reserved, 6 key codes. 1-byte LED output.
     static let keyboard: [UInt8] = [

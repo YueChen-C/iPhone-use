@@ -32,7 +32,23 @@ struct CaptureIdentityRetrySchedule {
     }
 }
 
-/// Runs only after capture topology changes or an explicit matching retry. No
+/// Failed identity checks must not become terminal while USB topology is stable.
+/// Back off to one observation every 30 seconds; no pointer probes or per-frame work.
+struct CaptureIdentityRecovery {
+    static func delay(attempt: Int) -> TimeInterval {
+        [3.0, 10.0, 30.0][min(2, max(0, attempt))]
+    }
+
+    static func permitsRetry(
+        stopped: Bool, expected: UInt64, current: UInt64,
+        sourceCount: Int, state: ScreenCaptureIdentityState
+    ) -> Bool {
+        !stopped && expected == current && sourceCount > 1
+            && [.failed, .partiallyVerified].contains(state)
+    }
+}
+
+/// Runs after topology changes, explicit retries or failed-check backoff. No
 /// subprocess, screenshot, or comparison is performed on the video hot path.
 enum CaptureIdentityVerifier {
     enum Result {
