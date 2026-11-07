@@ -143,6 +143,15 @@ final class DeviceRegistry {
         reconnectSavedBluetoothHosts(for: snapshot.screens, resetExhausted: resetExhausted)
     }
 
+    /// Public trigger to force immediate BLE reconnect attempt for saved paired hosts.
+    func reconnectBluetooth(resetExhausted: Bool = true) {
+        matchQueue.async { [weak self] in
+            guard let self else { return }
+            let screens = ScreenCaptureManager.shared.all
+            self.reconnectSavedBluetoothHosts(for: screens, resetExhausted: resetExhausted)
+        }
+    }
+
     /// Reconnects hosts that unexpectedly disconnected during idle, in parallel with USB resume.
     /// Normally the retained USB demand keeps the existing Bluetooth session alive.
     func prewakeBluetoothForIdleResume(

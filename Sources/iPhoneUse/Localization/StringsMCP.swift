@@ -94,7 +94,7 @@ struct StringsMCP: LocalizedTable {
         toolLongPress: "长按某个点，例如打开上下文菜单。",
         toolSwipe: "沿至少两个点的有序路径持续拖动，直到最后一个点才抬起。默认使用最新截图像素；normalized=true 时每轴使用 0...1000。",
         toolTypeText:
-            "通过蓝牙键盘输入 ASCII 或中文（中文转拼音并以空格选择首个候选词）。clear_before 先全选清空；commit_ime 在文字后按空格提交输入法候选词；press_enter 最后按回车；ensure_chinese_ime 使用屏幕 OCR 尝试切换中文输入法。",
+            "通过蓝牙键盘输入 ASCII 或中文（中文转拼音并以空格选择首个候选词）。clear_before 先全选清空；commit_ime 在文字后按空格提交输入法候选词；press_enter 最后按回车；submit 提交/发送文字（中文自动 commit 候选词并按回车提交，避免文字停留在输入框）；ensure_chinese_ime 使用屏幕 OCR 尝试切换中文输入法。",
         toolPressKey:
             "按下按键，可带修饰键。按键：enter、escape、backspace、tab、space、up、down、left、right 或单个字符。修饰键：cmd、shift、alt、ctrl。cmd+space 打开聚焦搜索。",
         toolKeyboardSequence:
@@ -161,7 +161,7 @@ struct StringsMCP: LocalizedTable {
         toolSwipe:
             "Drag continuously through an ordered path of at least two points, keeping contact until the last point. Coordinates default to pixels of the latest screenshot; normalized=true uses 0...1000 per axis.",
         toolTypeText:
-            "Type ASCII or Chinese with the Bluetooth keyboard (Hanzi becomes pinyin and selects the first candidate). clear_before selects all and deletes first; commit_ime presses space after text; press_enter presses enter last; ensure_chinese_ime uses screen OCR to attempt switching to a Chinese IME.",
+            "Type ASCII or Chinese with the Bluetooth keyboard (Hanzi becomes pinyin and selects the first candidate). clear_before selects all and deletes first; commit_ime presses space after text; press_enter presses enter last; submit commits IME candidate and presses enter to send/submit text atomically; ensure_chinese_ime uses screen OCR to attempt switching to a Chinese IME.",
         toolPressKey:
             "Press a key, optionally with modifiers. Keys: enter, escape, backspace, tab, space, up, down, left, right, or a character. Modifiers: cmd, shift, alt, ctrl. cmd+space opens Spotlight.",
         toolKeyboardSequence:

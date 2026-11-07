@@ -62,6 +62,7 @@ final class QuietModeActivityController {
         let timer = Timer(timeInterval: min(timeout, 1), repeats: true) { [weak self] _ in self?.checkIdle() }
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
+        syncResidentDemand()
     }
 
     func stop() {
@@ -71,11 +72,18 @@ final class QuietModeActivityController {
         timer = nil
         if let observer { NotificationCenter.default.removeObserver(observer) }
         observer = nil
+        HIDPeripheral.shared.setResidentQuietDemand(false)
     }
 
     func modeChanged() {
         if mode() == .desktop { wake() }
+        syncResidentDemand()
         lastActivity = now()
+    }
+
+    private func syncResidentDemand() {
+        let isResident = mode() == .residentQuiet
+        HIDPeripheral.shared.setResidentQuietDemand(isResident)
     }
 
     func setOpenWindows(_ open: Bool) {
