@@ -105,6 +105,43 @@ enum ControlAPI {
                 return .json(["ok": true, "device": id, "text": match.text, "x": match.x, "y": match.y])
             case ("GET", "/screenshot"):
                 return try screenshot(request.query, deviceQuery: deviceQuery)
+            case ("GET", "/track"), ("POST", "/track/status"):
+                let device = try DeviceRegistry.shared.find(deviceQuery)
+                let coordinator = DeviceRegistry.shared.coordinator(for: device)
+                return .json([
+                    "ok": true,
+                    "device": device.id,
+                    "track": coordinator.status.json,
+                ])
+            case ("POST", "/track"), ("POST", "/track/switch"):
+                let device = try DeviceRegistry.shared.find(deviceQuery)
+                let coordinator = DeviceRegistry.shared.coordinator(for: device)
+                let rawMode = (body["mode"] as? String) ?? (body["track"] as? String)
+                if request.path == "/track", rawMode == nil || rawMode?.isEmpty == true {
+                    return .json([
+                        "ok": true,
+                        "device": device.id,
+                        "track": coordinator.status.json,
+                    ])
+                }
+                guard let targetMode = ControlTrackMode.parse(rawMode) else {
+                    throw DeviceError("Invalid track mode. Expected 'standard', 'enhanced', or 'auto'.")
+                }
+                coordinator.switchMode(targetMode)
+                return .json([
+                    "ok": true,
+                    "device": device.id,
+                    "track": coordinator.status.json,
+                ])
+            case ("GET", "/tree"), ("GET", "/ax_tree"), ("POST", "/ax_tree"):
+                let device = try DeviceRegistry.shared.find(deviceQuery)
+                let coordinator = DeviceRegistry.shared.coordinator(for: device)
+                let includeOffscreen = (body["include_offscreen"] as? Bool) ?? (request.query["include_offscreen"] == "1")
+                let treeResp = try coordinator.getAXTree(includeOffscreen: includeOffscreen)
+                var out = treeResp
+                out["ok"] = true
+                out["device"] = device.id
+                return .json(out)
             default:
                 guard request.method == "POST", let action = Action(rawValue: request.path) else {
                     return .error("not found", status: 404)
@@ -297,6 +334,14 @@ enum ControlAPI {
 
     private static func tapTextPoint(_ id: String, _ x: Double, _ y: Double, _ hold: Double) throws {
         let device = try DeviceRegistry.shared.find(id)
+        let coordinator = DeviceRegistry.shared.coordinator(for: device)
+        let screenWidth = Double(device.screen.size?.width ?? 1179)
+        let screenHeight = Double(device.screen.size?.height ?? 2556)
+        if coordinator.mode == .enhanced || (coordinator.mode == .auto && coordinator.status.enhancedAvailable && coordinator.state != .degradedToStandard) {
+            DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+            try coordinator.tap(x: x, y: y, screenWidth: screenWidth, screenHeight: screenHeight, hold: hold)
+            return
+        }
         let input = try DeviceRegistry.shared.input(for: device)
         guard input.isPointerReady else {
             input.invalidatePointerEstimate(preservingBackgroundMotion: true)
@@ -310,6 +355,55 @@ enum ControlAPI {
         _ action: Action, body: [String: Any], deviceQuery: String?
     ) throws -> HTTPResponse {
         let device = try DeviceRegistry.shared.find(deviceQuery)
+        let coordinator = DeviceRegistry.shared.coordinator(for: device)
+        let useEnhanced = coordinator.mode == .enhanced
+            || (coordinator.mode == .auto && coordinator.status.enhancedAvailable && coordinator.state != .degradedToStandard)
+        let screenWidth = Double(device.screen.size?.width ?? 1179)
+        let screenHeight = Double(device.screen.size?.height ?? 2556)
+
+        if useEnhanced {
+            switch action {
+            case .tap:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+                let (x, y) = try point(body, "x", "y", on: device)
+                try coordinator.tap(
+                    x: x, y: y, screenWidth: screenWidth, screenHeight: screenHeight,
+                    hold: (body["hold"] as? Double) ?? 0.08)
+                return .json(["ok": true, "device": device.id])
+            case .swipe:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+                let swipe = try SwipeRequest(body, screenSize: device.screen.size, screenName: device.screen.name)
+                if let first = swipe.points.first, let last = swipe.points.last {
+                    try coordinator.swipe(
+                        fromX: first.0, fromY: first.1, toX: last.0, toY: last.1,
+                        screenWidth: screenWidth, screenHeight: screenHeight, duration: swipe.duration)
+                    return .json(["ok": true, "device": device.id])
+                }
+            case .type:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+                guard let text = body["text"] as? String else { return .error(StringsAPI.current.textRequired) }
+                let clear = (body["clear_before"] as? Bool) == true || (body["clear"] as? Bool) == true
+                let submit = (body["submit"] as? Bool) == true || (body["press_enter"] as? Bool) == true
+                try coordinator.type(text: text, clear: clear, submit: submit)
+                return .json(["ok": true, "device": device.id])
+            case .key:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+                guard let key = body["key"] as? String else { return .error(StringsAPI.current.keyRequired) }
+                try coordinator.key(name: key, modifiers: (body["modifiers"] as? [String]) ?? [])
+                return .json(["ok": true, "device": device.id])
+            case .home:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+                try coordinator.button(name: "home")
+                return .json(["ok": true, "device": device.id])
+            case .power:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+                try coordinator.button(name: "lock")
+                return .json(["ok": true, "device": device.id])
+            case .move, .nudge:
+                break
+            }
+        }
+
         // Reject unverified coordinates before cancellation so retrying clients
         // cannot repeatedly interrupt the calibration needed to serve them.
         // Ready gestures and keyboard/raw input still preempt background work.

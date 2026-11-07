@@ -35,6 +35,14 @@ final class ControlConnectionOverlay: NSView {
     private var instructionsField: NSTextField?
     private var helpField: NSTextField?
 
+    private var cardView: NSView?
+    private let reconnectButton = NSButton(title: "", target: nil, action: nil)
+    private let viewOnlyButton = NSButton(title: "", target: nil, action: nil)
+    private let pillView = PillContainerView()
+    private let pillLabel = NSTextField(labelWithString: "")
+    private let pillButton = NSButton(title: "", target: nil, action: nil)
+    private(set) var isDismissed = false
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -43,12 +51,16 @@ final class ControlConnectionOverlay: NSView {
         setAccessibilityLabel(StringsUI.current.overlayAccessibility)
 
         let card = makeMessageCard()
+        cardView = card
         let icon = makeIconAndConfigureLabels()
         let instructions = makePairingInstructions()
         let help = makeTroubleshootingLabel()
+        let buttons = makeButtonsStack()
         let stack = makeMessageStack(
-            card: card, icon: icon, instructions: instructions, help: help)
-        installConstraints(card: card, stack: stack, icon: icon, instructions: instructions, help: help)
+            card: card, icon: icon, instructions: instructions, help: help, buttons: buttons)
+        installConstraints(
+            card: card, stack: stack, icon: icon, instructions: instructions, help: help, buttons: buttons)
+        setupPillView()
         update(.disconnected)
     }
 
@@ -119,10 +131,29 @@ final class ControlConnectionOverlay: NSView {
         return help
     }
 
+    private func makeButtonsStack() -> NSStackView {
+        reconnectButton.title = StringsUI.current.overlayButtonReconnect
+        reconnectButton.bezelStyle = .rounded
+        reconnectButton.target = self
+        reconnectButton.action = #selector(onReconnectClicked)
+
+        viewOnlyButton.title = StringsUI.current.overlayButtonViewOnly
+        viewOnlyButton.bezelStyle = .rounded
+        viewOnlyButton.target = self
+        viewOnlyButton.action = #selector(onViewOnlyClicked)
+
+        let stack = NSStackView(views: [viewOnlyButton, reconnectButton])
+        stack.orientation = .horizontal
+        stack.spacing = 12
+        stack.alignment = .centerY
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        return stack
+    }
+
     private func makeMessageStack(
-        card: NSView, icon: NSImageView, instructions: NSTextField, help: NSTextField
+        card: NSView, icon: NSImageView, instructions: NSTextField, help: NSTextField, buttons: NSStackView
     ) -> NSStackView {
-        let stack = NSStackView(views: [icon, title, message, instructions, help])
+        let stack = NSStackView(views: [icon, title, message, instructions, help, buttons])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 12
@@ -131,9 +162,44 @@ final class ControlConnectionOverlay: NSView {
         return stack
     }
 
+    private func setupPillView() {
+        pillView.wantsLayer = true
+        pillView.translatesAutoresizingMaskIntoConstraints = false
+        pillView.isHidden = true
+        addSubview(pillView)
+
+        pillLabel.stringValue = StringsUI.current.overlayPillTitle
+        pillLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        pillLabel.textColor = .secondaryLabelColor
+        pillLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        pillButton.title = StringsUI.current.overlayPillShowGuidance
+        pillButton.bezelStyle = .inline
+        pillButton.font = .systemFont(ofSize: 11, weight: .semibold)
+        pillButton.target = self
+        pillButton.action = #selector(onShowGuidanceClicked)
+        pillButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let pillStack = NSStackView(views: [pillLabel, pillButton])
+        pillStack.orientation = .horizontal
+        pillStack.spacing = 8
+        pillStack.alignment = .centerY
+        pillStack.translatesAutoresizingMaskIntoConstraints = false
+        pillView.addSubview(pillStack)
+
+        NSLayoutConstraint.activate([
+            pillView.topAnchor.constraint(equalTo: topAnchor, constant: 14),
+            pillView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            pillView.heightAnchor.constraint(equalToConstant: 28),
+            pillStack.leadingAnchor.constraint(equalTo: pillView.leadingAnchor, constant: 12),
+            pillStack.trailingAnchor.constraint(equalTo: pillView.trailingAnchor, constant: -12),
+            pillStack.centerYAnchor.constraint(equalTo: pillView.centerYAnchor),
+        ])
+    }
+
     private func installConstraints(
         card: NSView, stack: NSStackView, icon: NSImageView,
-        instructions: NSTextField, help: NSTextField
+        instructions: NSTextField, help: NSTextField, buttons: NSStackView
     ) {
         let preferredWidth = card.widthAnchor.constraint(equalToConstant: 420)
         preferredWidth.priority = NSLayoutConstraint.Priority(500)
@@ -152,16 +218,59 @@ final class ControlConnectionOverlay: NSView {
             message.widthAnchor.constraint(equalTo: stack.widthAnchor),
             instructions.widthAnchor.constraint(equalTo: stack.widthAnchor),
             help.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            buttons.heightAnchor.constraint(greaterThanOrEqualToConstant: 28),
         ])
+    }
+
+    @objc private func onReconnectClicked() {
+        reconnectButton.isEnabled = false
+        DeviceRegistry.shared.reconnectBluetooth(resetExhausted: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.reconnectButton.isEnabled = true
+        }
+    }
+
+    @objc private func onViewOnlyClicked() {
+        setDismissed(true)
+    }
+
+    @objc private func onShowGuidanceClicked() {
+        setDismissed(false)
+    }
+
+    func setDismissed(_ dismissed: Bool) {
+        guard isDismissed != dismissed else { return }
+        isDismissed = dismissed
+        cardView?.isHidden = dismissed
+        pillView.isHidden = !dismissed
+        needsDisplay = true
     }
 
     func update(_ status: ControlConnectionStatus) {
         lastStatus = status
-        if status == .connected { hasConnected = true }
+        if status == .connected {
+            hasConnected = true
+            setDismissed(false)
+        }
         isHidden = !status.showsOverlay
         let table = StringsUI.current
         instructionsField?.isHidden = status == .unmatched
         helpField?.isHidden = status == .unmatched
+
+        let hasPhoneScreen = status != .waitingForDevice
+        viewOnlyButton.isHidden = !hasPhoneScreen
+        reconnectButton.isHidden = !hasPhoneScreen
+
+        if status == .waitingForDevice {
+            setDismissed(false)
+        } else if isDismissed {
+            cardView?.isHidden = true
+            pillView.isHidden = false
+        } else {
+            cardView?.isHidden = false
+            pillView.isHidden = true
+        }
+
         switch status {
         case .waitingForDevice:
             title.stringValue = table.overlayWaitingTitle
@@ -184,9 +293,14 @@ final class ControlConnectionOverlay: NSView {
     /// Rebuilds the static card text and replays the last status after a
     /// language change; replaying .connected only hides the overlay.
     func refreshLocalization() {
-        setAccessibilityLabel(StringsUI.current.overlayAccessibility)
+        let table = StringsUI.current
+        setAccessibilityLabel(table.overlayAccessibility)
         instructionsField?.stringValue = pairingText()
-        helpField?.stringValue = StringsUI.current.overlayHelp
+        helpField?.stringValue = table.overlayHelp
+        reconnectButton.title = table.overlayButtonReconnect
+        viewOnlyButton.title = table.overlayButtonViewOnly
+        pillLabel.stringValue = table.overlayPillTitle
+        pillButton.title = table.overlayPillShowGuidance
         update(lastStatus)
     }
 
@@ -194,7 +308,18 @@ final class ControlConnectionOverlay: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard !isHidden, bounds.contains(convert(point, from: superview)) else { return nil }
+        guard !isHidden else { return nil }
+        let localPoint = convert(point, from: superview)
+        guard bounds.contains(localPoint) else { return nil }
+        if isDismissed {
+            if !pillView.isHidden, pillView.frame.contains(localPoint) {
+                return pillView.hitTest(point)
+            }
+            return nil
+        }
+        if let cardView, !cardView.isHidden, cardView.frame.contains(localPoint) {
+            return cardView.hitTest(point)
+        }
         return self
     }
 
@@ -204,6 +329,7 @@ final class ControlConnectionOverlay: NSView {
     override func keyDown(with event: NSEvent) {}
 
     override func draw(_ dirtyRect: NSRect) {
+        guard !isDismissed else { return }
         NSColor.black.withAlphaComponent(0.45).setFill()
         dirtyRect.fill(using: .sourceOver)
     }
@@ -215,5 +341,16 @@ private final class ConnectionMessageCard: NSView {
     override func draw(_ dirtyRect: NSRect) {
         NSColor.windowBackgroundColor.setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 16, yRadius: 16).fill()
+    }
+}
+
+private final class PillContainerView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.withAlphaComponent(0.92).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 14, yRadius: 14).fill()
+        NSColor.separatorColor.setStroke()
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 13.5, yRadius: 13.5)
+        path.lineWidth = 1
+        path.stroke()
     }
 }
