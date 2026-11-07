@@ -68,6 +68,18 @@ final class PointerMotionObservationTests: XCTestCase {
         XCTAssertNil(motion(pair(nonCircularBlock: true)))
     }
 
+    func testCalibrationIgnoresBoundedClockAnimationButKeepsAmbiguityChecks() throws {
+        let frames = pair(nonCircularBlock: true)
+        let observed = try XCTUnwrap(
+            PointerMotionObservation.motion(
+                from: frames.0, to: frames.1, direction: CGPoint(x: 1, y: 0), allowingBackgroundAnimation: true))
+        XCTAssertEqual(observed.delta.x, 120)
+        let ambiguous = pair(thirdDisk: true)
+        XCTAssertNil(
+            PointerMotionObservation.motion(
+                from: ambiguous.0, to: ambiguous.1, direction: CGPoint(x: 1, y: 0), allowingBackgroundAnimation: true))
+    }
+
     private func rectangle(_ points: [CGPoint], animated: Bool = false) -> [PointerMotionObservation.Frame] {
         points.enumerated().map { index, point in
             var pixels = [UInt8](repeating: 255, count: width * height)

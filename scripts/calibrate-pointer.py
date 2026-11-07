@@ -14,6 +14,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import secrets
 import socket
 import threading
@@ -289,6 +290,12 @@ def verify_mapping(api, device, position, tolerance=5):
 def baseline_profile(path, device, host):
     """A baseline is a candidate gain, never evidence of device identity."""
     source = json.loads(path.read_text())
+    bound_id = source.get('screenID')
+    if bound_id is not None:
+        if bound_id != device['id']:
+            return None  # A measured phone profile never changes ownership.
+    elif source.get('kind') != 'relative-pointer-baseline':
+        return None  # Anonymous legacy profiles are not reusable baselines.
     reference = source.get('reference', source)
     if (reference.get('screenWidth'), reference.get('screenHeight')) != (device['width'], device['height']):
         return None  # Never scale a physical-pixel curve by resolution ratios.
@@ -311,6 +318,7 @@ def baseline_profile(path, device, host):
 
 def apply_verified_profile(api, device, directory, host, profile, position):
     """Try on the actual phone; roll back both files and live input on failure."""
+    validate_profile_identity(host, profile, screen_id=device['id'])
     root = directory / 'pointer-calibration'
     paths = [root / (host.upper() + '.json'), root / 'by-screen' / (device['id'].encode().hex() + '.json')]
     backups = {path: path.read_bytes() if path.exists() else None for path in paths}
@@ -361,9 +369,20 @@ def calibration_access(base_url, device_id):
         yield
 
 
+def validate_profile_identity(host, profile, screen_id=None):
+    identity = profile.get('screenID')
+    if not isinstance(identity, str) or re.fullmatch(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{8}-?[0-9a-fA-F]{16})', identity) is None:
+        raise RuntimeError('Calibration requires an explicit iPhone UDID.')
+    if not isinstance(profile.get('host'), str) or profile['host'].upper() != host.upper():
+        raise RuntimeError('Calibration Bluetooth route does not match the destination.')
+    if screen_id is not None and identity != screen_id:
+        raise RuntimeError('Calibration UDID does not match the selected iPhone.')
+
+
 def save_profile(directory, host, profile):
     # Write only after all required measurements succeed. Replacement keeps the
     # previous profile available if writing the temporary file fails.
+    validate_profile_identity(host, profile)
     destination = directory / 'pointer-calibration' / (host.upper() + '.json')
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix('.tmp')

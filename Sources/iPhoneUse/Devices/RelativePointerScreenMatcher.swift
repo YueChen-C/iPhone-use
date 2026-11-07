@@ -8,11 +8,37 @@ enum RelativePointerScreenMatcher {
     static let width = 180
     static let height = 320
 
-    static func matches(_ frames: [[UInt8]]) -> Bool {
-        guard frames.count == 5, frames.allSatisfy({ $0.count == width * height }) else { return false }
+    /// The HID axes can rotate independently of a portrait USB capture. This
+    /// is live session evidence, not a property of a saved gain curve or UDID.
+    enum Orientation: String, CaseIterable {
+        case identity, clockwise, halfTurn, counterclockwise
+
+        func screenDelta(dx: Int, dy: Int) -> (dx: Int, dy: Int) {
+            switch self {
+            case .identity: return (dx, dy)
+            case .clockwise: return (-dy, dx)
+            case .halfTurn: return (-dx, -dy)
+            case .counterclockwise: return (dy, -dx)
+            }
+        }
+
+        func reportDelta(dx: Int, dy: Int) -> (dx: Int, dy: Int) {
+            switch self {
+            case .identity: return (dx, dy)
+            case .clockwise: return (dy, -dx)
+            case .halfTurn: return (-dx, -dy)
+            case .counterclockwise: return (-dy, dx)
+            }
+        }
+    }
+
+    static func matches(_ frames: [[UInt8]]) -> Bool { orientation(frames) != nil }
+
+    static func orientation(_ frames: [[UInt8]]) -> Orientation? {
+        guard frames.count == 5, frames.allSatisfy({ $0.count == width * height }) else { return nil }
         let edges = (0..<4).map { regions(frames[$0], frames[$0 + 1]) }
         // A busy screen is insufficient evidence; keep the path search bounded.
-        guard edges.allSatisfy({ !$0.isEmpty && $0.count <= 64 }) else { return false }
+        guard edges.allSatisfy({ !$0.isEmpty && $0.count <= 64 }) else { return nil }
         let corners = (0..<4).map { corner in
             edges[corner].flatMap { outgoing in
                 edges[(corner + 3) % 4].compactMap { incoming -> Corner? in
@@ -32,21 +58,31 @@ enum RelativePointerScreenMatcher {
                 }
             }
         }
-        guard corners.allSatisfy({ !$0.isEmpty && $0.count <= 64 }) else { return false }
-        for a in corners[0] {
-            for b in corners[1] where edge(a, b, dx: 1, dy: 0) {
-                for c in corners[2] where edge(b, c, dx: 0, dy: 1) {
-                    for d in corners[3]
-                    where edge(c, d, dx: -1, dy: 0) && edge(d, a, dx: 0, dy: -1)
-                        && abs((b.center.x - a.center.x) + (d.center.x - c.center.x)) <= 2
-                        && abs((c.center.y - b.center.y) + (a.center.y - d.center.y)) <= 2
-                    {
-                        return true
+        guard corners.allSatisfy({ !$0.isEmpty && $0.count <= 64 }) else { return nil }
+        let orientations = Orientation.allCases.filter { orientation in
+            let directions = [(1, 0), (0, 1), (-1, 0), (0, -1)].map {
+                orientation.screenDelta(dx: $0.0, dy: $0.1)
+            }
+            func follows(_ a: Corner, _ b: Corner, _ index: Int) -> Bool {
+                edge(a, b, dx: Double(directions[index].dx), dy: Double(directions[index].dy))
+            }
+            for a in corners[0] {
+                for b in corners[1] where follows(a, b, 0) {
+                    for c in corners[2] where follows(b, c, 1) {
+                        for d in corners[3]
+                        where follows(c, d, 2) && follows(d, a, 3)
+                            && abs((b.center.x - a.center.x) + (d.center.x - c.center.x)) <= 2
+                            && abs((c.center.y - b.center.y) + (a.center.y - d.center.y)) <= 2
+                        {
+                            return true
+                        }
                     }
                 }
             }
+            return false
         }
-        return false
+        // Multiple plausible paths/orientations are not an identity proof.
+        return orientations.count == 1 ? orientations[0] : nil
     }
 
     private struct Region {

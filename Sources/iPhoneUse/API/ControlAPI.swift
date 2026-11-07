@@ -334,19 +334,20 @@ enum ControlAPI {
 
     private static func tapTextPoint(_ id: String, _ x: Double, _ y: Double, _ hold: Double) throws {
         let device = try DeviceRegistry.shared.find(id)
-        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
         let coordinator = DeviceRegistry.shared.coordinator(for: device)
         let screenWidth = Double(device.screen.size?.width ?? 1179)
         let screenHeight = Double(device.screen.size?.height ?? 2556)
         if coordinator.mode == .enhanced || (coordinator.mode == .auto && coordinator.status.enhancedAvailable && coordinator.state != .degradedToStandard) {
+            DeviceRegistry.shared.cancelBackgroundMotion(for: device)
             try coordinator.tap(x: x, y: y, screenWidth: screenWidth, screenHeight: screenHeight, hold: hold)
             return
         }
         let input = try DeviceRegistry.shared.input(for: device)
         guard input.isPointerReady else {
-            input.invalidatePointerEstimate()
+            input.invalidatePointerEstimate(preservingBackgroundMotion: true)
             throw DeviceError(StringsAPI.current.pointerNotReady)
         }
+        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
         try input.tap(x: x, y: y, hold: hold)
     }
 
@@ -354,10 +355,6 @@ enum ControlAPI {
         _ action: Action, body: [String: Any], deviceQuery: String?
     ) throws -> HTTPResponse {
         let device = try DeviceRegistry.shared.find(deviceQuery)
-        // Real input takes priority over background probes and measurement.
-        // Cancel before resolving/queuing input, so it cannot wait behind the
-        // very measurement that the user is trying to interrupt.
-        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
         let coordinator = DeviceRegistry.shared.coordinator(for: device)
         let useEnhanced = coordinator.mode == .enhanced
             || (coordinator.mode == .auto && coordinator.status.enhancedAvailable && coordinator.state != .degradedToStandard)
@@ -367,12 +364,14 @@ enum ControlAPI {
         if useEnhanced {
             switch action {
             case .tap:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
                 let (x, y) = try point(body, "x", "y", on: device)
                 try coordinator.tap(
                     x: x, y: y, screenWidth: screenWidth, screenHeight: screenHeight,
                     hold: (body["hold"] as? Double) ?? 0.08)
                 return .json(["ok": true, "device": device.id])
             case .swipe:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
                 let swipe = try SwipeRequest(body, screenSize: device.screen.size, screenName: device.screen.name)
                 if let first = swipe.points.first, let last = swipe.points.last {
                     try coordinator.swipe(
@@ -381,19 +380,23 @@ enum ControlAPI {
                     return .json(["ok": true, "device": device.id])
                 }
             case .type:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
                 guard let text = body["text"] as? String else { return .error(StringsAPI.current.textRequired) }
                 let clear = (body["clear_before"] as? Bool) == true || (body["clear"] as? Bool) == true
                 let submit = (body["submit"] as? Bool) == true || (body["press_enter"] as? Bool) == true
                 try coordinator.type(text: text, clear: clear, submit: submit)
                 return .json(["ok": true, "device": device.id])
             case .key:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
                 guard let key = body["key"] as? String else { return .error(StringsAPI.current.keyRequired) }
                 try coordinator.key(name: key, modifiers: (body["modifiers"] as? [String]) ?? [])
                 return .json(["ok": true, "device": device.id])
             case .home:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
                 try coordinator.button(name: "home")
                 return .json(["ok": true, "device": device.id])
             case .power:
+                DeviceRegistry.shared.cancelBackgroundMotion(for: device)
                 try coordinator.button(name: "lock")
                 return .json(["ok": true, "device": device.id])
             case .move, .nudge:
@@ -401,13 +404,17 @@ enum ControlAPI {
             }
         }
 
+        // Reject unverified coordinates before cancellation so retrying clients
+        // cannot repeatedly interrupt the calibration needed to serve them.
+        // Ready gestures and keyboard/raw input still preempt background work.
         let input = try DeviceRegistry.shared.input(for: device)
         if action.requiresPointer, !input.isPointerReady {
             // Keep readiness ahead of parameter parsing. API callers may have no window
             // polling readiness, and a lost subscription or screen change invalidates origin.
-            input.invalidatePointerEstimate()
+            input.invalidatePointerEstimate(preservingBackgroundMotion: true)
             return .error(StringsAPI.current.pointerNotReady, status: 503)
         }
+        DeviceRegistry.shared.cancelBackgroundMotion(for: device)
 
         switch action {
         case .tap:
