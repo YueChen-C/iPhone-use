@@ -4,12 +4,6 @@ import XCTest
 
 @testable import iPhoneUse
 
-/// Replays one relative-report byte through the built-in drag curve.
-private func curveStep(_ byte: UInt8) -> Double {
-    let count = Int(Int8(bitPattern: byte))
-    return Double(count.signum()) * DeviceInput.estimatedDragCurve[abs(count)]
-}
-
 final class HTTPMessageTests: XCTestCase {
     func testFragmentedRequestWaitsForTheDeclaredUTF8Body() throws {
         let body = Data(#"{"text":"你好"}"#.utf8)
@@ -192,21 +186,12 @@ final class SwipeRequestTests: XCTestCase {
             reportSender: { reports.append(($0, $1)) })
         try input.swipe(points: swipe.points, duration: swipe.duration)
 
-        // One absolute hover carries the start position; the whole drag —
-        // press, movement and release — stays on the relative collection.
+        // The HTTP/MCP path preserves corners on the absolute report.
+        XCTAssertTrue(reports.allSatisfy { $0.0 == .absolutePointer })
         XCTAssertEqual(reports.first?.1, [0, 0, 0, 255, 127])
-        XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.count, 1)
-        XCTAssertEqual(reports.first { $0.0 == .relativeMouse }?.1, [1, 0, 0, 0])
-        XCTAssertEqual(reports.last?.1, [0, 0, 0, 0])
-        let movement = reports.filter { $0.0 == .relativeMouse }.dropFirst().dropLast()
-        XCTAssertTrue(movement.allSatisfy { $0.1[0] == 1 })
-        var position = CGPoint(x: swipe.points[0].0 * size.width, y: swipe.points[0].1 * size.height)
-        for (_, bytes) in movement {
-            position.x += curveStep(bytes[1])
-            position.y += curveStep(bytes[2])
-        }
-        XCTAssertEqual(position.x, 0, accuracy: 0.5)
-        XCTAssertEqual(position.y, 0, accuracy: 0.5)
+        XCTAssertTrue(reports.dropFirst().dropLast().allSatisfy { $0.1[0] == 1 })
+        XCTAssertTrue(reports.contains { $0.1 == [1, 255, 127, 0, 64] })
+        XCTAssertEqual(reports.last?.1, [0, 0, 0, 0, 0])
     }
 
     func testJSONPathUsesOriginalScreenPixelsAndPreservesPointOrder() throws {

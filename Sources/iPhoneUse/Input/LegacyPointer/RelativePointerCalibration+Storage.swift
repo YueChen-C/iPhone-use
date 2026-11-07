@@ -6,7 +6,7 @@ enum PairingProbeCalibration {
     case unavailable
 }
 
-/// Profile persistence and identity migration. Screen identity selects a profile;
+/// Profile persistence. The physical UDID selects a curve; Bluetooth selects only its route;
 /// live screen dimensions are checked by `DeviceInput` before coordinate control.
 extension RelativePointerCalibration {
     static func fileURL(host: UUID) -> URL {
@@ -18,7 +18,7 @@ extension RelativePointerCalibration {
     }
 
     /// One authoritative measured curve per physical phone, independent of the
-    /// Bluetooth identity assigned by a later pairing. Hex keeps USB IDs opaque
+    /// Bluetooth identity assigned by a later pairing. Hex encodes the UDID
     /// and prevents path separators from becoming directory components.
     static func screenFileURL(screenID: String, directory: URL) -> URL {
         let name = screenID.utf8.map { String(format: "%02x", $0) }.joined()
@@ -27,7 +27,7 @@ extension RelativePointerCalibration {
     }
 
     private static func screenTemplate(screenID: String, directory: URL) -> Self? {
-        guard !screenID.isEmpty,
+        guard isDeviceUDID(screenID),
             let data = try? Data(contentsOf: screenFileURL(screenID: screenID, directory: directory)),
             let value = try? JSONDecoder().decode(Self.self, from: data),
             value.screenID == screenID, (try? value.validate()) != nil
@@ -40,12 +40,48 @@ extension RelativePointerCalibration {
             .appendingPathComponent("iPhoneUse/pointer-calibration", isDirectory: true)
     }
 
+    struct StorageSnapshot: Equatable {
+        fileprivate let urls: [URL]
+        fileprivate let contents: [Data?]
+    }
+
+    static func storageSnapshot(host: UUID, screenID: String, directory: URL? = nil) throws -> StorageSnapshot {
+        let root = directory ?? directoryURL
+        let template = screenFileURL(screenID: screenID, directory: root)
+        let destination = fileURL(host: host, directory: root)
+        var urls = [template, destination]
+        if !FileManager.default.fileExists(atPath: template.path),
+            FileManager.default.fileExists(atPath: root.path)
+        {
+            // Without an authoritative template, resolution depends on all
+            // valid historical candidates, including duplicates and conflicts.
+            let history = try FileManager.default.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+            urls += history.filter { url in
+                guard url.pathExtension.lowercased() == "json",
+                    let owner = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                    let profile = hostProfile(host: owner, directory: root)
+                else { return false }
+                return profile.screenID == screenID && url != destination
+            }.sorted { $0.path < $1.path }
+        }
+        return StorageSnapshot(
+            urls: urls,
+            contents: try urls.map { url in
+                guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+                return try Data(contentsOf: url)
+            })
+    }
+
     /// Called only after native motion and target verification. Preserve both
     /// previous files if either write fails; failed measurement never calls this.
-    func saveVerified(directory: URL? = nil) throws {
+    func saveVerified(directory: URL? = nil, ifUnchanged expected: StorageSnapshot? = nil) throws {
         try validate()
-        guard let screenID, !screenID.isEmpty else { throw DeviceError("missing calibration screen identity") }
+        guard let screenID, Self.isDeviceUDID(screenID) else { throw DeviceError("missing calibration iPhone UDID") }
         let root = directory ?? Self.directoryURL
+        if let expected, try Self.storageSnapshot(host: host, screenID: screenID, directory: root) != expected {
+            throw DeviceError("pointer calibration files changed during measurement; existing files preserved")
+        }
         let urls = [Self.screenFileURL(screenID: screenID, directory: root), Self.fileURL(host: host, directory: root)]
         let previous = try urls.map { url -> Data? in
             guard FileManager.default.fileExists(atPath: url.path) else { return nil }
@@ -102,54 +138,26 @@ extension RelativePointerCalibration {
         load(host: host, screenSize: screenSize, screenID: screenID, directory: directoryURL)
     }
 
-    /// A freshly observed motion associates this BLE host with the current
-    /// capture. Prefer the capture's stable template; use the host curve only
-    /// when the replacement capture has no measured template.
-    static func loadVerifiedHost(host: UUID, screenID: String?, directory: URL? = nil) -> Self? {
-        guard let screenID, !screenID.isEmpty,
-            let own = load(host: host, screenSize: nil, directory: directory ?? directoryURL),
-            own.screenID != nil, own.screenID != screenID
+    /// A current physical identity is required for normal input. A host-only
+    /// read is reserved for inspecting an explicitly bound historical profile
+    /// during discovery; it never supplies or changes a missing UDID.
+    static func load(host: UUID, screenSize: CGSize?, screenID: String? = nil, directory: URL) -> Self? {
+        if let screenID {
+            return loadMatchingScreen(host: host, screenSize: screenSize, screenID: screenID, directory: directory)
+        }
+        guard let own = hostProfile(host: host, directory: directory),
+            let boundID = own.screenID, isDeviceUDID(boundID)
         else { return nil }
-        let root = directory ?? directoryURL
-        // The observed USB screen is the stable physical-phone identity. A
-        // reconnected BLE host may carry a valid profile from another phone.
-        // Prefer this screen's measured template when one exists; retain the
-        // host curve only when a replacement capture has no screen template.
-        return (screenTemplate(screenID: screenID, directory: root) ?? own)
-            .rebound(to: host, screenID: screenID)
+        return loadMatchingScreen(host: host, screenSize: screenSize, screenID: boundID, directory: directory)
     }
 
-    static func load(host: UUID, screenSize: CGSize?, screenID: String? = nil, directory: URL) -> Self? {
+    private static func hostProfile(host: UUID, directory: URL) -> Self? {
         let url = fileURL(host: host, directory: directory)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        do {
-            var result = try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
-            try result.validate()
-            // Capture may have no first frame or start in another orientation.
-            // Keep the identity-bound profile; DeviceInput checks the live dimensions
-            // before each coordinate operation so it can recover automatically.
-            guard result.host == host,
-                screenID == nil || result.screenID == nil || result.screenID == screenID
-            else {
-                throw DeviceError("relative pointer calibration does not match host/screen identity")
-            }
-            let wasLegacy = result.screenID == nil
-            if let boundID = result.screenID ?? screenID,
-                let template = screenTemplate(screenID: boundID, directory: directory)
-            {
-                result = template.rebound(to: host, screenID: boundID)
-            }
-            if let screenID, !screenID.isEmpty, wasLegacy {
-                // The pairing already confirms this host's screen. Upgrade a
-                // legacy profile so future host identifiers can find it safely.
-                result = result.rebound(to: host, screenID: screenID)
-                try JSONEncoder().encode(result).write(to: url, options: .atomic)
-            }
-            return result
-        } catch {
-            log("pointer calibration unavailable: \(error)")
-            return nil
-        }
+        guard let data = try? Data(contentsOf: url),
+            let profile = try? JSONDecoder().decode(Self.self, from: data),
+            profile.host == host, (try? profile.validate()) != nil
+        else { return nil }
+        return profile
     }
 
     /// A broken profile still opts its phone into calibrated control. Do not
@@ -207,46 +215,27 @@ extension RelativePointerCalibration {
         return storedScreenID == screenID
     }
 
-    /// Selects only calibration tied to the screen being probed. Unlike the
-    /// regular pairing path, this lookup never writes a legacy profile's screen
-    /// identity before a match has been proven.
-    static func pairingProbeCalibration(host: UUID, screenID: String) -> PairingProbeCalibration {
-        let ownProfile = fileURL(host: host)
-        if FileManager.default.fileExists(atPath: ownProfile.path) {
-            guard let calibration = load(host: host, screenSize: nil), calibration.screenID == screenID else {
-                return .unavailable
-            }
+    /// Matching may use a curve only for the physical screen being probed.
+    /// Neither a stale host file nor an unknown screen can donate its curve.
+    static func pairingProbeCalibration(host: UUID, screenID: String, directory: URL? = nil) -> PairingProbeCalibration
+    {
+        let root = directory ?? directoryURL
+        if let calibration = loadMatchingScreen(host: host, screenSize: nil, screenID: screenID, directory: root) {
             return .calibrated(calibration)
         }
-
-        if let calibration = loadMatchingScreen(host: host, screenSize: nil, screenID: screenID) {
-            return .calibrated(calibration)
-        }
-        return requiresCalibration(host: host, screenID: screenID) ? .unavailable : .absolute
+        return requiresCalibration(host: host, screenID: screenID, directory: root) ? .unavailable : .absolute
     }
 
-    /// Calibration for a generic matching probe against one known free screen.
-    /// Re-pairing gives the phone a new central UUID and no profile of its own;
-    /// the unique profile bound to the probed screen is then its only working
-    /// movement mode, because those phones ignore the absolute report. The
-    /// rebound profile lives in memory for this probe alone — nothing is
-    /// written until store() migrates it for a confirmed pairing. A nil
-    /// screenID (several free screens in play) keeps the host absolute.
+    /// Discovery without a physical identity uses gain-independent reports.
+    /// This selection is read-only, including after a successful motion proof.
     static func probeInputCalibration(
         host: UUID, screenID: String?, directory: URL? = nil
     ) -> (calibration: Self?, required: Bool) {
         let root = directory ?? directoryURL
-        if let own = load(host: host, screenSize: nil, screenID: nil, directory: root) {
-            return (own, true)
+        let matching = screenID.flatMap {
+            loadMatchingScreen(host: host, screenSize: nil, screenID: $0, directory: root)
         }
-        if let screenID, !screenID.isEmpty,
-            let matching = loadMatchingScreen(host: host, screenSize: nil, screenID: screenID, directory: root)
-        {
-            return (matching, true)
-        }
-        // The host's own broken profile still opts it into calibrated control;
-        // an ambiguous or absent screen-bound set probes absolute, as before.
-        return (nil, requiresCalibration(host: host, screenID: nil, directory: root))
+        return (matching, matching != nil || requiresCalibration(host: host, screenID: screenID, directory: root))
     }
 
     private static func storedScreenID(host: UUID, directory: URL) -> String? {
@@ -254,22 +243,25 @@ extension RelativePointerCalibration {
         guard let data = try? Data(contentsOf: url),
             let profile = try? JSONDecoder().decode(Self.self, from: data),
             profile.host == host,
-            let screenID = profile.screenID, !screenID.isEmpty,
+            let screenID = profile.screenID, isDeviceUDID(screenID),
             (try? profile.validate()) != nil
         else { return nil }
         return screenID
     }
 
     /// Re-pairing can change CBCentral's identifier. Screen dimensions alone
-    /// cannot identify a phone: reuse only a profile bound to this USB screen.
+    /// cannot identify a phone: reuse only a profile bound to this iPhone UDID.
     static func loadMatchingScreen(host: UUID, screenSize: CGSize?, screenID: String? = nil) -> Self? {
         loadMatchingScreen(host: host, screenSize: screenSize, screenID: screenID, directory: directoryURL)
     }
 
     static func loadMatchingScreen(host: UUID, screenSize: CGSize?, screenID: String? = nil, directory: URL) -> Self? {
-        guard let screenID, !screenID.isEmpty else { return nil }
-        if let template = screenTemplate(screenID: screenID, directory: directory) {
-            return template.rebound(to: host, screenID: screenID)
+        guard let screenID, isDeviceUDID(screenID) else { return nil }
+        let templateURL = screenFileURL(screenID: screenID, directory: directory)
+        if FileManager.default.fileExists(atPath: templateURL.path) {
+            // A damaged or misidentified authoritative template must not expose
+            // an older host copy as if it were the current measured curve.
+            return screenTemplate(screenID: screenID, directory: directory)?.routed(to: host)
         }
         guard
             let urls = try? FileManager.default.contentsOfDirectory(
@@ -277,49 +269,22 @@ extension RelativePointerCalibration {
         else { return nil }
         let candidates = urls.compactMap { url -> Self? in
             guard url.pathExtension.lowercased() == "json",
-                let data = try? Data(contentsOf: url),
-                let value = try? JSONDecoder().decode(Self.self, from: data),
-                value.host != host, value.screenID == screenID
+                let owner = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                let profile = hostProfile(host: owner, directory: directory), profile.screenID == screenID
             else { return nil }
-            do {
-                try value.validate()
-                return value
-            } catch {
-                return nil
-            }
+            return profile
         }
-        guard candidates.count == 1, let value = candidates.first else { return nil }
-        log("reusing pointer calibration from re-paired host \(value.host) for \(host)")
-        return value.rebound(to: host, screenID: screenID)
+        // Old pairings may contain duplicate copies. Reuse identical curves,
+        // but never pick an arbitrary winner among conflicting histories.
+        guard let first = candidates.first,
+            candidates.allSatisfy({ $0.routed(to: host) == first.routed(to: host) })
+        else { return nil }
+        return first.routed(to: host)
     }
 
-    /// DeviceRegistry already knows the old and new hosts belong to the same USB
-    /// screen. Validate the source before atomically writing a profile whose
-    /// embedded identity agrees with its new filename.
-    @discardableResult
-    static func rebind(from oldHost: UUID, to newHost: UUID, screenID: String) throws -> Self? {
-        try rebind(from: oldHost, to: newHost, screenID: screenID, directory: directoryURL)
-    }
-
-    @discardableResult
-    static func rebind(from oldHost: UUID, to newHost: UUID, screenID: String, directory: URL) throws -> Self? {
-        let source = fileURL(host: oldHost, directory: directory)
-        guard FileManager.default.fileExists(atPath: source.path) else { return nil }
-        let value = try JSONDecoder().decode(Self.self, from: Data(contentsOf: source))
-        try value.validate()
-        guard !screenID.isEmpty, value.host == oldHost,
-            value.screenID == nil || value.screenID == screenID
-        else {
-            throw DeviceError("relative pointer calibration does not match the paired screen")
-        }
-        let latest = screenTemplate(screenID: screenID, directory: directory) ?? value
-        let rebound = latest.rebound(to: newHost, screenID: screenID)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try JSONEncoder().encode(rebound).write(to: fileURL(host: newHost, directory: directory), options: .atomic)
-        return rebound
-    }
-
-    private func rebound(to host: UUID, screenID: String) -> Self {
+    /// Only the transport destination may change. There is deliberately no
+    /// operation that changes a measured profile's physical screen identity.
+    private func routed(to host: UUID) -> Self {
         Self(
             host: host, screenWidth: screenWidth, screenHeight: screenHeight,
             reportInterval: reportInterval, distances: distances, screenID: screenID, vectorModel: vectorModel)

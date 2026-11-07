@@ -16,7 +16,7 @@ enum DeviceBluetoothState: String {
 }
 
 /// The existing USB-device-ID to Bluetooth-host JSON format. Synchronization and
-/// calibration migration belong to DeviceRegistry; this type only reads/writes the file.
+/// association updates belong to DeviceRegistry; this type only reads/writes the file.
 struct DevicePairingStore {
     let file: URL
 
@@ -51,6 +51,9 @@ struct DevicePairingStore {
 /// Pointer discovery is intrusive: a failed observation must not turn into an
 /// endless timer that keeps moving a phone the user is trying to use.
 struct DevicePairingProbeSchedule {
+    /// Finite, increasingly quiet retries give slow iOS subscriptions/unlocks
+    /// several minutes to recover without continuously moving a pointer.
+    static let retryDelays: [TimeInterval] = [20, 40, 60, 90]
     struct Topology: Equatable {
         let screens: [String: ObjectIdentifier]
         let sessions: [UUID: UUID]
@@ -61,16 +64,20 @@ struct DevicePairingProbeSchedule {
     private var topology: Topology?
     private var generation: UInt64 = 0
     private var retriesRemaining = 0
+    var pendingRetryDelay: TimeInterval? {
+        guard pending else { return nil }
+        return Self.retryDelays[Self.retryDelays.count - retriesRemaining - 1]
+    }
     private var pending = false
 
-    /// Each USB capture / Bluetooth session topology gets its initial attempt
-    /// and one delayed retry. Explicit matching can start a fresh attempt.
+    /// Each topology gets an initial attempt and four spaced retries.
+    /// Explicit matching or a new topology starts a fresh bounded window.
     @discardableResult
     mutating func update(_ topology: Topology, restart: Bool = false) -> Bool {
         guard restart || self.topology != topology else { return false }
         self.topology = topology
         generation &+= 1
-        retriesRemaining = 1
+        retriesRemaining = Self.retryDelays.count
         pending = false
         return true
     }
@@ -78,6 +85,7 @@ struct DevicePairingProbeSchedule {
     mutating func scheduleRetry() -> UInt64? {
         guard !pending, retriesRemaining > 0 else { return nil }
         retriesRemaining -= 1
+        generation &+= 1
         pending = true
         return generation
     }
