@@ -70,7 +70,9 @@ struct TypeTextRequest {
         }
         actions.append(clipboard ? .clipboard(text) : .text(text, ensureIME: body["ensure_chinese_ime"] as? Bool))
         let submit = body["submit"] as? Bool == true
-        let commitIME = (body["commit_ime"] as? Bool == true) || (submit && !clipboard && KeyboardMap.containsHanzi(text))
+        // Han runs already commit their candidate in KeyboardMap.keyboardText.
+        // submit adds Enter only; preserve an explicitly requested extra Space.
+        let commitIME = body["commit_ime"] as? Bool == true
         let pressEnter = (body["press_enter"] as? Bool == true) || submit
 
         if commitIME { actions.append(key("space")) }

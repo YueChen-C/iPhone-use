@@ -539,25 +539,29 @@ final class TypeTextRequestTests: XCTestCase {
     }
 
     func testSubmitOptionEmitsOrderedCommitAndEnterReports() throws {
-        // Plain ASCII text: submit presses enter directly without redundant IME commit space.
-        var asciiReports: [[UInt8]] = []
-        let asciiInput = DeviceInput(
-            host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
-            reportSender: { _, bytes in asciiReports.append(bytes) })
-        try TypeTextRequest(["text": "hi", "submit": true]).perform(on: asciiInput)
-        let asciiPressed = asciiReports.filter { $0.dropFirst(2).contains(where: { $0 != 0 }) }
-        // 'h'=11, 'i'=12, enter=40
-        XCTAssertEqual(asciiPressed.map { $0[2] }, [11, 12, 40])
+        func pressed(_ body: [String: Any]) throws -> [UInt8] {
+            var reports: [[UInt8]] = []
+            let input = DeviceInput(
+                host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
+                reportSender: { _, bytes in reports.append(bytes) })
+            try TypeTextRequest(body).perform(on: input)
+            return reports.filter { $0.dropFirst(2).contains(where: { $0 != 0 }) }.map { $0[2] }
+        }
 
-        // Hanzi text: submit automatically inserts space to commit IME candidate before enter.
-        var hanziReports: [[UInt8]] = []
-        let hanziInput = DeviceInput(
-            host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
-            reportSender: { _, bytes in hanziReports.append(bytes) })
-        try TypeTextRequest(["text": "好", "submit": true]).perform(on: hanziInput)
-        let hanziPressed = hanziReports.filter { $0.dropFirst(2).contains(where: { $0 != 0 }) }
-        // 'h'=11, 'a'=4, 'o'=18, pinyin word end space=44, commit IME space=44, enter=40
-        XCTAssertEqual(hanziPressed.suffix(2).map { $0[2] }, [44, 40])
+        for (text, expected): (String, [UInt8]) in [
+            ("hi", [11, 12, 40]),
+            ("好", [11, 4, 18, 44, 40]),
+            ("好!", [11, 4, 18, 44, 30, 40]),
+            ("好a", [11, 4, 18, 44, 4, 40]),
+        ] {
+            XCTAssertEqual(try pressed(["text": text, "submit": true]), expected, text)
+            XCTAssertEqual(
+                try pressed(["text": text, "submit": true, "commit_ime": false]), expected, text)
+            XCTAssertEqual(try pressed(["text": text, "press_enter": true]), expected, text)
+            XCTAssertEqual(
+                try pressed(["text": text, "submit": true, "commit_ime": true]),
+                Array(expected.dropLast()) + [44, 40], text)
+        }
     }
 
     func testPinyinPreservesUmlautAsVBeforeStrippingTones() {
