@@ -613,8 +613,25 @@ final class TypeTextRequestTests: XCTestCase {
         XCTAssertTrue(ChineseIMEHeuristic.isEnglish(result(["q", "w", "e"])))
         XCTAssertFalse(ChineseIMEHeuristic.isEnglish(result(["q", "w", "e", "完成"])))
         XCTAssertFalse(ChineseIMEHeuristic.isEnglish(result([])))
+        XCTAssertTrue(ChineseIMEHeuristic.isChinese(result(["123", "双", "英", "搜索"])))
+        XCTAssertTrue(ChineseIMEHeuristic.isChinese(result(["123", "空格", "换行"])))
+        XCTAssertTrue(ChineseIMEHeuristic.isChinese(result(["选定"])))
+        XCTAssertFalse(ChineseIMEHeuristic.isChinese(result(["q", "w", "e", "搜索"])))
+        XCTAssertFalse(ChineseIMEHeuristic.isChinese(result(["return"])))
+        XCTAssertFalse(ChineseIMEHeuristic.isChinese(result([])))
         XCTAssertTrue(try TypeTextRequest(["text": "abc", "ensure_chinese_ime": true]).ensureChineseIME)
+        XCTAssertFalse(try TypeTextRequest(["text": "abc", "ensure_chinese_ime": true]).ensureASCIIIME)
         XCTAssertFalse(try TypeTextRequest(["text": "abc"]).ensureChineseIME)
+        XCTAssertTrue(try TypeTextRequest(["text": "abc"]).ensureASCIIIME)
+        XCTAssertFalse(try TypeTextRequest(["text": "abc", "use_clipboard": true]).ensureASCIIIME)
+        reports.removeAll()
+        delays.removeAll()
+        try TypeTextRequest(["text": "http://a.b"]).perform(
+            on: input, ocr: { result(["123", "双", "英", "换行"]) }, sleep: { delays.append($0) })
+        let asciiFromChinesePressed = reports.filter { $0.dropFirst(2).contains(where: { $0 != 0 }) }
+        XCTAssertEqual(asciiFromChinesePressed.first?[0], 1)
+        XCTAssertEqual(asciiFromChinesePressed.first?[2], 44)
+        XCTAssertEqual(delays, [0.25])
     }
 
     func testInvalidTextAndOptionsCannotClearTheField() {
