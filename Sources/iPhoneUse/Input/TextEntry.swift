@@ -3,7 +3,9 @@ import CoreFoundation
 import Foundation
 
 enum TextEntry {
-    static let textOptions = ["clear_before", "commit_ime", "press_enter", "submit", "ensure_chinese_ime", "use_clipboard"]
+    static let textOptions = [
+        "clear_before", "commit_ime", "press_enter", "submit", "ensure_chinese_ime", "use_clipboard",
+    ]
 
     static func isBoolean(_ value: Any?) -> Bool {
         guard let number = value as? NSNumber else { return false }
@@ -46,6 +48,7 @@ enum TextEntryStep {
 struct TypeTextRequest {
     let actions: [TextEntryStep]
     let ensureChineseIME: Bool
+    let ensureASCIIIME: Bool
 
     init(_ body: [String: Any], language: AppLanguage = .en) throws {
         let table = StringsAPI(language: language)
@@ -78,7 +81,10 @@ struct TypeTextRequest {
         if commitIME { actions.append(key("space")) }
         if pressEnter { actions.append(key("enter")) }
         self.actions = actions
-        ensureChineseIME = !clipboard && ((body["ensure_chinese_ime"] as? Bool) ?? KeyboardMap.containsHanzi(text))
+        let explicitChineseIME = body["ensure_chinese_ime"] as? Bool
+        let hasHanzi = KeyboardMap.containsHanzi(text)
+        ensureChineseIME = !clipboard && (explicitChineseIME ?? hasHanzi)
+        ensureASCIIIME = !clipboard && explicitChineseIME != true && !hasHanzi && !text.isEmpty
     }
 
     func perform(
@@ -92,6 +98,9 @@ struct TypeTextRequest {
             if case .clipboard(let text) = action { try clipboard(text) }
         }
         if ensureChineseIME, let result = ocr(), ChineseIMEHeuristic.isEnglish(result) {
+            try input.key("space", modifiers: ["control"])
+            sleep(0.25)
+        } else if ensureASCIIIME, let result = ocr(), ChineseIMEHeuristic.isChinese(result) {
             try input.key("space", modifiers: ["control"])
             sleep(0.25)
         }
@@ -117,5 +126,13 @@ enum ChineseIMEHeuristic {
         if labels.contains(where: { englishLabels.contains($0) }) { return true }
         let keys = Set(labels).intersection(["q", "w", "e", "a", "s", "d"])
         return keys.count >= 3
+    }
+
+    static func isChinese(_ result: ScreenOCR.Result) -> Bool {
+        guard result.height > 0 else { return false }
+        let labels = result.items.filter { Double($0.y) / Double(result.height) > 0.65 }
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        let chineseMarkers: Set<String> = ["空格", "选定", "拼音", "双拼", "双", "中", "中/英", "中英"]
+        return labels.contains(where: { chineseMarkers.contains($0) })
     }
 }
