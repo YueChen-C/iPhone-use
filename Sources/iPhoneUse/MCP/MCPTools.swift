@@ -18,6 +18,10 @@ enum MCPToolCatalog {
             tool("list_devices", table.toolListDevices, [:], readOnly: true),
             tool(
                 "screenshot", table.toolScreenshot, ["device": device, "include_image": includeImage], readOnly: true),
+            tool("get_ax_tree", language == .zh
+                ? "通过原生 Apple 设备服务读取 Accessibility 元素树；需要开发者服务，不以 OCR 替代。iOS 15/16 为局部 Inspector 树，无坐标、可能截短文字；读取会移动检查焦点并可能滚动页面。"
+                : "Read native Accessibility hierarchy via Apple device services, never OCR. Requires developer services. On iOS 15/16 returns a partial inspector tree without geometry; text may be truncated and reading moves inspector focus and may scroll the viewport.",
+                ["device": device, "include_offscreen": ["type": "boolean", "default": false]], readOnly: false),
             tool("ocr_screen", table.toolOCRScreen, ["device": device, "maxEdge": maxEdge], readOnly: true),
             tool(
                 "tap_text", table.toolTapText,
@@ -215,6 +219,9 @@ struct MCPToolRequest {
                 return translated
             }
             return MCPToolRequest(path: "/act", body: withDevice(["steps": steps], device))
+        case "get_ax_tree":
+            let options = try AXTreeOptions(body: arguments, query: [:])
+            return MCPToolRequest(path: "/ax_tree", body: withDevice(["include_offscreen": options.includeOffscreen], device))
         case "ocr_screen", "tap_text":
             let table = StringsAPI(language: language)
             let edge = try OCRRequest.maxEdge(arguments, table: table) ?? longEdge

@@ -52,6 +52,13 @@ class MockApp(BaseHTTPRequestHandler):
         self.server.events.append(("POST", self.path, body))
         if self.server.before_post:
             self.server.before_post(body)
+        if self.path == "/ax_tree":
+            if self.server.fail_actions:
+                self.send(503, b'{"error":"native AX unavailable"}')
+            else:
+                self.send(200, json.dumps({"source": "accessibility", "device": body["device"],
+                    "elements": [{"object_id": "o1", "role": "Button", "label": "Send"}]}).encode())
+            return
         if self.path == "/ocr":
             self.send(200, json.dumps({"device": body["device"], "width": 600, "height": 1200,
                                        "items": [{"text": "设置", "x": 120, "y": 400}]}).encode())
@@ -215,7 +222,7 @@ class MCPStdioTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=15,
             )
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertIn("15 tools", process.stdout)
+        self.assertIn("16 tools", process.stdout)
         # The checker's initialize fetches /config; tools/list reuses the value.
         self.assertEqual(self.server.events, [("GET", "/config")])
 
@@ -235,6 +242,30 @@ class MCPStdioTests(unittest.TestCase):
             ("POST", "/tap", {"x": 120.5, "y": 400, "device": "phone-1", "maxEdge": 1000}),
             ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
         ])
+
+    def test_ax_tree_returns_native_json_without_screenshot_or_input(self):
+        result = self.exchange([("get_ax_tree", {"device": "First", "include_offscreen": True})])[0]
+        self.assertNotIn("isError", result)
+        self.assertEqual(len(result["content"]), 1)
+        tree = json.loads(result["content"][0]["text"])
+        self.assertEqual(tree["source"], "accessibility")
+        self.assertEqual(tree["elements"][0]["label"], "Send")
+        self.assertEqual(self.server.events[-1], ("POST", "/ax_tree", {
+            "device": "phone-1", "include_offscreen": True}))
+        self.assertFalse(any(event[1].startswith("/screenshot") for event in self.server.events))
+        self.assertEqual(self.server.stability_events, [])
+
+    def test_ax_tree_transport_failure_is_error_not_ocr_fallback(self):
+        self.server.fail_actions = True
+        result = self.exchange([("get_ax_tree", {"device_id": "First"})])[0]
+        self.assertTrue(result["isError"])
+        self.assertIn("native AX unavailable", result["content"][0]["text"])
+        self.assertFalse(any(event[1].startswith("/screenshot") for event in self.server.events))
+
+    def test_ax_tree_invalid_flag_does_not_touch_device(self):
+        result = self.exchange([("get_ax_tree", {"include_offscreen": 1})])[0]
+        self.assertTrue(result["isError"])
+        self.assertEqual([event for event in self.server.events if event[1] != "/config"], [])
 
     def test_ocr_screen_returns_only_text_and_preserves_dimensions_and_device(self):
         result = self.exchange([("ocr_screen", {"device": "First", "maxEdge": 800})])[0]
@@ -580,7 +611,7 @@ class MCPStdioTests(unittest.TestCase):
         self.assertIn("控制真实 iPhone", replies[0]["result"]["instructions"])
         tools = replies[1]["result"]["tools"]
         # Tool and parameter names are the client contract and stay English.
-        self.assertEqual(len(tools), 15)
+        self.assertEqual(len(tools), 16)
         home = next(tool for tool in tools if tool["name"] == "home")
         self.assertEqual(home["description"], "回到主屏幕。")
         error = replies[2]["result"]["content"][0]["text"]

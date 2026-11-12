@@ -154,6 +154,32 @@ curl -s http://127.0.0.1:7390/tap \
 
 When multiple phones are connected, specify the full device ID: use `?device=<id>` for GET requests and a `"device"` field in POST JSON. The service listens only on the local loopback address. See the [API reference](docs/user-guide.md#http-api) for endpoints and coordinate formats.
 
+## Native Accessibility Tree
+
+HTTP `GET/POST /ax_tree` and MCP `get_ax_tree` read the native device AX hierarchy, never an OCR substitute. They require a trusted USB-connected device and available developer services. The iOS 17+ code path uses a CoreDevice tunnel with Developer Mode (the current USB CoreDeviceProxy path has not been validated on iOS 17.0–17.3, which are not promised to work); iOS 15/16 connects directly to the legacy lockdown AX Audit service and requires a matching DeveloperDiskImage already mounted (this feature does not download or mount images). Check UI Automation if the service is unavailable. Verified on iPhone 12 / iOS 26.5 (23F77) and iPhone SE / iOS 15.4; other versions, apps, and controls may differ.
+
+```sh
+curl --fail-with-body -sS http://127.0.0.1:7390/ax_tree \
+  -H 'Content-Type: application/json' \
+  -d '{"device":"<full-device-id>","include_offscreen":false}'
+```
+
+MCP example: `get_ax_tree({"device":"<full-device-id>","include_offscreen":false})`. The response includes `elements` (labels, roles, frames, states), application metadata, and orientation. `parent` is the parent's index in the returned array, or `null` for roots. Device-supplied fields may be absent. Coordinates use `coordinate_space: "ax_native"`; **do not use them directly as MCP screenshot pixels**.
+
+`include_offscreen` defaults to `false` and prefers reported visible children, falling back to ordinary children when a visible set is not reported. `true` walks all children already returned by the service; it does not force offscreen content to load. The modern path merges received incremental updates until the quiet window or observation budget described below; `snapshot_complete: false` means this is not a guaranteed complete snapshot. Unavailable services return HTTP 503 / an MCP error without OCR fallback. An isolated worker has a 25-second timeout and starts no second Bluetooth or video session.
+
+**iOS 15/16 limits:** `transport: "lockdown-audit"` and `scope: "inspector-focusable-elements"` identify the legacy result. Reading moves the Inspector focus and may scroll the viewport (`inspector_focus_changed` / `viewport_may_change: true`), without activation, clicks, or typing. Only device-provided partial parent/child relationships are returned; no application root or geometry is invented. `hierarchy_complete` is `false`. The verified legacy samples do not expose geometry (`geometry_available: false`), so they provide no coordinates for clicking. The daemon may truncate text (`text_may_be_truncated: true`); `include_offscreen=true` is rejected explicitly. Normal completion waits for monitoring-disable and cleanup replies (`cleanup_acknowledged: true`), which do not promise restoration of the previous Inspector focus or viewport. Current real-device validation covers some lock/notification and Home screen states, not arbitrary applications.
+
+**Enhanced direct capture (no Runner):** On iOS 17+, merge subsequent updates instead of returning the first usable tree. Capture ends after 600ms without attribute changes or an 8-second observation deadline. Neither is a service snapshot-complete marker: `snapshot_complete` remains `false`. `capture` reports the reason, message count and attribute revisions. `raw_attributes` preserves every received attribute, including unknown IDs; binary values use explicit `$type: data` / base64 objects. Already received nodes outside the selected root/visible traversal are kept in `unreturned_elements`, without inventing parent links. `coverage` reports received/returned/framed counts, `missing_frame_ids`, `unresolved_children`, and nodes whose children were not reported. Unverified active attribute requests are not sent (`active_attribute_query_performed: false`); receiving every server-side node is not guaranteed.
+
+Legacy capture preserves `raw_inspector_focus`, `raw_hierarchy_node` and `raw_attributes`, and reads attributes the device advertises explicitly as non-actions. It skips actions and sends no attribute setters. `attribute_status` distinguishes advertised names, nil values and budget-deferred reads; `coverage.uninspected_ids` identifies hierarchy nodes not inspected in focus. A `frame` is emitted only for a validated, device-advertised Frame/AXFrame/accessibilityFrame value. Otherwise `geometry_capability: not-observed` describes the observation, not an OS capability limit. Even observed per-focus frames have `geometry_simultaneous: false`, because focus traversal may scroll. Attribute reads have a 12-second/4096-query budget, excluding blocking service calls; the outer worker still has a 25-second timeout.
+
+Legacy traversal sets `traversal_complete: true` when focus returns to the first node. A repeated different node returns the observed nodes with `traversal_complete: false` and `termination_reason: "revisited-focus-node"`. Neither outcome guarantees a complete snapshot.
+
+See [AX implementation notes](docs/native-ax-tree.md) for capability boundaries and sanitized validation results.
+
+For AX-only debugging, run `.build/debug/iphone-use --ax-server <full-device-id> 7393` and query `/ax_tree` on that port. This AX-only listener does not provide screenshots or input endpoints, but legacy reads can still move focus and scroll the viewport.
+
 ## Things to Know
 
 - **Device state:** Keep the iPhone unlocked. Portrait orientation is the primary workflow; landscape and dynamic rotation are not guaranteed.

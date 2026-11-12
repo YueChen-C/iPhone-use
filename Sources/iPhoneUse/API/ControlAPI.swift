@@ -33,7 +33,8 @@ enum ControlAPI {
         _ request: HTTPRequest,
         ocrCapture: (String?, Int?) throws -> (String, Data),
         ocrTap: (String, Double, Double, Double) throws -> Void = tapTextPoint,
-        activity: QuietModeActivityController = .shared
+        activity: QuietModeActivityController = .shared,
+        axCapture: (String, Bool) throws -> [String: Any] = NativeAXTree.capture
     ) -> HTTPResponse {
         let passive = request.method == "GET" && request.query["wake"] == "0"
         let wasSuspended = passive ? false : activity.requestStarted()
@@ -56,6 +57,9 @@ enum ControlAPI {
                 return status()
             case ("GET", "/devices"):
                 return deviceList()
+            case ("GET", "/ax_tree"), ("POST", "/ax_tree"):
+                return AXTreeEndpoint.response(request,
+                    resolve: { try DeviceRegistry.shared.find($0).id }, capture: axCapture)
             case ("POST", "/match"):
                 return match(body)
             case ("POST", "/pair"):
