@@ -166,6 +166,32 @@ curl -s http://127.0.0.1:7390/tap \
 
 连接多台手机时，请指定完整设备 ID：GET 请求使用 `?device=<id>`，POST 请求在 JSON 中添加 `"device"` 字段。服务仅监听本机回环地址。完整接口与坐标说明见 [API 参考](docs/user-guide.md#http-api)。
 
+## 原生 Accessibility 元素树
+
+HTTP `GET/POST /ax_tree` 与 MCP `get_ax_tree` 可读取真机原生 AX 层级，不使用 OCR 替代。需要通过 USB 连接并信任的设备及可用的开发者服务。iOS 17+ 代码路径使用 CoreDevice 隧道，需开启开发者模式（当前 USB CoreDeviceProxy 路径未验证 iOS 17.0–17.3，不承诺这些版本可用）；iOS 15/16 使用 lockdown 直连旧版 AX Audit 服务，需已挂载匹配的 DeveloperDiskImage（本功能不会自动下载或挂载镜像）。服务未开放时检查 UI Automation 设置。目前已在 iPhone 12 / iOS 26.5（23F77）与 iPhone SE / iOS 15.4 上验证；不保证所有系统版本、应用或控件都能提供完整语义。
+
+```sh
+curl --fail-with-body -sS http://127.0.0.1:7390/ax_tree \
+  -H 'Content-Type: application/json' \
+  -d '{"device":"<完整设备ID>","include_offscreen":false}'
+```
+
+MCP 参数示例：`get_ax_tree({"device":"<完整设备ID>","include_offscreen":false})`。返回 `elements`（`label`、`role`、`frame`、状态等）、应用信息和方向；`parent` 是父元素在该数组中的索引，根为 `null`。字段由设备提供，可能缺省。`coordinate_space: "ax_native"` 表示设备 AX 原生坐标，**不能直接当作 MCP 截图像素坐标点击**。
+
+`include_offscreen` 默认为 `false`，优先沿设备报告的可见子节点遍历（未报告可见集合时使用普通子节点）；`true` 遍历服务已返回的全部子节点，但不会强制应用加载屏外内容。新版会合并已收到的后续增量，按下述静默窗口或预算结束；`snapshot_complete` 固定为 `false`，不承诺完整快照。服务不可用返回 HTTP 503 / MCP 错误；不会回退为 OCR。读取在独立进程中运行，25 秒超时，且不启动第二套蓝牙或视频采集。
+
+**iOS 15/16 限制**：旧版返回 `transport: "lockdown-audit"`、`scope: "inspector-focusable-elements"`；读取会移动 Inspector 焦点，设备可能随焦点滚动页面（`inspector_focus_changed` / `viewport_may_change` 为 `true`），不执行激活、点击或输入。返回设备实际提供的局部父子关系，不补造应用根；`hierarchy_complete` 为 `false`；当前已验证的旧版样本没有几何属性，`geometry_available` 为 `false`，不能直接点击定位。旧版服务可能截短字段文字（`text_may_be_truncated: true`），不支持 `include_offscreen=true`，此时明确报错。正常完成后等待关闭监控和清理的回复；`cleanup_acknowledged: true` 仅表示服务确认收到清理，不承诺恢复调用前 Inspector 焦点或页面位置。当前真机验证覆盖部分锁屏／通知界面和主屏幕状态，不代表任意应用均支持。
+
+**直连采集增强（不安装 Runner）**：iOS 17+ 不再在第一份可用树到达时立即返回，而是合并后续增量，在属性变化静默 600ms 后结束，最长采集 8 秒；这不是服务提供的完整快照标记，`snapshot_complete` 仍为 `false`。`capture` 返回结束原因、消息数和属性修订数。所有已收到的节点属性（包括未知编号）保留在 `raw_attributes`；二进制值使用显式 `$type: data` / base64 包装。未沿当前根/可见路径输出的已接收节点在 `unreturned_elements` 中，不能据此补造父关系。`coverage` 列出已接收/已输出/有坐标数量、`missing_frame_ids`、`unresolved_children` 与未报告孩子集合的节点。目前不发送未经验证的主动属性补查，`active_attribute_query_performed` 为 `false`，不保证所有服务端节点都已收到。
+
+旧版对每个焦点保存原始 `raw_inspector_focus`、`raw_hierarchy_node` 和 `raw_attributes`，并读取设备实际声明且明确不是动作的 Inspector 属性，跳过动作属性，不尝试设置。`attribute_status` 区分设备声明属性、返回空值及预算内未读取项；`coverage.uninspected_ids` 列出只在层级中看到、未焦点检查的节点。仅当设备实际声明并返回可验证的屏幕 Frame/AXFrame/accessibilityFrame 时输出 `frame`；否则 `geometry_capability: not-observed`，不是系统不支持几何的结论。即使得到旧版逐焦点 frame，`geometry_simultaneous: false`，因为读取期间可能滚动，不能拼成同时有效的点击坐标。读取预算为 12 秒/4096 次属性查询（不含服务阻塞，外层仍有 25 秒 worker 超时）。
+
+旧版焦点遍历若回到首节点，`traversal_complete` 为 `true`；若重复遇到其他节点则为 `false`，`termination_reason` 为 `revisited-focus-node`，仍返回已观察到的节点；两者均不代表完整快照。
+
+更多能力边界与脱敏验证结果见 [AX 实现说明](docs/native-ax-tree.md)。
+
+仅调试 AX 时，可运行 `.build/debug/iphone-use --ax-server <完整设备ID> 7393`，再访问该端口的 `/ax_tree`；该 AX 专用监听器不提供点击、截图等接口，但旧版读取仍可能移动焦点和页面。
+
 ## 界面语言
 
 在主菜单 **iPhone Use → 语言 / Language** 中选择 **中文** 或 **English** 即可切换，立即生效并记住选择；未手动选择时跟随 macOS 系统语言。

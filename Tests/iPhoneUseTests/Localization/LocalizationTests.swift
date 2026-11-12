@@ -139,7 +139,7 @@ final class LocalizationTests: XCTestCase {
         let enTools = MCPToolCatalog.tools(for: .en)
         let zhTools = MCPToolCatalog.tools(for: .zh)
         let required: Set<String> = [
-            "list_devices", "screenshot", "ocr_screen", "tap_text", "move_pointer", "adjust_pointer", "click_pointer",
+            "list_devices", "screenshot", "get_ax_tree", "ocr_screen", "tap_text", "move_pointer", "adjust_pointer", "click_pointer",
             "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home", "act",
         ]
         func names(_ tools: [[String: Any]]) -> Set<String> {
