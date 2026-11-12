@@ -215,7 +215,7 @@ class MCPStdioTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=15,
             )
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertIn("15 tools", process.stdout)
+        self.assertIn("18 tools", process.stdout)
         # The checker's initialize fetches /config; tools/list reuses the value.
         self.assertEqual(self.server.events, [("GET", "/config")])
 
@@ -580,7 +580,7 @@ class MCPStdioTests(unittest.TestCase):
         self.assertIn("控制真实 iPhone", replies[0]["result"]["instructions"])
         tools = replies[1]["result"]["tools"]
         # Tool and parameter names are the client contract and stay English.
-        self.assertEqual(len(tools), 15)
+        self.assertEqual(len(tools), 18)
         home = next(tool for tool in tools if tool["name"] == "home")
         self.assertEqual(home["description"], "回到主屏幕。")
         error = replies[2]["result"]["content"][0]["text"]
