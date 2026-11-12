@@ -111,7 +111,9 @@ struct AXTree {
                     if !NSDictionary(dictionary: ["value": node.raw[key] ?? NSNull()]).isEqual(to: ["value": raw]) || node.raw[key] == nil { revision += 1 }
                     node.raw[key] = raw
                     switch Int(key) {
-                    case 3, 33: if node.fields["label"] == nil || key == "33" { node.fields["label"] = raw }
+                    case 3, 33:
+                        // Reproject the latest valid source; attribute 33 has priority.
+                        node.fields["label"] = node.raw["33"] as? String ?? node.raw["3"] as? String
                     case 6: node.fields["bundle_id"] = raw
                     case 23: node.fields["hint"] = raw
                     case 25: node.fields["identifier"] = raw
@@ -152,7 +154,8 @@ struct AXTree {
             fields["raw_attributes"] = node.raw
             let index = elements.count
             elements.append(fields)
-            let children = includeOffscreen || node.visible.isEmpty ? node.children : node.visible
+            // A reported empty visible set means no visible children, not unknown visibility.
+            let children = includeOffscreen || node.raw["9"] == nil ? node.children : node.visible
             stack += children.reversed().map { ($0, index, depth + 1) }
         }
         let unresolved = nodes.keys.sorted().flatMap { id in

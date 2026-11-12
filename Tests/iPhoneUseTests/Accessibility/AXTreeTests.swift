@@ -164,4 +164,105 @@ final class AXTreeTests: XCTestCase {
         XCTAssertEqual(response.status, 400)
         XCTAssertTrue(String(decoding: response.body, as: UTF8.self).contains("include_offscreen"))
     }
+
+
+    private func projectionUpdate(_ id: Int, _ values: [String: Any]) -> [String: Any] {
+        ["associatedRequestType": 11, "resultData": ["treeDump": [
+            ["associatedRequestType": 5, "associatedTranslationObject": ["objectID": id], "resultData": values]
+        ]]]
+    }
+
+    private func projectionTree(includeOffscreen: Bool = false) throws -> AXTree {
+        var tree = AXTree(includeOffscreen: includeOffscreen)
+        try tree.update(fixture())
+        return tree
+    }
+
+    private func projectionIDs(_ result: [String: Any], field: String = "elements") throws -> [String] {
+        try XCTUnwrap(result[field] as? [[String: Any]]).compactMap { $0["object_id"] as? String }
+    }
+
+    private func projectedLabel(_ tree: AXTree, id: String = "o3") throws -> String? {
+        let elements = try XCTUnwrap(tree.json(device: "phone")["elements"] as? [[String: Any]])
+        return try XCTUnwrap(elements.first { $0["object_id"] as? String == id })["label"] as? String
+    }
+
+    func testExplicitEmptyVisibilityExcludesKnownChildren() throws {
+        var tree = try projectionTree()
+        try tree.update(projectionUpdate(1, ["9": [Int]()]))
+        let result = tree.json(device: "phone")
+        XCTAssertEqual(try projectionIDs(result), ["o1"])
+        XCTAssertEqual(try projectionIDs(result, field: "unreturned_elements"), ["o2", "o3"])
+        XCTAssertEqual((result["coverage"] as? [String: Any])?["nodes_returned"] as? Int, 1)
+        // An unrelated update must not erase the explicitly empty visible set.
+        try tree.update(projectionUpdate(1, ["3": "Renamed"]))
+        XCTAssertEqual(try projectionIDs(tree.json(device: "phone")), ["o1"])
+        try tree.update(projectionUpdate(1, ["9": [3]]))
+        XCTAssertEqual(try projectionIDs(tree.json(device: "phone")), ["o1", "o3"])
+    }
+
+    func testMissingVisibilityStillFallsBackToKnownChildren() throws {
+        var tree = AXTree(includeOffscreen: false)
+        try tree.update(["associatedRequestType": 11, "resultData": ["treeDump": [
+            ["associatedRequestType": 4, "resultData": ["objectID": 1]],
+            ["associatedRequestType": 5, "associatedTranslationObject": ["objectID": 1],
+             "resultData": ["8": [2]]],
+            ["associatedRequestType": 5, "associatedTranslationObject": ["objectID": 2],
+             "resultData": ["3": "Child"]]
+        ]]])
+        XCTAssertEqual(try projectionIDs(tree.json(device: "phone")), ["o1", "o2"])
+    }
+
+    func testIncludeOffscreenIgnoresExplicitEmptyVisibility() throws {
+        var tree = try projectionTree(includeOffscreen: true)
+        try tree.update(projectionUpdate(1, ["9": [Int]()]))
+        XCTAssertEqual(try projectionIDs(tree.json(device: "phone")), ["o1", "o2", "o3"])
+    }
+
+    func testAttribute3RefreshesPublicLabelAcrossIncrementalUpdates() throws {
+        var tree = try projectionTree(includeOffscreen: true)
+        for label in ["Before", "After", ""] {
+            try tree.update(projectionUpdate(3, ["3": label]))
+            XCTAssertEqual(try projectedLabel(tree), label)
+            let elements = try XCTUnwrap(tree.json(device: "phone")["elements"] as? [[String: Any]])
+            let child = try XCTUnwrap(elements.first { $0["object_id"] as? String == "o3" })
+            XCTAssertEqual((child["raw_attributes"] as? [String: Any])?["3"] as? String, label)
+        }
+        // Application names use the same projection and must refresh as well.
+        try tree.update(projectionUpdate(1, ["3": "Application After"]))
+        let app = tree.json(device: "phone")["foreground_app"] as? [String: Any]
+        XCTAssertEqual(app?["name"] as? String, "Application After")
+    }
+
+    func testAttribute33KeepsPriorityWhileBothSourcesKeepUpdating() throws {
+        var tree = try projectionTree(includeOffscreen: true)
+        try tree.update(projectionUpdate(3, ["33": "Preferred Before"]))
+        try tree.update(projectionUpdate(3, ["3": "Fallback After"]))
+        XCTAssertEqual(try projectedLabel(tree), "Preferred Before")
+        try tree.update(projectionUpdate(3, ["33": "Preferred After"]))
+        XCTAssertEqual(try projectedLabel(tree), "Preferred After")
+        try tree.update(projectionUpdate(3, ["3": "Fallback Latest", "33": "Preferred Latest"]))
+        XCTAssertEqual(try projectedLabel(tree), "Preferred Latest")
+        try tree.update(projectionUpdate(3, ["33": ""]))
+        try tree.update(projectionUpdate(3, ["3": "Must not replace an empty preferred label"]))
+        XCTAssertEqual(try projectedLabel(tree), "")
+    }
+
+    func testNullOrInvalidPreferredLabelFallsBackToLatestStringSource() throws {
+        var tree = try projectionTree(includeOffscreen: true)
+        try tree.update(projectionUpdate(3, ["3": "Fallback Latest", "33": "Preferred"]))
+        for invalid: Any in [NSNull(), 7, ["unexpected": "object"]] {
+            try tree.update(projectionUpdate(3, ["33": invalid]))
+            XCTAssertEqual(try projectedLabel(tree), "Fallback Latest")
+        }
+        try tree.update(projectionUpdate(3, ["3": "Fallback After"]))
+        XCTAssertEqual(try projectedLabel(tree), "Fallback After")
+        try tree.update(projectionUpdate(3, ["33": "Preferred Again"]))
+        try tree.update(projectionUpdate(3, ["3": NSNull()]))
+        XCTAssertEqual(try projectedLabel(tree), "Preferred Again")
+        try tree.update(projectionUpdate(3, ["33": NSNull()]))
+        XCTAssertNil(try projectedLabel(tree))
+        try tree.update(projectionUpdate(3, ["3": "Recovered"]))
+        XCTAssertEqual(try projectedLabel(tree), "Recovered")
+    }
 }
