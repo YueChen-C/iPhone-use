@@ -12,6 +12,28 @@ struct USBTouchPoint: Codable, Equatable {
     }
 }
 
+/// Pure request validation shared by admission, IPC and the worker. Reject bad
+/// caller parameters before they can retire an otherwise healthy USB session.
+enum USBTouchRequest {
+    static func validate(_ operation: String, points: [USBTouchPoint], duration: Double) throws {
+        guard duration.isFinite, (0...60).contains(duration) else {
+            throw AXDTX.Failure("Invalid USB gesture duration")
+        }
+        switch operation {
+        case "down", "move", "up", "tap":
+            guard points.count == 1 else { throw AXDTX.Failure("Expected one USB point") }
+        case "swipe":
+            guard (2...2048).contains(points.count), duration > 0 else {
+                throw AXDTX.Failure("Invalid USB gesture path")
+            }
+        case "cancel":
+            guard points.isEmpty else { throw AXDTX.Failure("USB cancellation takes no points") }
+        default: throw AXDTX.Failure("Unsupported USB touch operation")
+        }
+        for point in points { try point.validate() }
+    }
+}
+
 /// Serial, single-contact state machine. A transport failure never replays a
 /// contact. The same last position is used for best-effort cancellation release.
 final class USBTouchContact {
@@ -164,22 +186,16 @@ final class USBTouchSession {
         try ping()
     }
     func execute(_ operation: String, points: [USBTouchPoint], duration: Double) throws {
-        for point in points { try point.validate() }
-        guard duration.isFinite, (0...60).contains(duration) else { throw AXDTX.Failure("Invalid USB gesture duration") }
+        try USBTouchRequest.validate(operation, points: points, duration: duration)
         switch operation {
         case "down":
-            guard points.count == 1 else { throw AXDTX.Failure("Expected one USB point") }
             try checkDisplay(); try contact.down(points[0]); downSince = now()
         case "move":
-            guard points.count == 1 else { throw AXDTX.Failure("Expected one USB point") }
             try validateHeldContact(); try contact.move(points[0])
         case "up":
-            guard points.count == 1 else { throw AXDTX.Failure("Expected one USB point") }
             try validateHeldContact(); try contact.up(points[0]); downSince = nil; try ping()
         case "cancel": cancel(); try ping()
         case "tap", "swipe":
-            guard operation == "tap" ? points.count == 1 : (2...2048).contains(points.count),
-                  operation != "swipe" || duration > 0 else { throw AXDTX.Failure("Invalid USB gesture path") }
             try checkDisplay()
             defer { cancel() }
             try contact.down(points[0]); downSince = now()

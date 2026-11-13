@@ -2,6 +2,44 @@ import XCTest
 @testable import iPhoneUse
 
 final class USBTouchTests: XCTestCase {
+    func testRequestValidationRejectsInvalidDurationPathAndOperation() throws {
+        let a = USBTouchPoint(x: 0.2, y: 0.4), b = USBTouchPoint(x: 0.2, y: 0.6)
+        for duration in [-1, 60.01, Double.nan, .infinity] {
+            XCTAssertThrowsError(try USBTouchRequest.validate("tap", points: [a], duration: duration))
+        }
+        for count in [0, 1, 2049] {
+            XCTAssertThrowsError(try USBTouchRequest.validate("swipe", points: Array(repeating: a, count: count), duration: 0.3))
+        }
+        XCTAssertThrowsError(try USBTouchRequest.validate("swipe", points: [a, b], duration: 0))
+        for operation in ["tap", "down", "move", "up"] {
+            XCTAssertThrowsError(try USBTouchRequest.validate(operation, points: [], duration: 0))
+            XCTAssertThrowsError(try USBTouchRequest.validate(operation, points: [a, b], duration: 0))
+        }
+        XCTAssertThrowsError(try USBTouchRequest.validate("hover", points: [a], duration: 0))
+        XCTAssertThrowsError(try USBTouchRequest.validate("cancel", points: [a], duration: 0))
+        XCTAssertThrowsError(try USBTouchRequest.validate("swipe", points: [a, .init(x: 2, y: 0.5)], duration: 0.3))
+        try USBTouchRequest.validate("tap", points: [a], duration: 0)
+        try USBTouchRequest.validate("tap", points: [a], duration: 60)
+        try USBTouchRequest.validate("swipe", points: Array(repeating: b, count: 2048), duration: 60)
+        try USBTouchRequest.validate("cancel", points: [], duration: 0)
+    }
+
+    func testInvalidRequestHasNoDisplayOrContactSideEffectsAndValidRequestStillWorks() throws {
+        var checks = 0, pings = 0
+        var reports: [(USBTouchPoint, Bool)] = []
+        let session = USBTouchSession(physicalID: "fixture", dimensions: (1170, 2532), surface: 99,
+            readDisplay: { checks += 1; return (1170, 2532) }, ping: { pings += 1 },
+            send: { reports.append(($0, $1)) })
+        let point = USBTouchPoint(x: 0.5, y: 0.3)
+        XCTAssertThrowsError(try session.execute("tap", points: [point], duration: 61))
+        XCTAssertThrowsError(try session.execute("swipe", points: Array(repeating: point, count: 2049), duration: 0.3))
+        XCTAssertEqual(checks, 0); XCTAssertEqual(pings, 0); XCTAssertTrue(reports.isEmpty)
+        try session.execute("down", points: [point], duration: 0)
+        try session.execute("up", points: [point], duration: 0)
+        XCTAssertEqual(checks, 1); XCTAssertEqual(pings, 1)
+        XCTAssertEqual(reports.map(\.1), [true, false])
+    }
+
     func testContinuousDragRechecksDisplayWithoutIdleTickAndReleasesLastSafePoint() throws {
         var time = 0.0, rotated = false, checks = 0
         var reports: [(USBTouchPoint, Bool)] = []

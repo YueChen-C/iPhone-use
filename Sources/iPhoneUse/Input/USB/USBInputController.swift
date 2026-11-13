@@ -215,7 +215,7 @@ final class USBDeviceInput {
         }
     }
     func gesture(_ operation: String, points: [USBTouchPoint], duration: Double) throws {
-        for point in points { try point.validate() }
+        try USBTouchRequest.validate(operation, points: points, duration: duration)
         let generation = lock.withLock { motionGeneration }
         try queue.sync {
             let accepted = lock.withLock { () -> Bool in

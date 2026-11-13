@@ -93,6 +93,7 @@ final class USBTouchClient {
         }
     }
     func send(_ operation: String, points: [USBTouchPoint] = [], duration: Double = 0) throws {
+        try USBTouchRequest.validate(operation, points: points, duration: duration)
         try commandLock.withLock {
             let id = UUID()
             let command = USBTouchWorkerCommand(id: id, operation: operation, points: points, duration: duration)
