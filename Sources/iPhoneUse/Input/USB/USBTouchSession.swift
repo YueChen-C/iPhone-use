@@ -44,6 +44,7 @@ final class USBTouchContact {
     func down(_ value: USBTouchPoint) throws {
         try value.validate()
         guard point == nil else { throw AXDTX.Failure("USB contact already held") }
+        guard releaseConfirmed else { throw AXDTX.Failure("USB prior contact release unconfirmed; reprepare required") }
         point = value; releaseConfirmed = false // A partial write may already have reached the device.
         do { try send(value, true) } catch { cancel(); throw error }
     }
@@ -194,7 +195,7 @@ final class USBTouchSession {
             try validateHeldContact(); try contact.move(points[0])
         case "up":
             try validateHeldContact(); try contact.up(points[0]); downSince = nil; try ping()
-        case "cancel": cancel(); try ping()
+        case "cancel": cancel(); try finish()
         case "tap", "swipe":
             try checkDisplay()
             defer { cancel() }

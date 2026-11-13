@@ -137,6 +137,47 @@ final class USBTouchTests: XCTestCase {
         contact.cancel(); XCTAssertFalse(contact.releaseConfirmed)
         contact.cancel(); XCTAssertFalse(contact.releaseConfirmed)
     }
+    func testFailedCancelCannotBeAcknowledgedByPingOrOverwrittenByAnotherContact() throws {
+        var allowRelease = false, pings = 0, sent: [Bool] = []
+        let session = USBTouchSession(physicalID: "fixture", dimensions: (1170, 2532), surface: 99,
+            readDisplay: { (1170, 2532) }, ping: { pings += 1 }, send: { _, down in
+                sent.append(down)
+                if !down && !allowRelease { throw AXDTX.Failure("fixture failed release") }
+            })
+        let point = USBTouchPoint(x: 0.5, y: 0.3)
+        try session.execute("down", points: [point], duration: 0)
+        XCTAssertThrowsError(try session.execute("cancel", points: [], duration: 0))
+        XCTAssertEqual(pings, 0); XCTAssertEqual(sent, [true, false])
+        allowRelease = true // Recovery of the transport is not proof of prior release.
+        XCTAssertThrowsError(try session.execute("down", points: [point], duration: 0))
+        XCTAssertThrowsError(try session.execute("tap", points: [point], duration: 0))
+        XCTAssertThrowsError(try session.execute("cancel", points: [], duration: 0))
+        XCTAssertThrowsError(try session.finish())
+        XCTAssertEqual(sent, [true, false]); XCTAssertEqual(pings, 0)
+    }
+    func testSuccessfulAndIdleCancelConfirmReleaseAndPermitExplicitNextContact() throws {
+        var pings = 0, sent: [Bool] = []
+        let session = USBTouchSession(physicalID: "fixture", dimensions: (1170, 2532), surface: 99,
+            readDisplay: { (1170, 2532) }, ping: { pings += 1 }, send: { _, down in sent.append(down) })
+        let point = USBTouchPoint(x: 0.5, y: 0.3)
+        try session.execute("cancel", points: [], duration: 0)
+        XCTAssertTrue(sent.isEmpty); XCTAssertEqual(pings, 1)
+        try session.execute("down", points: [point], duration: 0)
+        try session.execute("cancel", points: [], duration: 0)
+        try session.execute("down", points: [point], duration: 0)
+        try session.execute("up", points: [point], duration: 0)
+        XCTAssertEqual(sent, [true, false, true, false]); XCTAssertEqual(pings, 3)
+    }
+    func testCancelPingFailureDoesNotAcknowledgeAnOtherwiseSentRelease() throws {
+        var sent: [Bool] = []
+        let session = USBTouchSession(physicalID: "fixture", dimensions: (1170, 2532), surface: 99,
+            readDisplay: { (1170, 2532) }, ping: { throw AXDTX.Failure("fixture ping failure") },
+            send: { _, down in sent.append(down) })
+        let point = USBTouchPoint(x: 0.5, y: 0.3)
+        try session.execute("down", points: [point], duration: 0)
+        XCTAssertThrowsError(try session.execute("cancel", points: [], duration: 0))
+        XCTAssertEqual(sent, [true, false])
+    }
     func testBLEBackendRetirementReleasesAndRejectsStaleInput() throws {
         var reports: [(ReportID, [UInt8])] = []
         let input = DeviceInput(host: UUID(), session: UUID(), sleep: { _ in },

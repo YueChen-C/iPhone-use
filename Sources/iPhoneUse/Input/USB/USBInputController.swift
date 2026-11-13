@@ -293,7 +293,9 @@ final class USBDeviceInput {
         }
         queue.async { [self] in
             guard lock.withLock({ motionGeneration == generation && !retired }) else { return }
-            if let client = lock.withLock({ self.client }), client.sessionID != nil { try? client.send("cancel") }
+            if let client = lock.withLock({ self.client }), client.sessionID != nil {
+                do { try client.send("cancel") } catch { fail(error) }
+            }
         }
     }
     private func enqueue(_ operation: String, point: USBTouchPoint, generation: UInt64) {
