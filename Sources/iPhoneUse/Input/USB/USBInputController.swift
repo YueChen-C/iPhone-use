@@ -9,10 +9,15 @@ final class USBInputController {
     private var entries: [String: USBDeviceInput] = [:]
     private var retiring: [String: [USBDeviceInput]] = [:]
     private var selections: [String: InputBackendSelection] = [:]
+    private let transitionWork = DispatchGroup()
+    private var stopped = false
+    private var shutdownWork: DispatchGroup?
+    private var shutdownReleased = false
 
     func selectAtLaunch(physicalID: String) {
         // Capture refresh will prepare USB after identity becomes verified.
         lock.withLock {
+            guard !stopped else { return }
             var state = InputBackendSelection()
             let id = state.begin(.usb); state.finish(id, released: true)
             selections[physicalID] = state
@@ -24,31 +29,35 @@ final class USBInputController {
         return selections[id]!.generation
     } }
     func permitsBLE(_ id: String, generation: UUID?) -> Bool {
-        lock.withLock { selections[id]?.permits(.ble, generation: generation) ?? (generation == nil) }
+        lock.withLock { !stopped && (selections[id]?.permits(.ble, generation: generation) ?? (generation == nil)) }
     }
     func input(_ device: Device) -> USBDeviceInput? {
         lock.withLock {
-            guard selections[device.id]?.permits(.usb) == true, let input = entries[device.id],
+            guard !stopped, selections[device.id]?.permits(.usb) == true, let input = entries[device.id],
                   input.captureID == device.screen.associationIdentity else { return nil }
             return input
         }
     }
     func select(_ backend: InputBackendKind, device: Device) {
-        let (generation, previous) = lock.withLock { () -> (UUID, USBDeviceInput?) in
+        let admitted = lock.withLock { () -> (UUID, USBDeviceInput?, DispatchQueue)? in
+            guard !stopped else { return nil }
             var state = selections[device.id] ?? InputBackendSelection()
             let generation = state.begin(backend); selections[device.id] = state
             let previous = entries.removeValue(forKey: device.id)
             if let previous { retiring[device.id, default: []].append(previous) }
-            return (generation, previous)
+            let queue = transitions[device.id] ?? DispatchQueue(label: "iphone-use.input-transition.\(device.id)")
+            transitions[device.id] = queue
+            // Register before dropping the admission lock: shutdown must also
+            // drain transitions that have not reached their queue yet.
+            transitionWork.enter()
+            return (generation, previous, queue)
         }
+        guard let (generation, previous, transitionQueue) = admitted else { return }
         previous?.retire() // EOF interrupts a synchronous worker gesture too.
         DeviceRegistry.shared.cancelBackgroundMotion(for: device)
-        let transitionQueue = lock.withLock { () -> DispatchQueue in
-            if let existing = transitions[device.id] { return existing }
-            let queue = DispatchQueue(label: "iphone-use.input-transition.\(device.id)")
-            transitions[device.id] = queue; return queue
-        }
         transitionQueue.async { [self] in
+            defer { transitionWork.leave() }
+            guard !lock.withLock({ stopped }) else { return }
             let old = lock.withLock { retiring[device.id] ?? [] }
             let unreleased = old.filter { !$0.retireAndWait() }
             let usbReleased = unreleased.isEmpty
@@ -60,6 +69,7 @@ final class USBInputController {
             let bleReleased = DeviceRegistry.shared.releaseForBackendSwitch(device)
             let input = backend == .usb ? USBDeviceInput(device: device) : nil
             let accepted = lock.withLock { () -> Bool in
+                guard !stopped else { return false }
                 selections[device.id]?.finish(generation, released: usbReleased && bleReleased)
                 guard selections[device.id]?.permits(backend, generation: generation) == true else { return false }
                 if let input { entries[device.id] = input }
@@ -69,13 +79,18 @@ final class USBInputController {
         }
     }
     func refresh(_ device: Device) {
-        let allowed = lock.withLock { selections[device.id]?.permits(.usb) == true }
+        let allowed = lock.withLock { !stopped && selections[device.id]?.permits(.usb) == true }
         guard allowed else { return }
         if let entry = input(device) { entry.validateCapture(); return }
         select(.usb, device: device)
     }
     func status(_ device: Device) -> [String: Any] {
-        let state = lock.withLock { selections[device.id] }
+        let (state, isStopped) = lock.withLock { (selections[device.id], stopped) }
+        if isStopped {
+            return ["backend": (state?.backend ?? .ble).rawValue, "state": "disconnected",
+                    "detail": "Application input is shutting down; no replay or restart", "capabilities": [],
+                    "sessionCurrent": false]
+        }
         if let state, state.transitioning || state.failure != nil {
             return ["backend": state.backend.rawValue, "state": state.failure == nil ? "preparing" : "failed",
                     "detail": state.failure ?? "Releasing previous input session", "capabilities": [],
@@ -84,14 +99,38 @@ final class USBInputController {
         guard state?.backend == .usb else { return ["backend": "ble"] }
         return input(device)?.status ?? ["backend": "usb", "state": "preparing", "capabilities": []]
     }
-    func stop() {
-        let old = lock.withLock { () -> [USBDeviceInput] in
+    /// Close admission first, then wait for transitions, preparation and every
+    /// current/retiring worker's release/PING AND exit. A bounded timeout is a
+    /// failed shutdown, not permission to claim that contacts were released.
+    @discardableResult
+    func stop(waitTimeout: TimeInterval = 4) -> Bool {
+        let (work, old, initiate) = lock.withLock { () -> (DispatchGroup, [USBDeviceInput], Bool) in
+            if let shutdownWork { return (shutdownWork, [], false) }
+            stopped = true
             for id in Array(selections.keys) {
                 var state = selections[id]!; _ = state.begin(state.backend); selections[id] = state
             }
-            let old = Array(entries.values); entries.removeAll(); return old
+            var seen = Set<ObjectIdentifier>()
+            let old = (Array(entries.values) + retiring.values.flatMap { $0 }).filter {
+                seen.insert(ObjectIdentifier($0)).inserted
+            }
+            entries.removeAll()
+            let work = DispatchGroup(); work.enter(); shutdownWork = work
+            return (work, old, true)
         }
-        for entry in old { entry.retire() }
+        if initiate {
+            for entry in old { entry.retire() }
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                transitionWork.wait()
+                // Do not short-circuit: all owners must get a release attempt.
+                let released = old.map { $0.retireAndWait() }.allSatisfy { $0 }
+                lock.withLock { shutdownReleased = released; retiring.removeAll() }
+                work.leave()
+            }
+        }
+        let timeout = waitTimeout.isFinite ? max(0, min(waitTimeout, 60)) : 0
+        guard work.wait(timeout: .now() + timeout) == .success else { return false }
+        return lock.withLock { shutdownReleased }
     }
 }
 final class USBDeviceInput {
@@ -138,12 +177,20 @@ final class USBDeviceInput {
                 guard !lock.withLock({ retired }) else { return }
                 guard screenValid else { throw AXDTX.Failure("USB capture identity is not verified") }
                 let fresh = try USBTouchClient(physicalID: physicalID)
+                // A failed capture/dimension check still owns a live worker;
+                // retain it for shutdown/transition release confirmation.
+                lock.withLock {
+                    closingClients.append(fresh)
+                    if retired { fresh.close() }
+                }
+                try fresh.waitUntilReady()
                 guard screenValid, let screen, let size = screen.size, let dimensions = fresh.dimensions,
                       Int(size.width) == dimensions.0, Int(size.height) == dimensions.1 else {
                     fresh.close(); throw AXDTX.Failure("USB display/capture identity or dimensions changed")
                 }
                 lock.withLock {
                     client = fresh
+                    closingClients.removeAll { $0 === fresh }
                     if retired { fresh.close() } else { readiness = .ready; detail = "" }
                 }
             } catch { fail(error) }
@@ -258,11 +305,11 @@ final class USBDeviceInput {
     }
     func retire() {
         wheelGate.cancel()
-        let old = lock.withLock { () -> USBTouchClient? in
+        let old = lock.withLock { () -> [USBTouchClient] in
             retired = true; readiness = .disconnected; gestureHeld = false; pendingMotion = nil; motionScheduled = nil
-            return client
+            return closingClients + (client.map { [$0] } ?? [])
         }
-        old?.close()
+        for client in old { client.close() }
     }
     func retireAndWait() -> Bool {
         retire()

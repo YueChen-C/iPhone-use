@@ -52,6 +52,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard USBInputController.shared.stop(waitTimeout: Application.inputShutdownWaitTimeout) else {
+            log("USB input shutdown incomplete: release/worker exit unconfirmed; quit cancelled, input remains gated")
+            return .terminateCancel
+        }
+        return .terminateNow
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         if let languageObserver { NotificationCenter.default.removeObserver(languageObserver) }
         languageObserver = nil
@@ -59,7 +67,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runModeObserver = nil
         QuietModeActivityController.shared.stop()
         windows.stop()
-        USBInputController.shared.stop()
+        let inputReleased = USBInputController.shared.stop(waitTimeout: Application.inputShutdownWaitTimeout)
+        if !inputReleased { log("USB input shutdown incomplete: release/worker exit unconfirmed") }
         let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Application.shutdownWaitTimeout)
         if !stopResult.isClean {
             log(
@@ -172,9 +181,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// MCP mode bypasses this path entirely and never starts AppKit or hardware.
 enum Application {
     static let shutdownWaitTimeout: TimeInterval = 3.0
+    static let inputShutdownWaitTimeout: TimeInterval = 4.0
 
-    static func terminationExitCode(for stopResult: ScreenCaptureStopResult) -> Int32 {
-        stopResult.isClean ? 0 : 1
+    static func terminationExitCode(for stopResult: ScreenCaptureStopResult, usbInputReleased: Bool = true) -> Int32 {
+        stopResult.isClean && usbInputReleased ? 0 : 1
     }
 
     static func run() {
@@ -258,7 +268,10 @@ enum Application {
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler {
                 server.stop()
-                USBInputController.shared.stop()
+                let inputReleased = USBInputController.shared.stop(waitTimeout: Self.inputShutdownWaitTimeout)
+                log(inputReleased
+                    ? "USB input shutdown confirmed: release/worker exit barrier passed"
+                    : "USB input shutdown incomplete: release/worker exit unconfirmed")
                 let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Self.shutdownWaitTimeout)
                 if !stopResult.isClean {
                     log(
@@ -266,7 +279,7 @@ enum Application {
                     )
                 }
                 HIDPeripheral.shared.stop()
-                exit(Self.terminationExitCode(for: stopResult))
+                exit(Self.terminationExitCode(for: stopResult, usbInputReleased: inputReleased))
             }
             source.resume()
             return source

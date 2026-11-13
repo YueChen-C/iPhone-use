@@ -49,6 +49,10 @@ final class USBTouchClient {
         do { try process.run() } catch {
             output.fileHandleForReading.readabilityHandler = nil; throw error
         }
+    }
+    /// The owner registers this client before waiting, so shutdown can close
+    /// stdin even while readiness is blocked or eventually fails.
+    func waitUntilReady() throws {
         condition.lock()
         let deadline = Date().addingTimeInterval(35)
         while ready == nil && failure == nil && !closed {
