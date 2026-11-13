@@ -59,6 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runModeObserver = nil
         QuietModeActivityController.shared.stop()
         windows.stop()
+        USBInputController.shared.stop()
         let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Application.shutdownWaitTimeout)
         if !stopResult.isClean {
             log(
@@ -191,6 +192,11 @@ enum Application {
         let appDelegate = AppDelegate()
         app.delegate = appDelegate
 
+        // Explicit launch-only selection; BLE remains the default otherwise.
+        if let device = ProcessInfo.processInfo.environment["IPHONE_USE_USB_DEVICE"], !device.isEmpty {
+            USBInputController.shared.selectAtLaunch(physicalID: device)
+        }
+
         DeviceRegistry.shared.start()
         HIDPeripheral.shared.start(initialDisplayState: HIDPeripheral.onlineDisplayState())
         let powerObservers = installPowerObservers()
@@ -249,6 +255,7 @@ enum Application {
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler {
                 server.stop()
+                USBInputController.shared.stop()
                 let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Self.shutdownWaitTimeout)
                 if !stopResult.isClean {
                     log(

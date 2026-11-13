@@ -14,6 +14,11 @@ final class ControlSidebar: NSView {
         ]
 
     var onAction: ((ControlShortcut) -> Void)?
+    var onBackendChange: ((InputBackendKind) -> Void)?
+    private let backendSelector = NSPopUpButton(frame: .zero, pullsDown: false)
+    func updateBackend(_ backend: InputBackendKind) {
+        backendSelector.selectItem(at: backend == .usb ? 1 : 0)
+    }
     private var buttons: [ControlShortcut: NSButton] = [:]
     private var groupLabels: [NSTextField] = []
     private let status = NSTextField(wrappingLabelWithString: StringsUI.current.statusInitial)
@@ -61,6 +66,12 @@ final class ControlSidebar: NSView {
         stack.spacing = 7
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
+        backendSelector.addItems(withTitles: ["Bluetooth", "USB Touch"])
+        backendSelector.target = self
+        backendSelector.action = #selector(selectBackend(_:))
+        backendSelector.setAccessibilityLabel("Input backend")
+        stack.addArrangedSubview(backendSelector)
+        backendSelector.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         for group in Self.shortcutGroups {
             addShortcutGroup(titleKey: group.title, shortcuts: group.shortcuts, to: stack)
         }
@@ -136,6 +147,10 @@ final class ControlSidebar: NSView {
     @objc private func activate(_ sender: NSButton) {
         guard let shortcut = ControlShortcut(rawValue: sender.tag) else { return }
         onAction?(shortcut)
+    }
+
+    @objc private func selectBackend(_ sender: NSPopUpButton) {
+        onBackendChange?(sender.indexOfSelectedItem == 1 ? .usb : .ble)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }

@@ -303,6 +303,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         sidebar.onAction = { [weak controlView] shortcut in
             controlView?.performShortcut(shortcut)
         }
+        sidebar.onBackendChange = { [weak controlView] backend in controlView?.selectBackend(backend) }
         controlView.onShortcutStateChanged = { [weak sidebar] available, status in
             sidebar?.update(available: available, status: status)
         }
@@ -323,6 +324,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     func updateDevice(_ device: Device?) {
         lastKnownDevice = device.flatMap { $0.id == deviceID ? $0 : nil }
         applyWindowStrings()
+        sidebar.updateBackend(controlView.selectedBackend)
     }
 
     /// The coordinator's timer re-runs updateDevice for device windows, but never
@@ -410,7 +412,8 @@ private final class ControlWindowContent: NSView {
             lockNotice.bottomAnchor.constraint(equalTo: phoneView.bottomAnchor, constant: -24),
             lockNotice.widthAnchor.constraint(equalTo: phoneView.widthAnchor, constant: -24),
             connectionOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            connectionOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            // Keep backend selection reachable even while BLE is disconnected.
+            connectionOverlay.trailingAnchor.constraint(equalTo: phoneView.trailingAnchor),
             connectionOverlay.topAnchor.constraint(equalTo: topAnchor),
             connectionOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])

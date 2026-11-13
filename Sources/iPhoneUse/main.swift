@@ -1,5 +1,11 @@
 import Foundation
 
+// Native USB control runs in this executable, isolated from AppKit/BLE/capture.
+if CommandLine.arguments.dropFirst().first == USBTouchWorker.argument {
+    guard CommandLine.arguments.count == 3 else { exit(64) }
+    exit(USBTouchWorker.run(physicalID: CommandLine.arguments[2]))
+}
+
 // An opt-in, read-only listener for validating AX without a second BLE/capture owner.
 if CommandLine.arguments.dropFirst().first == "--ax-server" {
     guard CommandLine.arguments.count == 4, let port = UInt16(CommandLine.arguments[3]), port > 0 else { exit(64) }

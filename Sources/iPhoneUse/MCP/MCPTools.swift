@@ -16,6 +16,9 @@ enum MCPToolCatalog {
         let maxEdge: [String: Any] = ["type": "integer", "minimum": 1, "default": MCPServer.longEdge]
         return [
             tool("list_devices", table.toolListDevices, [:], readOnly: true),
+            tool("set_input_backend", language == .zh ? "显式选择此设备的蓝牙或USB触控后端；USB失败不自动回退。"
+                : "Explicitly select Bluetooth or native USB touch for one device; no automatic fallback.",
+                ["device": device, "backend": ["type": "string", "enum": ["ble", "usb"]]], required: ["backend"]),
             tool(
                 "screenshot", table.toolScreenshot, ["device": device, "include_image": includeImage], readOnly: true),
             tool("get_ax_tree", language == .zh
@@ -203,6 +206,11 @@ struct MCPToolRequest {
     ) throws -> MCPToolRequest? {
         let device = (arguments["device"] as? String) ?? (arguments["device_id"] as? String)
         switch name {
+        case "set_input_backend":
+            guard let backend = arguments["backend"] as? String, InputBackendKind(rawValue: backend) != nil else {
+                throw DeviceError("backend must be ble or usb")
+            }
+            return MCPToolRequest(path: "/input/backend", body: withDevice(["backend": backend], device))
         case "act":
             let batch = try ActRequest(arguments)
             let steps = try batch.steps.map { step -> [String: Any] in
