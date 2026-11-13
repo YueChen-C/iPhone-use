@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-/// Offline management boundary. The GUI and touch workers hold shared leases;
+/// Offline management boundary. Every non-management entry holds a shared lease;
 /// image mutations require an exclusive lease and no legacy iphone-use process.
 /// The fixed per-user location deliberately ignores configurable MCP state dirs.
 final class DDIProcessLease {
@@ -33,7 +33,7 @@ final class DDIProcessLease {
         }
         do {
             if !exclusive, try Self.hasPending(directory) {
-                throw DDIManagementError("DDI recovery is pending; inspect \(directory.appendingPathComponent("pending.json").path) and use its transaction path/hash with the explicit local restore command before starting input")
+                throw DDIManagementError("DDI recovery is pending; run iphone-use ddi recovery to discover the transaction path/hash, then review status and explicitly restore before starting input. Never delete pending.json to bypass recovery")
             }
         } catch { flock(fd, LOCK_UN); close(fd); throw error }
     }
@@ -49,6 +49,49 @@ final class DDIProcessLease {
         return lease
     }
     struct Pending: Codable, Equatable { let transactionPath: String; let planSHA256: String }
+    /// Discovery must work while pending blocks input, without acquiring an
+    /// input/exclusive lease, creating a directory or clearing any barrier.
+    static func pendingRecovery() throws -> Pending? { try pendingRecovery(directory: directory) }
+    static func pendingRecovery(directory: URL) throws -> Pending? {
+        var info = stat()
+        if lstat(directory.path, &info) != 0 {
+            guard errno == ENOENT else { throw DDIManagementError("Cannot inspect DDI recovery directory") }
+            return nil
+        }
+        return try DDILocalFile.withDirectory(directory) { root in
+            var rootInfo = stat()
+            guard fstat(root, &rootInfo) == 0, rootInfo.st_uid == getuid(), rootInfo.st_mode & 0o077 == 0 else {
+                throw DDIManagementError("DDI recovery directory must be private and owned by this user")
+            }
+            var pendingInfo = stat()
+            if fstatat(root, "pending.json", &pendingInfo, AT_SYMLINK_NOFOLLOW) != 0 {
+                guard errno == ENOENT else { throw DDIManagementError("Cannot inspect pending DDI recovery") }
+                return nil
+            }
+            guard pendingInfo.st_mode & S_IFMT == S_IFREG, pendingInfo.st_uid == getuid(),
+                  pendingInfo.st_nlink == 1, pendingInfo.st_mode & 0o077 == 0 else {
+                throw DDIManagementError("DDI recovery record must be a private regular file")
+            }
+            let bytes = try DDILocalFile.withFile(root: directory, path: "pending.json") { handle, size in
+                var opened = stat()
+                guard fstat(handle.fileDescriptor, &opened) == 0, opened.st_dev == pendingInfo.st_dev,
+                      opened.st_ino == pendingInfo.st_ino, opened.st_uid == getuid(), opened.st_nlink == 1,
+                      opened.st_mode & 0o077 == 0, size <= 16 * 1024 else {
+                    throw DDIManagementError("DDI recovery record changed or exceeds its private metadata limit")
+                }
+                let data = try handle.read(upToCount: 16 * 1024 + 1) ?? Data()
+                guard data.count == size else { throw DDIManagementError("DDI recovery record was truncated") }
+                return data
+            }
+            let pending = try JSONDecoder().decode(Pending.self, from: bytes)
+            _ = try DDILocalFile.absoluteURL(pending.transactionPath)
+            guard pending.planSHA256.count == 64,
+                  pending.planSHA256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                throw DDIManagementError("Invalid DDI recovery plan hash")
+            }
+            return pending
+        }
+    }
     func markPending(_ pending: Pending) throws {
         try withStore { store in
             if try Self.hasPending(directory) {

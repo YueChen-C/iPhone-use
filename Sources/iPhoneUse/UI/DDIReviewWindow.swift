@@ -10,6 +10,7 @@ final class DDIReviewWindowController: NSWindowController, NSTextFieldDelegate {
     private let inspectButton: NSButton
     private let openButton: NSButton
     private let copyButton: NSButton
+    private let recoveryButton: NSButton
     private var texts: StringsDDIReview
     private var labels: [NSTextField] = []
     private var chooseButtons: [NSButton] = []
@@ -26,6 +27,7 @@ final class DDIReviewWindowController: NSWindowController, NSTextFieldDelegate {
         inspectButton = NSButton(title: texts.inspect, target: nil, action: nil)
         openButton = NSButton(title: texts.open, target: nil, action: nil)
         copyButton = NSButton(title: texts.copy, target: nil, action: nil)
+        recoveryButton = NSButton(title: texts.recovery, target: nil, action: nil)
         let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 860, height: 760),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = texts.title; window.isReleasedWhenClosed = false; window.minSize = .init(width: 720, height: 640)
@@ -66,6 +68,8 @@ final class DDIReviewWindowController: NSWindowController, NSTextFieldDelegate {
         }
         copyButton.isEnabled = false; stack.addArrangedSubview(actions)
         actions.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        recoveryButton.target = self; recoveryButton.action = #selector(findRecovery)
+        stack.addArrangedSubview(recoveryButton)
         offline.stringValue = texts.offline; offline.font = .systemFont(ofSize: 11)
         stack.addArrangedSubview(offline)
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
@@ -95,6 +99,7 @@ final class DDIReviewWindowController: NSWindowController, NSTextFieldDelegate {
         }
         for button in chooseButtons { button.title = texts.choose }
         inspectButton.title = texts.inspect; createButton.title = texts.create; openButton.title = texts.open; copyButton.title = texts.copy
+        recoveryButton.title = texts.recovery
         result.setAccessibilityLabel(texts.title)
         if busy { result.string = texts.working }
     }
@@ -114,6 +119,7 @@ final class DDIReviewWindowController: NSWindowController, NSTextFieldDelegate {
         }
     }
     @objc private func inspectDevice() { run(.inspect(fields[0].stringValue)) }
+    @objc private func findRecovery() { run(.recovery) }
     @objc private func createPlan() {
         run(.plan(device: fields[0].stringValue, candidate: fields[1].stringValue, candidateReceipt: fields[2].stringValue,
                   baseline: fields[3].stringValue, baselineReceipt: fields[4].stringValue, directory: fields[5].stringValue))
@@ -138,7 +144,7 @@ final class DDIReviewWindowController: NSWindowController, NSTextFieldDelegate {
         busy = true; commands = nil; copyButton.isEnabled = false
         for field in fields { field.isEnabled = false }
         for button in chooseButtons { button.isEnabled = false }
-        for button in [createButton, inspectButton, openButton] { button.isEnabled = false }
+        for button in [createButton, inspectButton, openButton, recoveryButton] { button.isEnabled = false }
         result.string = texts.working
         DispatchQueue.global(qos: .utility).async { [self] in
             let outcome = Result { try DDIReviewClient(executable: executable).run(request) }
@@ -146,7 +152,7 @@ final class DDIReviewWindowController: NSWindowController, NSTextFieldDelegate {
                 busy = false
                 for field in fields { field.isEnabled = true }
                 for button in chooseButtons { button.isEnabled = true }
-                for button in [createButton, inspectButton, openButton] { button.isEnabled = true }
+                for button in [createButton, inspectButton, openButton, recoveryButton] { button.isEnabled = true }
                 switch outcome {
                 case .success(let report):
                     commands = report.offlineCommands; copyButton.isEnabled = commands != nil

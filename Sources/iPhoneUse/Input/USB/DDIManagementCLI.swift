@@ -9,11 +9,13 @@ enum DDIManagementCLI {
         case preflight(bundle: String, receipt: String, product: String)
         case plan(device: String, candidate: String, candidateReceipt: String, baseline: String, baselineReceipt: String, directory: String)
         case status(String)
+        case recovery
         case execute(directory: String, confirmation: String, restore: Bool)
     }
-    static let usage = "Usage: iphone-use ddi inspect FULL_USB_UDID | ddi preflight ABS_BUNDLE ABS_RECEIPT PRODUCT_TYPE | ddi plan FULL_USB_UDID ABS_CANDIDATE ABS_RECEIPT ABS_BASELINE ABS_RECEIPT ABS_NEW_TRANSACTION | ddi status ABS_TRANSACTION | ddi apply|restore ABS_TRANSACTION --confirm PLAN_SHA256 --acknowledge-source-risk"
+    static let usage = "Usage: iphone-use ddi inspect FULL_USB_UDID | ddi preflight ABS_BUNDLE ABS_RECEIPT PRODUCT_TYPE | ddi plan FULL_USB_UDID ABS_CANDIDATE ABS_RECEIPT ABS_BASELINE ABS_RECEIPT ABS_NEW_TRANSACTION | ddi status ABS_TRANSACTION | ddi recovery | ddi apply|restore ABS_TRANSACTION --confirm PLAN_SHA256 --acknowledge-source-risk"
 
     static func parse(_ arguments: [String]) throws -> Command {
+        if arguments == ["recovery"] { return .recovery }
         if arguments.count == 2, arguments[0] == "inspect" {
             try NativeDDIInspection.validateIdentity(arguments[1])
             return .inspect(arguments[1])
@@ -67,6 +69,8 @@ enum DDIManagementCLI {
                     directory: URL(fileURLWithPath: directory), device: adapter))
             case .status(let directory):
                 result = try encoder.encode(DDITransaction.status(directory: URL(fileURLWithPath: directory)))
+            case .recovery:
+                result = try encoder.encode(DDIRecoveryReport(pending: DDIProcessLease.pendingRecovery()))
             case let .execute(directory, confirmation, restore):
                 alarm(300)
                 let lease = try DDIProcessLease.management()
@@ -85,6 +89,29 @@ enum DDIManagementCLI {
             "deviceMutationPossible": deviceMutationPossible, "automaticReplay": false]
         if let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) {
             try? FileHandle.standardError.write(contentsOf: data + Data([10]))
+        }
+    }
+}
+
+/// Discovery is not a status validation or authorization. Arguments are data,
+/// not shell text, and never automatically executed or replayed.
+struct DDIRecoveryReport: Encodable {
+    let recoveryPending: Bool
+    let pending: DDIProcessLease.Pending?
+    let statusArguments: [String]?
+    let restoreArguments: [String]?
+    let deviceMutation = false
+    let inputSent = false
+    let automaticReplay = false
+    let transactionValidated = false
+    let restoreAuthorized = false
+
+    init(pending: DDIProcessLease.Pending?) {
+        recoveryPending = pending != nil
+        self.pending = pending
+        statusArguments = pending.map { ["ddi", "status", $0.transactionPath] }
+        restoreArguments = pending.map {
+            ["ddi", "restore", $0.transactionPath, "--confirm", $0.planSHA256, "--acknowledge-source-risk"]
         }
     }
 }

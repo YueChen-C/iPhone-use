@@ -8,14 +8,15 @@ or bundle Apple images, run Python, or invoke a third-party mounting tool.
 
 The local **iPhone Use → DDI Plan & Review (Experimental)** menu opens a native
 window for an exact full USB UDID, read-only inspection, candidate/baseline bundle
-and receipt pickers, a new transaction directory, and opening an existing journal.
+and receipt pickers, a new transaction directory, opening an existing journal,
+and **Find pending recovery** discovery.
 Creating a plan invokes the same application's `ddi plan` entry in an isolated
 child. Hashing and staging stay off the AppKit/video thread. It shows the complete
 JSON review including current/candidate/baseline versions, sources, digests,
 device/OS identity, plan hash and phase. Local output is private and bounded.
 
 The window has **no mount/restore action** and its request type can construct only
-`inspect`, `plan` or `status`. Copyable status/apply/restore commands quote local
+`inspect`, `plan`, `status` or `recovery`. Copyable status/apply/restore commands quote local
 paths and are text only, not shell execution or a mount authorization. Both
 mutation templates are commented out so pasting the copied text cannot apply and
 restore as an accidental batch; explicitly select/uncomment only the intended
@@ -24,8 +25,11 @@ input owners cleanly, review the exact plan and source-risk warning, then use th
 offline CLI below. The running GUI's lifetime lease is never bypassed. Existing
 transactions can be opened even without input preparation; failed/pending phases
 are not automatically retried. If an interrupted transaction's global pending
-barrier blocks a fresh GUI start, use local `ddi status` / explicit `ddi restore`
-instead; the review window never bypasses that startup barrier. This is a plan/review integration, not accepted
+barrier blocks a fresh GUI start, run local `ddi recovery` to find the recorded
+transaction before reviewing `ddi status` and explicitly choosing `ddi restore`;
+the review window never bypasses that startup barrier. Recovery discovery offers
+only a status command and a commented restore template, never an apply template.
+This is a plan/review integration, not accepted
 whole hardware recovery or authenticated source policy. Interactive window
 validation still requires an unlocked desktop.
 
@@ -36,7 +40,21 @@ Run the app's executable directly; no running GUI is required:
 ```sh
 iphone-use ddi inspect FULL_USB_UDID
 iphone-use ddi preflight /absolute/DDI.bundle /absolute/source-receipt.json iPhone13,2
+iphone-use ddi recovery
 ```
+
+`recovery` only discovers the fixed per-user pending record. It works without an
+input or management lease, including while a management owner is live or a pending
+barrier prevents GUI/MCP startup. It does not create the control directory, clear
+the barrier, inspect a phone, validate transaction snapshots, authorize a restore,
+or execute returned arguments. A private, user-owned regular record is read
+without symlink components and with a 16 KiB limit; an unsafe or malformed record
+is an error, not a report that recovery is unnecessary. No pending record returns
+`recoveryPending: false`. A valid record returns its literal transaction path,
+plan hash, and `statusArguments` / `restoreArguments` arrays. Both
+`transactionValidated` and `restoreAuthorized` remain `false`. Review the journal
+and sources, close owners cleanly, and explicitly authorize restoration separately.
+Never delete the pending file to make input start.
 
 `inspect` uses the Apple-installed MobileDevice framework, limited to the verified
 arm64 ABI at version `1827.100.17.100.1`. It selects exactly one already-trusted USB

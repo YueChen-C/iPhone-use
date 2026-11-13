@@ -6,16 +6,45 @@ final class DDIReviewTests: XCTestCase {
     private let planHash = String(repeating: "a", count: 64)
     private let executable = URL(fileURLWithPath: "/Applications/iPhone Use.app/Contents/MacOS/iphone-use")
 
-    func testReviewOnlyConstructsThreeNonMutatingCLIRequests() throws {
+    func testReviewOnlyConstructsNonMutatingCLIRequests() throws {
         let request = DDIReviewRequest.plan(device: id, candidate: "/candidate", candidateReceipt: "/candidate.json",
             baseline: "/baseline", baselineReceipt: "/baseline.json", directory: "/new transaction")
         XCTAssertEqual(try request.arguments(), ["ddi", "plan", id, "/candidate", "/candidate.json", "/baseline", "/baseline.json", "/new transaction"])
         XCTAssertEqual(try DDIReviewRequest.inspect(id).arguments(), ["ddi", "inspect", id])
         XCTAssertEqual(try DDIReviewRequest.status("/transaction").arguments(), ["ddi", "status", "/transaction"])
+        XCTAssertEqual(try DDIReviewRequest.recovery.arguments(), ["ddi", "recovery"])
         XCTAssertEqual(request.timeout, 245)
         XCTAssertEqual(DDIReviewRequest.inspect(id).timeout, 35)
         XCTAssertThrowsError(try DDIReviewRequest.inspect("first phone").arguments())
         XCTAssertThrowsError(try DDIReviewRequest.status("relative").arguments())
+    }
+
+    func testRecoveryDiscoveryBuildsOnlyStatusAndCommentedRestoreWithLiteralPendingPath() throws {
+        let path = "/transaction ' $(PAYLOAD)"
+        let pending = DDIProcessLease.Pending(transactionPath: path, planSHA256: planHash)
+        let data = try JSONEncoder().encode(DDIRecoveryReport(pending: pending))
+        let report = try DDIReviewResult(data: data, request: .recovery, executable: executable)
+        let commands = try XCTUnwrap(report.offlineCommands)
+        XCTAssertFalse(commands.contains(" ddi apply "))
+        XCTAssertTrue(commands.contains("# '/Applications/iPhone Use.app/Contents/MacOS/iphone-use' ddi restore "))
+        XCTAssertEqual(commands.split(separator: "\n").filter { !$0.hasPrefix("#") }.count, 1)
+        let multiline = DDIRecoveryReport(pending: .init(transactionPath: "/transaction\nPAYLOAD", planSHA256: planHash))
+        XCTAssertNil(try DDIReviewResult(data: JSONEncoder().encode(multiline), request: .recovery, executable: executable).offlineCommands)
+        let empty = try DDIReviewResult(data: JSONEncoder().encode(DDIRecoveryReport(pending: nil)), request: .recovery, executable: executable)
+        XCTAssertNil(empty.offlineCommands)
+    }
+
+    func testRecoveryDiscoveryRejectsFalseAuthorizationAndMalformedOrContradictoryPending() throws {
+        let valid = try JSONSerialization.jsonObject(with: JSONEncoder().encode(DDIRecoveryReport(
+            pending: .init(transactionPath: "/transaction", planSHA256: planHash)))) as! [String: Any]
+        for (key, value): (String, Any) in [("restoreAuthorized", true), ("transactionValidated", true),
+                                          ("automaticReplay", true), ("deviceMutation", true),
+                                          ("recoveryPending", false), ("pending", NSNull()),
+                                          ("pending", ["transactionPath": "relative", "planSHA256": planHash]),
+                                          ("pending", ["transactionPath": "/transaction", "planSHA256": "main"])] {
+            var invalid = valid; invalid[key] = value
+            XCTAssertThrowsError(try DDIReviewResult(data: JSONSerialization.data(withJSONObject: invalid), request: .recovery, executable: executable))
+        }
     }
 
     func testPathsRemainLiteralArgumentsNotShellCode() throws {

@@ -8,6 +8,7 @@ enum DDIReviewRequest {
     case plan(device: String, candidate: String, candidateReceipt: String,
               baseline: String, baselineReceipt: String, directory: String)
     case status(String)
+    case recovery
 
     func arguments() throws -> [String] {
         let arguments: [String]
@@ -16,13 +17,14 @@ enum DDIReviewRequest {
         case let .plan(id, candidate, receipt, baseline, baselineReceipt, directory):
             arguments = ["plan", id, candidate, receipt, baseline, baselineReceipt, directory]
         case .status(let directory): arguments = ["status", directory]
+        case .recovery: arguments = ["recovery"]
         }
         _ = try DDIManagementCLI.parse(arguments)
         return ["ddi"] + arguments
     }
     var timeout: TimeInterval { if case .plan = self { return 245 }; return 35 }
     var transactionPath: String? {
-        switch self { case .inspect: return nil; case .plan(_, _, _, _, _, let path), .status(let path): return path }
+        switch self { case .inspect, .recovery: return nil; case .plan(_, _, _, _, _, let path), .status(let path): return path }
     }
 }
 
@@ -34,6 +36,8 @@ struct DDIReviewResult {
         guard data.count <= 1024 * 1024,
               let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               object["inputSent"] as? Bool == false else { throw DDIManagementError("Invalid native DDI review reply") }
+        var transactionPath = request.transactionPath
+        var planHash = object["planSHA256"] as? String
         switch request {
         case .inspect(let id):
             guard object["physicalID"] as? String == id, object["deviceMutation"] as? Bool == false else {
@@ -45,11 +49,27 @@ struct DDIReviewResult {
                 throw DDIManagementError("DDI planning identity or mutation mismatch")
             }
         case .status: break // A journal can describe earlier device mutations.
+        case .recovery:
+            guard object["deviceMutation"] as? Bool == false, object["automaticReplay"] as? Bool == false,
+                  object["transactionValidated"] as? Bool == false, object["restoreAuthorized"] as? Bool == false,
+                  let pending = object["recoveryPending"] as? Bool else {
+                throw DDIManagementError("Invalid non-mutating DDI recovery discovery reply")
+            }
+            if pending {
+                guard let record = object["pending"] as? [String: Any],
+                      let path = record["transactionPath"] as? String, let hash = record["planSHA256"] as? String else {
+                    throw DDIManagementError("Invalid pending DDI recovery record")
+                }
+                _ = try DDIManagementCLI.parse(["restore", path, "--confirm", hash, "--acknowledge-source-risk"])
+                transactionPath = path; planHash = hash
+            } else if object["pending"] != nil && !(object["pending"] is NSNull) {
+                throw DDIManagementError("DDI recovery discovery disagrees with its pending record")
+            }
         }
         let pretty = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
         json = String(decoding: pretty, as: UTF8.self)
-        if let directory = request.transactionPath {
-            guard object["transactionPath"] as? String == directory, let hash = object["planSHA256"] as? String,
+        if let directory = transactionPath {
+            guard (request.transactionPath == nil || object["transactionPath"] as? String == directory), let hash = planHash,
                   hash.count == 64, hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
                 throw DDIManagementError("DDI review plan path/hash mismatch")
             }
@@ -63,9 +83,10 @@ struct DDIReviewResult {
             // into Process.arguments. Quote every local path, even newlines/'.
             let prefix = Self.quote(executable.path) + " ddi "
             let suffix = Self.quote(directory) + " --confirm " + hash + " --acknowledge-source-risk"
+            let apply = request.transactionPath == nil ? "" : "# " + prefix + "apply " + suffix + "\n"
             offlineCommands = prefix + "status " + Self.quote(directory) + "\n"
                 + "# Review and explicitly uncomment ONE intended operation while offline; never paste a batch of mutations.\n"
-                + "# " + prefix + "apply " + suffix + "\n# " + prefix + "restore " + suffix
+                + apply + "# " + prefix + "restore " + suffix
         } else { offlineCommands = nil }
     }
     private static func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
