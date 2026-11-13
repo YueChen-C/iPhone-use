@@ -1,7 +1,8 @@
 import Foundation
 
-// Held for the full lifetime of each input owner, including its child worker.
-// A persistent interrupted-DDI barrier also blocks fresh input processes.
+// Held for the full lifetime of every non-management entry, including MCP,
+// AX and screenshot helpers. Acquire before any entry can start device work:
+// legacy-process discovery alone cannot stop an owner starting after its scan.
 var ddiInputLease: DDIProcessLease?
 
 // DDI management is explicit and local; it never starts GUI or input.
@@ -9,11 +10,19 @@ if CommandLine.arguments.dropFirst().first == "ddi" {
     exit(DDIManagementCLI.run(arguments: Array(CommandLine.arguments.dropFirst(2))))
 }
 
+do { ddiInputLease = try DDIInputAdmission.acquire(arguments: Array(CommandLine.arguments.dropFirst())) }
+catch {
+    if CommandLine.arguments.dropFirst().first == USBTouchWorker.argument {
+        USBTouchWorker.emit(["event": "failed", "error": "\(error)", "replayAllowed": false])
+    } else {
+        FileHandle.standardError.write(Data("\(error)\n".utf8))
+    }
+    exit(78)
+}
+
 // Native USB control runs in this executable, isolated from AppKit/BLE/capture.
 if CommandLine.arguments.dropFirst().first == USBTouchWorker.argument {
     guard CommandLine.arguments.count == 3 else { exit(64) }
-    do { ddiInputLease = try DDIProcessLease.input() }
-    catch { USBTouchWorker.emit(["event": "failed", "error": "\(error)", "replayAllowed": false]); exit(78) }
     exit(USBTouchWorker.run(physicalID: CommandLine.arguments[2]))
 }
 
@@ -44,6 +53,4 @@ if CommandLine.arguments.dropFirst().first == "mcp" {
     MCPServer.run()
 }
 
-do { ddiInputLease = try DDIProcessLease.input() }
-catch { FileHandle.standardError.write(Data("\(error)\n".utf8)); exit(78) }
 Application.run()

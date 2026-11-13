@@ -125,8 +125,12 @@ output as sensitive: it contains physical device identity and local paths.
 `apply` and `restore` require all app/input owners to be **cleanly stopped first**.
 Finish/cancel the active gesture and confirm release before quitting the GUI.
 Stop other MCP/AX sessions through their owning tasks; the CLI never kills them.
-The GUI and USB worker take lifetime shared process leases in a fixed private
-per-user control directory. Mutation requires an exclusive lease and also refuses
+Every non-`ddi` entry takes a shared process lease before dispatch: GUI, USB touch
+worker, MCP forwarding, AX listener/worker and capture-identity screenshot helper.
+The lease is retained for that process's lifetime. This closes the admission race
+where a new helper could start after the legacy-process scan. The fixed private
+per-user control directory is not configurable through MCP/environment state paths.
+Mutation requires an exclusive lease and also refuses
 any other running `iphone-use` process, covering older binaries that do not take
 the lease. This is intentionally conservative: idle legacy MCP/AX processes block
 mutation as well. It is not a claim that arbitrary old binaries participate in
@@ -155,7 +159,7 @@ independently checked through fresh mounted metadata; a zero return alone cannot
 clear the pending barrier. Error/timeout/crash leaves its actual last attempted
 phase available through `status`; no automatic restore, contact replay or input
 restart occurs. The fixed `~/Library/Application Support/iPhoneUse/DDIControl/`
-barrier survives the mutating process and blocks new GUI/worker starts until the
+barrier survives the mutating process and blocks every new non-`ddi` start until the
 recorded transaction verifies successfully. Do not delete pending/lock files to
 bypass it. For a corrupted candidate, recovery still permits the validated
 baseline; corrupted baseline bytes stop recovery before device mutation. A crash
