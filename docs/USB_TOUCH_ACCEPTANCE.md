@@ -69,7 +69,9 @@ The current run does not close these remaining gates:
   are not this acceptance. Other tasks' processes must not be killed or bypassed.
 - Connected-BLE regression, physical rotation/unplug/reconnect, concurrent
   multi-device input isolation, and longer-duration stability coverage.
-- AssistiveTouch-disabled validation, which still requires explicit approval.
+- AssistiveTouch-disabled validation was not performed. The user explicitly
+  requested that AssistiveTouch remain unchanged; do not toggle it for acceptance
+  or infer disabled-mode compatibility from the existing enabled-mode results.
 - Authenticated source policy, licensing and distribution review. Integrity
   hashes and source-risk acknowledgement do not constitute these approvals.
 

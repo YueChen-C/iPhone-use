@@ -84,6 +84,14 @@ final class USBInputController {
         if let entry = input(device) { entry.validateCapture(); return }
         select(.usb, device: device)
     }
+    /// Capture removal/remapping/revoked identity must retire input even when
+    /// no control window is polling. Keep each entry owned until explicit
+    /// selection/shutdown can confirm release and exit; never prepare or replay
+    /// from a capture notification. Do not hold our lock across capture reads.
+    func captureDidChange() {
+        let current = lock.withLock { stopped ? [] : Array(entries.values) }
+        for input in current { input.validateCapture() }
+    }
     func status(_ device: Device) -> [String: Any] {
         let (state, isStopped) = lock.withLock { (selections[device.id], stopped) }
         if isStopped {

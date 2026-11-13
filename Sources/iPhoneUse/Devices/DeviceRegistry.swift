@@ -95,6 +95,7 @@ final class DeviceRegistry {
     func start() {
         load()
         ScreenCaptureManager.shared.onScreensChanged = { [weak self] in
+            USBInputController.shared.captureDidChange()
             self?.matchQueue.async {
                 self?.syncBluetoothForCurrentScreens(resetExhausted: true)
             }

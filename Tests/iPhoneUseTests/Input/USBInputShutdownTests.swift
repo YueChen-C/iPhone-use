@@ -2,6 +2,29 @@ import XCTest
 @testable import iPhoneUse
 
 final class USBInputShutdownTests: XCTestCase {
+    func testCaptureChangeDoesNotPrepareAnUnboundLaunchSelectionOrSwitchBackend() {
+        let controller = USBInputController()
+        controller.selectAtLaunch(physicalID: "fixture")
+        let generation = controller.generation("fixture")
+        controller.captureDidChange()
+        XCTAssertEqual(controller.selected("fixture"), .usb)
+        XCTAssertEqual(controller.generation("fixture"), generation)
+        XCTAssertFalse(controller.permitsBLE("fixture", generation: nil))
+        XCTAssertTrue(controller.stop(waitTimeout: 1))
+    }
+
+    func testCaptureChangeCannotReopenStoppedAdmission() {
+        let controller = USBInputController()
+        controller.selectAtLaunch(physicalID: "fixture")
+        XCTAssertTrue(controller.stop(waitTimeout: 1))
+        let generation = controller.generation("fixture")
+        controller.captureDidChange()
+        XCTAssertEqual(controller.generation("fixture"), generation)
+        XCTAssertFalse(controller.permitsBLE("fixture", generation: nil))
+        XCTAssertFalse(controller.permitsBLE("other", generation: nil))
+        XCTAssertTrue(controller.stop(waitTimeout: 0))
+    }
+
     func testStopWithoutWorkersClosesAdmissionAndIsIdempotent() {
         let controller = USBInputController()
         XCTAssertTrue(controller.permitsBLE("fixture", generation: nil))
