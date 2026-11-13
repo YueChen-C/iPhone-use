@@ -1,5 +1,10 @@
 import Foundation
 
+// DDI inspection/preflight is explicit and local; it never starts GUI or input.
+if CommandLine.arguments.dropFirst().first == "ddi" {
+    exit(DDIManagementCLI.run(arguments: Array(CommandLine.arguments.dropFirst(2))))
+}
+
 // Native USB control runs in this executable, isolated from AppKit/BLE/capture.
 if CommandLine.arguments.dropFirst().first == USBTouchWorker.argument {
     guard CommandLine.arguments.count == 3 else { exit(64) }

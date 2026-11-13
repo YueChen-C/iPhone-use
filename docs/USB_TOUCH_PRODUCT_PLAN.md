@@ -175,6 +175,17 @@ DDI恢复与禁用USB回退均实际验证。若未验证机型/方向/能力则
 - 按用户要求暂不添加子目录独立许可证文件及打包资源，保留源码出处与原根目录 LICENSE；
   正式分发前仍需完成许可整理，不视为法律/来源审查已完成。
 
-未完成：M5 的产品内原生 DDI 授权管理、来源/完整性门禁与整段恢复入口验收；
+- M5 新增应用自身早期本地 `ddi inspect` / `ddi preflight` 入口：固定 MobileDevice
+  ABI、精确完整 USB UDID、只读 mounted metadata，以及外部来源 receipt 的 SHA256
+  固定、目标 product 的 Personalized 身份 manifest SHA384、包内路径/符号链接/普通文件/
+  大小门禁。明确不覆盖无关旧机型或 Cryptex 身份。离线预检只核对
+  手工提供 product type，不宣称设备兼容或来源可信，不授予挂载权限；网络接口不接受
+  DDI 路径。用法与未实现的写入边界见 [USB_DDI_MANAGEMENT.md](USB_DDI_MANAGEMENT.md)。
+- M3 补充真机端到端：应用自身 `mcp` 进程完成 initialize / tools/list / list_devices /
+  screenshot，USB 坐标点击进入“通用”，`act` 内 OCR `tap_text` 打开“关于本机”，并由
+  `wait_text` 识别“iOS版本”；已看前后截图且返回通用页。蓝牙管理器始终 disabled。
+  本次 MCP 进程为新构建，HTTP/GUI 服务仍为上一阶段已验收进程；未声称 DDI 写入完成。
+
+未完成：M5 的产品内原生 DDI 授权切换、可信来源策略与整段恢复入口验收；
 M6 的实际 BLE 已连接设备回归、拔插/旋转/多设备动作隔离、AssistiveTouch 关闭验证、
-长期连续输入、MCP 端到端和发布文档。旧实验 DDI 恢复证据不替代产品管理入口。
+长期连续输入和发布文档。旧实验 DDI 恢复证据不替代产品管理入口。
