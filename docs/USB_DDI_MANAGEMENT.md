@@ -78,16 +78,83 @@ Output is one JSON object on stdout. Usage/identity/path syntax errors exit 64;
 inspection/integrity/runtime failures exit 70 with JSON on stderr. Reaching the
 process deadline terminates the CLI rather than retrying a device operation.
 
-## Not yet available
+## Offline transaction commands (experimental; hardware recovery not accepted yet)
 
-There are no product `mount`, `unmount`, `switch`, or `restore` commands yet, and
-no network endpoint accepts a DDI path. Do not substitute an experimental script
-for product acceptance. A future mutating command must first stop and confirm
-release of active input, bind the exact device and current image, stage and
-revalidate candidate/backup bytes, obtain explicit local authorization tied to
-their hashes and provenance, and persist recoverable transaction phases before
-unmounting. Independent mounted metadata readback and whole restore-entry
-acceptance remain required. Source rollback does not restore a phone's DDI.
+No network endpoint accepts a DDI path. The local transaction interface is:
+
+```sh
+iphone-use ddi plan FULL_USB_UDID /absolute/candidate /absolute/candidate-receipt.json /absolute/baseline /absolute/baseline-receipt.json /absolute/NEW_TRANSACTION
+iphone-use ddi status /absolute/NEW_TRANSACTION
+iphone-use ddi apply /absolute/NEW_TRANSACTION --confirm PLAN_SHA256 --acknowledge-source-risk
+iphone-use ddi restore /absolute/NEW_TRANSACTION --confirm PLAN_SHA256 --acknowledge-source-risk
+```
+
+`plan` is non-mutating on the phone. It independently inspects the exact trusted
+USB device and requires the supplied baseline to match the mounted personalized
+image's build, CoreDevice version and 48-byte image signature. It validates both
+receipts and copies just their pinned metadata/payloads into new private local
+snapshots, streams and revalidates the copies, and fsyncs files/directories before
+writing a plan and journal. The existing directory must not be reused. Treat the
+output as sensitive: it contains physical device identity and local paths.
+
+`apply` and `restore` require all app/input owners to be **cleanly stopped first**.
+Finish/cancel the active gesture and confirm release before quitting the GUI.
+Stop other MCP/AX sessions through their owning tasks; the CLI never kills them.
+The GUI and USB worker take lifetime shared process leases in a fixed private
+per-user control directory. Mutation requires an exclusive lease and also refuses
+any other running `iphone-use` process, covering older binaries that do not take
+the lease. This is intentionally conservative: idle legacy MCP/AX processes block
+mutation as well. It is not a claim that arbitrary old binaries participate in
+the new lock or that process exit proves a prior touch release. If an input owner
+crashed with an unconfirmed release, stop and resolve it before managing images.
+
+The exact plan SHA256 plus `--acknowledge-source-risk` is a local, explicit
+research authorization for the plan's source descriptions, candidate, baseline,
+device/OS and current signature. It is **not authenticated Apple provenance**, a
+signature/license approval or a general production source-policy clearance. The
+CLI accepts no standalone unmount/mount commands and does not retry `apply` after
+it has started; an uncertain result requires inspection and explicit recovery.
+
+Before mutation it verifies the snapshots and current identity/mounted state,
+then fsyncs a persistent pending-input barrier and each journal intent/result:
+
+```text
+preflight -> authorized -> unmounting -> unmounted -> mounting -> mounted
+          -> independentlyVerified
+restoreAuthorized -> restoreUnmounting -> restoreUnmounted -> restoring
+                  -> restoreMounted -> restored
+```
+
+Native calls use only the version-pinned Apple framework. Unmount and mount are
+independently checked through fresh mounted metadata; a zero return alone cannot
+clear the pending barrier. Error/timeout/crash leaves its actual last attempted
+phase available through `status`; no automatic restore, contact replay or input
+restart occurs. The fixed `~/Library/Application Support/iPhoneUse/DDIControl/`
+barrier survives the mutating process and blocks new GUI/worker starts until the
+recorded transaction verifies successfully. Do not delete pending/lock files to
+bypass it. For a corrupted candidate, recovery still permits the validated
+baseline; corrupted baseline bytes stop recovery before device mutation. A crash
+after verified restoration but before barrier removal can be finalized by the
+same explicit restore command without remounting.
+
+`plan` has a 240-second process deadline and mutation has a 300-second deadline.
+All phases and errors remain local, not in the public PR. A single per-user
+offline barrier intentionally blocks all new app input, not just one device.
+No DDI payloads or host frameworks are installed into the host system.
+
+### Evidence boundary / remaining work
+
+Focused injected-device tests execute the whole apply/restore engine, ambiguous
+mount, wrong identity/signature, corrupt snapshots, durable-write failure,
+independent readback, no-replay and persistent input-barrier behavior. A real
+device-bound plan was staged with the phone's existing 27B52 image as baseline;
+a real `apply` was correctly refused while other app/MCP/AX processes were live,
+leaving its journal in preflight and mounted image unchanged. These results do
+**not** prove successful native hardware switch/recovery or crash-time touch
+release. Whole hardware restore, interrupted native-call acceptance, source
+policy and UI management integration remain unaccepted. Do not substitute the
+historical experiment's constituent calls for this product-entry acceptance.
+Source rollback does not restore a phone's DDI or clear a recovery barrier.
 
 The current fixed newer experimental image came from a pinned third-party mirror,
 not a direct Apple CDN acquisition. License/source-policy review remains deferred;

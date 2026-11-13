@@ -1,6 +1,10 @@
 import Foundation
 
-// DDI inspection/preflight is explicit and local; it never starts GUI or input.
+// Held for the full lifetime of each input owner, including its child worker.
+// A persistent interrupted-DDI barrier also blocks fresh input processes.
+var ddiInputLease: DDIProcessLease?
+
+// DDI management is explicit and local; it never starts GUI or input.
 if CommandLine.arguments.dropFirst().first == "ddi" {
     exit(DDIManagementCLI.run(arguments: Array(CommandLine.arguments.dropFirst(2))))
 }
@@ -8,6 +12,8 @@ if CommandLine.arguments.dropFirst().first == "ddi" {
 // Native USB control runs in this executable, isolated from AppKit/BLE/capture.
 if CommandLine.arguments.dropFirst().first == USBTouchWorker.argument {
     guard CommandLine.arguments.count == 3 else { exit(64) }
+    do { ddiInputLease = try DDIProcessLease.input() }
+    catch { USBTouchWorker.emit(["event": "failed", "error": "\(error)", "replayAllowed": false]); exit(78) }
     exit(USBTouchWorker.run(physicalID: CommandLine.arguments[2]))
 }
 
@@ -38,4 +44,6 @@ if CommandLine.arguments.dropFirst().first == "mcp" {
     MCPServer.run()
 }
 
+do { ddiInputLease = try DDIProcessLease.input() }
+catch { FileHandle.standardError.write(Data("\(error)\n".utf8)); exit(78) }
 Application.run()

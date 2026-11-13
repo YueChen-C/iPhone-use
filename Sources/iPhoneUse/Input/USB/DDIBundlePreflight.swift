@@ -55,6 +55,21 @@ enum DDILocalFile {
 
     static func withFile<T>(root: URL, path: String, _ body: (FileHandle, UInt64) throws -> T) throws -> T {
         try validateRelativePath(path)
+        return try withDirectory(root) { directory in
+            var directory = dup(directory)
+            guard directory >= 0 else { throw DDIManagementError("Cannot duplicate DDI directory descriptor") }
+            defer { close(directory) }
+            let components = path.split(separator: "/").map(String.init)
+            for component in components.dropLast() {
+                let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                guard next >= 0 else { throw DDIManagementError("DDI directory path is missing or contains a symlink") }
+                close(directory); directory = next
+            }
+            return try readFile(directory: directory, name: components.last!, body)
+        }
+    }
+
+    static func withDirectory<T>(_ root: URL, _ body: (Int32) throws -> T) throws -> T {
         guard root.path.hasPrefix("/") else { throw DDIManagementError("DDI root must be absolute") }
         var directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard directory >= 0 else { throw DDIManagementError("Cannot open DDI directory without following links") }
@@ -64,20 +79,18 @@ enum DDILocalFile {
             guard next >= 0 else { throw DDIManagementError("DDI root is missing or contains a symlink") }
             close(directory); directory = next
         }
-        let components = path.split(separator: "/").map(String.init)
-        for component in components.dropLast() {
-            let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            guard next >= 0 else { throw DDIManagementError("DDI directory path is missing or contains a symlink") }
-            close(directory); directory = next
-        }
-        let descriptor = openat(directory, components.last!, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard descriptor >= 0 else { throw DDIManagementError("DDI file is missing or contains a symlink: \(path)") }
+        return try body(directory)
+    }
+
+    private static func readFile<T>(directory: Int32, name: String, _ body: (FileHandle, UInt64) throws -> T) throws -> T {
+        let descriptor = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { throw DDIManagementError("DDI file is missing or contains a symlink: \(name)") }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? handle.close() }
         var before = stat()
         guard fstat(descriptor, &before) == 0, before.st_mode & S_IFMT == S_IFREG,
               before.st_size > 0, before.st_size <= 4 * 1024 * 1024 * 1024 else {
-            throw DDIManagementError("DDI input must be a nonempty bounded regular file: \(path)")
+            throw DDIManagementError("DDI input must be a nonempty bounded regular file: \(name)")
         }
         let result = try body(handle, UInt64(before.st_size))
         var after = stat()
@@ -86,7 +99,7 @@ enum DDILocalFile {
               before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
               before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec,
               before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else {
-            throw DDIManagementError("DDI file changed during inspection: \(path)")
+            throw DDIManagementError("DDI file changed during inspection: \(name)")
         }
         return result
     }
@@ -112,7 +125,7 @@ enum DDILocalFile {
 }
 
 struct DDIBundlePreflight: Encodable {
-    struct FileDigest: Encodable {
+    struct FileDigest: Codable, Equatable {
         let path: String
         let bytes: UInt64
         let sha256: String

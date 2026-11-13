@@ -1,12 +1,12 @@
 import Darwin
 import Foundation
 
-/// Apple-installed, version-pinned read-only adapter. Mount/unmount symbols are
-/// intentionally absent. This runs only in the app's early local CLI process.
+/// Apple-installed, version-pinned adapter. Inspection remains read-only;
+/// transaction mutations use the same exact-device binding in a local CLI.
 enum NativeDDIInspection {
     static let frameworkVersion = "1827.100.17.100.1"
     static let frameworkPath = "/Library/Apple/System/Library/PrivateFrameworks/MobileDevice.framework"
-    struct MountedImage: Encodable {
+    struct MountedImage: Codable, Equatable {
         let mountPath: String
         let isMounted: Bool
         let imageType: String
@@ -45,6 +45,10 @@ enum NativeDDIInspection {
     private typealias Mounted = @convention(c) (UnsafeRawPointer, UnsafeMutablePointer<Int32>) -> Unmanaged<CFTypeRef>?
 
     static func inspect(physicalID: String) throws -> Report {
+        try withDevice(physicalID: physicalID) { _, _, report in report }
+    }
+
+    static func withDevice<T>(physicalID: String, _ body: (UnsafeMutableRawPointer, UnsafeRawPointer, Report) throws -> T) throws -> T {
         try validateIdentity(physicalID)
         #if !arch(arm64)
         throw DDIManagementError("Native DDI ABI has only been verified on arm64")
@@ -56,9 +60,9 @@ enum NativeDDIInspection {
             throw DDIManagementError("Apple MobileDevice framework unavailable")
         }
         defer { dlclose(library) }
-        func symbol<T>(_ name: String, _: T.Type) throws -> T {
+        func symbol<Function>(_ name: String, _: Function.Type) throws -> Function {
             guard let address = dlsym(library, name) else { throw DDIManagementError("Missing native DDI symbol: \(name)") }
-            return unsafeBitCast(address, to: T.self)
+            return unsafeBitCast(address, to: Function.self)
         }
         let subscribe = try symbol("AMDeviceNotificationSubscribe", Subscribe.self)
         let unsubscribe = try symbol("AMDeviceNotificationUnsubscribe", Unsubscribe.self)
@@ -91,7 +95,8 @@ enum NativeDDIInspection {
                 throw DDIManagementError("Exact USB device absent or ambiguous; no fallback")
             }
             try check(connect(device), "DDI identity connect")
-            defer { _ = disconnect(device) }
+            var connected = true
+            defer { if connected { _ = disconnect(device) } }
             guard identifier(device)?.takeRetainedValue() as String? == physicalID, paired(device) == 1 else {
                 throw DDIManagementError("DDI requires an already trusted, exact USB device; pairing refused")
             }
@@ -107,12 +112,14 @@ enum NativeDDIInspection {
             }
             let product = try value("ProductType"), version = try value("ProductVersion"), build = try value("BuildVersion")
             try check(stop(device), "DDI stop inspection session"); sessionOpen = false
+            try check(disconnect(device), "DDI disconnect inspection session"); connected = false
             var code: Int32 = 0
             let object = mounted(device, &code)?.takeRetainedValue()
             try check(code, "DDI mounted image inspection")
             let images = try mountedImages(object)
-            return Report(physicalID: physicalID, productType: product, productVersion: version,
-                          productBuild: build, mountedImages: images, frameworkVersion: frameworkVersion)
+            let report = Report(physicalID: physicalID, productType: product, productVersion: version,
+                                productBuild: build, mountedImages: images, frameworkVersion: frameworkVersion)
+            return try body(library, device, report)
         }
         #endif
     }
