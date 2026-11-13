@@ -53,6 +53,21 @@ replacement, DDI mutation or local unit-test rerun in this stage. Device-specifi
 commands, literal stdout/stderr, exit statuses, frame hashes and process/resource
 samples are retained in the local verification ledger, not the public PR.
 
+## Unsupported-device fallback
+
+Runtime `80908a47314a6626e2459e95dca32d339b3251ed` was deployed after the owned
+previous application confirmed USB release and worker exit. With Bluetooth
+disabled, a second phone (iPhone SE 2, iOS 15.4, existing legacy developer image)
+was absent from a read-only CoreDevice check-in performed before any usage
+assertion. Explicit USB selection reported unavailable; subsequent explicit BLE
+selection completed and the failed worker exited. This proves route recovery,
+not connected-BLE input or USB support for that phone.
+
+No touch input, DDI mutation or AssistiveTouch change occurred. Both phones'
+before/after PNGs were byte-identical; the supported phone retained the same ready
+USB worker. Existing focused tests were not rerun, and latest-build GUI and
+whole-product DDI recovery acceptance remain open.
+
 ## Acceptance boundary
 
 Prior stages established native HTTP/MCP touch, explicit USB/BLE routing and
