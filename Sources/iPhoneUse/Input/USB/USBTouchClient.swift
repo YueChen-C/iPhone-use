@@ -1,6 +1,19 @@
 import Darwin
 import Foundation
 
+/// Exit alone never proves safety. A worker that explicitly failed before
+/// session construction needs no contact release, provided no command was sent.
+struct USBTouchWorkerLifetime {
+    var becameReady = false
+    var commandDispatched = false
+    var released = false
+    var unprepared = false
+    var exited = false
+    var retirementConfirmed: Bool {
+        exited && (released || (unprepared && !becameReady && !commandDispatched))
+    }
+}
+
 /// Parent-side owner of exactly one native worker. JSON lines are bounded and
 /// writes are serialized with replies; stdout is never used as a shell command.
 final class USBTouchClient {
@@ -12,8 +25,7 @@ final class USBTouchClient {
     private var replies: [String: [String: Any]] = [:]
     private var failure: String?
     private var closed = false
-    private var released = false
-    private var exited = false
+    private var lifetime = USBTouchWorkerLifetime()
     private let process = Process()
     private let input = Pipe()
     private let output = Pipe()
@@ -42,7 +54,7 @@ final class USBTouchClient {
         process.terminationHandler = { [weak self] _ in
             guard let self else { return }
             self.condition.lock()
-            self.exited = true
+            self.lifetime.exited = true
             if !self.closed { self.failure = self.failure ?? "USB worker exited; prepare again to reconnect" }
             self.condition.broadcast(); self.condition.unlock()
         }
@@ -83,9 +95,16 @@ final class USBTouchClient {
                 guard object["physicalID"] as? String == physicalID, ready == nil else {
                     failure = "USB worker identity mismatch"; condition.broadcast(); return
                 }
+                lifetime.becameReady = true
                 ready = object
             } else if object["event"] as? String == "released" {
-                released = true
+                lifetime.released = true
+            } else if object["event"] as? String == "unprepared" {
+                guard object["physicalID"] as? String == physicalID, object["inputSent"] as? Bool == false,
+                      !lifetime.becameReady, !lifetime.commandDispatched else {
+                    failure = "Invalid USB worker pre-session proof"; condition.broadcast(); return
+                }
+                lifetime.unprepared = true
             } else if let id = object["id"] as? String {
                 replies[id] = object
             } else if object["event"] as? String == "failed" { failure = object["error"] as? String ?? "USB worker failed" }
@@ -100,6 +119,7 @@ final class USBTouchClient {
             let bytes = try JSONEncoder().encode(command) + Data([10])
             condition.lock()
             if closed || failure != nil { let message = failure ?? "USB session closed"; condition.unlock(); throw AXDTX.Failure(message) }
+            lifetime.commandDispatched = true // Even a partial pipe write invalidates no-contact proof.
             condition.unlock()
             do { try input.fileHandleForWriting.write(contentsOf: bytes) }
             catch { fail("USB write failed; mayHaveExecuted=true; replayAllowed=false"); close(); throw error }
@@ -130,15 +150,16 @@ final class USBTouchClient {
         }
     }
     /// A process being killed is not proof of contact release. Keep the next
-    /// transport gated unless the worker confirmed release/PING and then exited.
+    /// transport gated unless release/PING was confirmed, or explicit pre-session
+    /// failure proved no contact was possible. Both paths also require exit.
     func closeAndWait() -> Bool {
         close()
         condition.lock(); defer { condition.unlock() }
         let deadline = Date().addingTimeInterval(4)
-        while !(released && exited) {
+        while !lifetime.retirementConfirmed {
             if !condition.wait(until: deadline) { break }
         }
-        return released && exited
+        return lifetime.retirementConfirmed
     }
     deinit { close(); output.fileHandleForReading.readabilityHandler = nil }
 }

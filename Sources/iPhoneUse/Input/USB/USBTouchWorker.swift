@@ -18,6 +18,7 @@ enum USBTouchWorker {
 
     static func run(physicalID: String) -> Int32 {
         signal(SIGPIPE, SIG_IGN)
+        var sessionPrepared = false
         // The parent closes stdin on cancellation. SIGTERM is only used after
         // that graceful interval; no other application's sessions are touched.
         do {
@@ -29,6 +30,7 @@ enum USBTouchWorker {
                 let session = try USBTouchSession(physicalID: physicalID,
                     control: connect("com.apple.coredevice.deviceinfo"), discovery: connect(USBTouchWire.hidService),
                     sender: connect(USBTouchWire.hidService), identifier: identifier)
+                sessionPrepared = true
                 session.interrupted = {
                     var state = pollfd(fd: STDIN_FILENO, events: Int16(POLLHUP), revents: 0)
                     return poll(&state, 1, 0) > 0 && state.revents & Int16(POLLHUP | POLLERR) != 0
@@ -74,6 +76,10 @@ enum USBTouchWorker {
             }
             return 0
         } catch {
+            // Before session construction completes, only discovery has run:
+            // no command loop or contact report can have been entered. This is
+            // not a release acknowledgement for a session that became ready.
+            if !sessionPrepared { emit(["event": "unprepared", "physicalID": physicalID, "inputSent": false]) }
             emit(["event": "failed", "error": "\(error)", "replayAllowed": false]); return 70
         }
     }
