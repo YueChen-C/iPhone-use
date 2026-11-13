@@ -33,7 +33,10 @@ enum USBTouchWorker {
                     var state = pollfd(fd: STDIN_FILENO, events: Int16(POLLHUP), revents: 0)
                     return poll(&state, 1, 0) > 0 && state.revents & Int16(POLLHUP | POLLERR) != 0
                 }
-                defer { session.cancel() }
+                defer {
+                    session.cancel()
+                    if (try? session.finish()) != nil { emit(["event": "released"]) }
+                }
                 emit(["event": "ready", "physicalID": physicalID, "width": session.width,
                       "height": session.height, "surface": session.surface, "session": UUID().uuidString])
                 var pending = Data()
@@ -45,7 +48,11 @@ enum USBTouchWorker {
                     if pollFD.revents & Int16(POLLIN | POLLHUP) != 0 {
                         var buffer = [UInt8](repeating: 0, count: 4096)
                         let count = Darwin.read(STDIN_FILENO, &buffer, buffer.count)
-                        if count == 0 { return }
+                        if count == 0 {
+                            try session.finish()
+                            emit(["event": "released"])
+                            return
+                        }
                         if count < 0 { if errno == EINTR { continue }; throw AXDTX.Failure("USB worker stdin closed") }
                         pending.append(contentsOf: buffer.prefix(count))
                         guard pending.count <= 256 * 1024 else { throw AXDTX.Failure("USB worker command exceeds limit") }

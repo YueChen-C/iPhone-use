@@ -8,7 +8,7 @@ import XPC
 // resolved at runtime from the installed CoreDevice framework.
 // Check-in/usage-assertion sequencing adapted from sunghyun-k/iphone-use
 // CoreDeviceClient.swift at 63472c34c0891d836ef7607cc88a15df5c7d59be (MIT).
-// Copyright (c) 2026 Sunghyun Kim. See USB/UPSTREAM_LICENSE.txt for the full notice.
+// Copyright (c) 2026 Sunghyun Kim.
 enum CoreDeviceTouchBroker {
     final class ReplyBox {
         private let lock = NSLock()

@@ -294,8 +294,9 @@ final class PhoneControlView: NSView {
         let status: String
         if usbSelected {
             let chinese = AppLanguageStore.shared.language == .zh
-            let state = usbInput?.status["state"] as? String ?? "preparing"
-            let detail = usbInput?.status["detail"] as? String ?? ""
+            let snapshot = device.map { USBInputController.shared.status($0) } ?? [:]
+            let state = snapshot["state"] as? String ?? "preparing"
+            let detail = snapshot["detail"] as? String ?? ""
             status = usbInput?.isReady == true
                 ? (chinese ? "USB触控 · 鼠标已就绪" : "USB touch · Mouse ready")
                 : "USB: \(state)\(detail.isEmpty ? "" : " · " + detail)"
@@ -351,8 +352,8 @@ final class PhoneControlView: NSView {
         }
         let connection = current.map { device in
             ControlDeviceBinding.Connection(
-                deviceID: device.id, captureID: ObjectIdentifier(device.screen), host: device.host,
-                session: device.host.flatMap { HIDPeripheral.shared.connectionSession(for: $0) })
+                deviceID: device.id, captureID: ObjectIdentifier(device.screen), host: usbSelected ? nil : device.host,
+                session: usbSelected ? nil : device.host.flatMap { HIDPeripheral.shared.connectionSession(for: $0) })
         }
         if binding.observe(connection) {
             cancelInteraction()
@@ -544,10 +545,7 @@ final class PhoneControlView: NSView {
               let point = normalizedPoint(event.locationInWindow, device: device),
               abs(event.scrollingDeltaY) > 0.01 else { return }
         let delta = max(-0.3, min(0.3, -event.scrollingDeltaY / 200))
-        let end = USBTouchPoint(x: point.x, y: max(0.05, min(0.95, point.y + delta)))
-        shortcutQueue.async {
-            try? usbInput.gesture("swipe", points: [.init(x: point.x, y: point.y), end], duration: 0.18)
-        }
+        usbInput.scroll(at: .init(x: point.x, y: point.y), delta: delta)
     }
 
     /// Fractions of the phone image, independent of capture and Retina scale.

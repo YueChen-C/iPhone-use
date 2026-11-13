@@ -213,7 +213,8 @@ enum ControlAPI {
             return info
         }
         return .json([
-            "bluetooth": HIDPeripheral.shared.state,
+            "bluetooth": ProcessInfo.processInfo.environment["IPHONE_USE_DISABLE_BLUETOOTH"] == "1"
+                ? "disabled" : HIDPeripheral.shared.state,
             "bluetoothHosts": hosts,
             "capture": captureStatus(),
             "devices": DeviceRegistry.shared.status(),

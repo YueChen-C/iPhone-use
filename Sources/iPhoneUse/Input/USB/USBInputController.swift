@@ -1,63 +1,99 @@
 import Foundation
 
-/// One USB queue/session per complete physical identity. The registry remains
-/// responsible for BLE matching; USB selection never asks it to fabricate a host.
+/// Full physical identity owns selection and retirement. Switching is off the
+/// AppKit thread; neither backend may send while the previous one is retiring.
 final class USBInputController {
     static let shared = USBInputController()
     private let lock = NSLock()
+    private var transitions: [String: DispatchQueue] = [:]
     private var entries: [String: USBDeviceInput] = [:]
-    private var selections: [String: InputBackendKind] = [:]
-    private var generations: [String: UUID] = [:]
+    private var retiring: [String: [USBDeviceInput]] = [:]
+    private var selections: [String: InputBackendSelection] = [:]
 
     func selectAtLaunch(physicalID: String) {
-        lock.withLock { selections[physicalID] = .usb }
+        // Capture refresh will prepare USB after identity becomes verified.
+        lock.withLock {
+            var state = InputBackendSelection()
+            let id = state.begin(.usb); state.finish(id, released: true)
+            selections[physicalID] = state
+        }
     }
-
-    func selected(_ id: String) -> InputBackendKind { lock.withLock { selections[id] ?? .ble } }
+    func selected(_ id: String) -> InputBackendKind { lock.withLock { selections[id]?.backend ?? .ble } }
+    func generation(_ id: String) -> UUID { lock.withLock {
+        if selections[id] == nil { selections[id] = InputBackendSelection() }
+        return selections[id]!.generation
+    } }
+    func permitsBLE(_ id: String, generation: UUID?) -> Bool {
+        lock.withLock { selections[id]?.permits(.ble, generation: generation) ?? (generation == nil) }
+    }
     func input(_ device: Device) -> USBDeviceInput? {
         lock.withLock {
-            guard selections[device.id] == .usb, let input = entries[device.id],
+            guard selections[device.id]?.permits(.usb) == true, let input = entries[device.id],
                   input.captureID == device.screen.associationIdentity else { return nil }
             return input
         }
     }
     func select(_ backend: InputBackendKind, device: Device) {
-        // Publish generation change before allowing any new action. A retired
-        // worker may finish its release only; no queued contact is reused.
-        let generation = UUID()
-        let previous = lock.withLock { () -> USBDeviceInput? in
-            selections[device.id] = backend
-            generations[device.id] = generation
-            return entries.removeValue(forKey: device.id)
+        let (generation, previous) = lock.withLock { () -> (UUID, USBDeviceInput?) in
+            var state = selections[device.id] ?? InputBackendSelection()
+            let generation = state.begin(backend); selections[device.id] = state
+            let previous = entries.removeValue(forKey: device.id)
+            if let previous { retiring[device.id, default: []].append(previous) }
+            return (generation, previous)
         }
-        previous?.retire()
+        previous?.retire() // EOF interrupts a synchronous worker gesture too.
         DeviceRegistry.shared.cancelBackgroundMotion(for: device)
-        if device.host != nil, let ble = try? DeviceRegistry.shared.input(for: device) { ble.cancelPointer() }
-        guard backend == .usb else { return }
-        let input = USBDeviceInput(device: device)
-        let accepted = lock.withLock { () -> Bool in
-            guard selections[device.id] == .usb, generations[device.id] == generation else { return false }
-            entries[device.id] = input; return true
+        let transitionQueue = lock.withLock { () -> DispatchQueue in
+            if let existing = transitions[device.id] { return existing }
+            let queue = DispatchQueue(label: "iphone-use.input-transition.\(device.id)")
+            transitions[device.id] = queue; return queue
         }
-        if accepted { input.prepare() } else { input.retire() }
+        transitionQueue.async { [self] in
+            let old = lock.withLock { retiring[device.id] ?? [] }
+            let unreleased = old.filter { !$0.retireAndWait() }
+            let usbReleased = unreleased.isEmpty
+            lock.withLock {
+                retiring[device.id]?.removeAll { candidate in
+                    old.contains(where: { $0 === candidate }) && !unreleased.contains(where: { $0 === candidate })
+                }
+            }
+            let bleReleased = DeviceRegistry.shared.releaseForBackendSwitch(device)
+            let input = backend == .usb ? USBDeviceInput(device: device) : nil
+            let accepted = lock.withLock { () -> Bool in
+                selections[device.id]?.finish(generation, released: usbReleased && bleReleased)
+                guard selections[device.id]?.permits(backend, generation: generation) == true else { return false }
+                if let input { entries[device.id] = input }
+                return true
+            }
+            if accepted { input?.prepare() } else { input?.retire() }
+        }
     }
     func refresh(_ device: Device) {
-        guard selected(device.id) == .usb else { return }
+        let allowed = lock.withLock { selections[device.id]?.permits(.usb) == true }
+        guard allowed else { return }
         if let entry = input(device) { entry.validateCapture(); return }
         select(.usb, device: device)
     }
     func status(_ device: Device) -> [String: Any] {
-        guard selected(device.id) == .usb else { return ["backend": "ble"] }
-        return input(device)?.status ?? ["backend": "usb", "state": "disconnected", "capabilities": []]
+        let state = lock.withLock { selections[device.id] }
+        if let state, state.transitioning || state.failure != nil {
+            return ["backend": state.backend.rawValue, "state": state.failure == nil ? "preparing" : "failed",
+                    "detail": state.failure ?? "Releasing previous input session", "capabilities": [],
+                    "sessionCurrent": false]
+        }
+        guard state?.backend == .usb else { return ["backend": "ble"] }
+        return input(device)?.status ?? ["backend": "usb", "state": "preparing", "capabilities": []]
     }
     func stop() {
         let old = lock.withLock { () -> [USBDeviceInput] in
+            for id in Array(selections.keys) {
+                var state = selections[id]!; _ = state.begin(state.backend); selections[id] = state
+            }
             let old = Array(entries.values); entries.removeAll(); return old
         }
         for entry in old { entry.retire() }
     }
 }
-
 final class USBDeviceInput {
     let physicalID: String
     let captureID: UUID
@@ -65,12 +101,15 @@ final class USBDeviceInput {
     private let lock = NSLock()
     private let queue: DispatchQueue
     private var client: USBTouchClient?
+    private var closingClients: [USBTouchClient] = []
     private var readiness: InputBackendReadiness = .preparing
     private var detail = ""
     private var retired = false
     private var pendingMotion: USBTouchPoint?
-    private var motionScheduled = false
+    private var motionScheduled: UUID?
     private var gestureHeld = false
+    private var synchronousGesture = false
+    private let wheelGate = USBWheelGate()
     private var motionGeneration: UInt64 = 0
     private var screenValid: Bool {
         guard let screen else { return false }
@@ -96,6 +135,7 @@ final class USBDeviceInput {
     func prepare() {
         queue.async { [self] in
             do {
+                guard !lock.withLock({ retired }) else { return }
                 guard screenValid else { throw AXDTX.Failure("USB capture identity is not verified") }
                 let fresh = try USBTouchClient(physicalID: physicalID)
                 guard screenValid, let screen, let size = screen.size, let dimensions = fresh.dimensions,
@@ -103,7 +143,8 @@ final class USBDeviceInput {
                     fresh.close(); throw AXDTX.Failure("USB display/capture identity or dimensions changed")
                 }
                 lock.withLock {
-                    if retired { fresh.close() } else { client = fresh; readiness = .ready; detail = "" }
+                    client = fresh
+                    if retired { fresh.close() } else { readiness = .ready; detail = "" }
                 }
             } catch { fail(error) }
         }
@@ -111,7 +152,9 @@ final class USBDeviceInput {
     func validateCapture() { if !screenValid { retire() } }
     private func fail(_ error: Error) {
         let old = lock.withLock { () -> USBTouchClient? in
-            readiness = .failed; detail = "\(error)"; let old = client; client = nil; gestureHeld = false; return old
+            readiness = .failed; detail = "\(error)"; let old = client; client = nil; gestureHeld = false
+            if let old { closingClients.append(old) }
+            return old
         }
         old?.close()
     }
@@ -126,28 +169,58 @@ final class USBDeviceInput {
     }
     func gesture(_ operation: String, points: [USBTouchPoint], duration: Double) throws {
         for point in points { try point.validate() }
+        let generation = lock.withLock { motionGeneration }
         try queue.sync {
-            guard !lock.withLock({ gestureHeld }) else { throw AXDTX.Failure("USB pointer is busy") }
+            let accepted = lock.withLock { () -> Bool in
+                guard !retired && !gestureHeld && motionGeneration == generation else { return false }
+                synchronousGesture = true; return true
+            }
+            guard accepted else {
+                throw AXDTX.Failure("USB pointer busy or stale gesture; replayAllowed=false")
+            }
+            defer { lock.withLock { synchronousGesture = false } }
             do { try current().send(operation, points: points, duration: duration) } catch { fail(error); throw error }
         }
     }
+    func scroll(at point: USBTouchPoint, delta: Double) {
+        guard delta.isFinite, abs(delta) > 0.0001, let token = wheelGate.begin() else { return }
+        let generation = lock.withLock { motionGeneration }
+        queue.async { [self] in
+            defer { wheelGate.finish(token) }
+            guard wheelGate.isCurrent(token) else { return }
+            let accepted = lock.withLock { () -> Bool in
+                guard !gestureHeld && !retired && motionGeneration == generation else { return false }
+                synchronousGesture = true; return true
+            }
+            guard accepted else { return }
+            let end = USBTouchPoint(x: point.x, y: max(0.05, min(0.95, point.y + delta)))
+            do {
+                defer { lock.withLock { synchronousGesture = false } }
+                try current().send("swipe", points: [point, end], duration: 0.18)
+            } catch { fail(error) }
+        }
+    }
     func down(_ point: USBTouchPoint) {
+        wheelGate.cancel()
         let generation = lock.withLock { () -> UInt64 in
-            gestureHeld = true; motionGeneration &+= 1; return motionGeneration
+            gestureHeld = true; pendingMotion = nil; motionScheduled = nil
+            return motionGeneration
         }
         enqueue("down", point: point, generation: generation)
     }
     func move(_ point: USBTouchPoint) {
-        let schedule = lock.withLock { () -> Bool in
-            guard gestureHeld && !retired else { return false }
+        let schedule = lock.withLock { () -> (UUID, UInt64)? in
+            guard gestureHeld && !retired else { return nil }
             pendingMotion = point
-            if motionScheduled { return false }; motionScheduled = true; return true
+            guard motionScheduled == nil else { return nil }
+            let ticket = UUID(); motionScheduled = ticket
+            return (ticket, motionGeneration)
         }
-        if schedule {
-            let generation = lock.withLock { motionGeneration }
+        if let (ticket, generation) = schedule {
             queue.async { [self] in
                 let target = lock.withLock { () -> USBTouchPoint? in
-                    defer { pendingMotion = nil; motionScheduled = false }; return pendingMotion
+                    guard motionScheduled == ticket else { return nil }
+                    defer { pendingMotion = nil; motionScheduled = nil }; return pendingMotion
                 }
                 if let target { perform("move", point: target, generation: generation) }
             }
@@ -155,13 +228,24 @@ final class USBDeviceInput {
     }
     func up(_ point: USBTouchPoint) {
         let generation = lock.withLock { () -> UInt64 in
-            gestureHeld = false; pendingMotion = nil; return motionGeneration
+            gestureHeld = false; pendingMotion = nil; motionScheduled = nil; return motionGeneration
         }
         enqueue("up", point: point, generation: generation)
     }
     func cancel() {
-        lock.withLock { gestureHeld = false; pendingMotion = nil; motionGeneration &+= 1 }
+        wheelGate.cancel()
+        let (generation, active) = lock.withLock { () -> (UInt64, USBTouchClient?) in
+            gestureHeld = false; pendingMotion = nil; motionScheduled = nil; motionGeneration &+= 1
+            return (motionGeneration, synchronousGesture ? client : nil)
+        }
+        if let active {
+            // Closing stdin interrupts an in-flight tap/swipe immediately, not
+            // after it finishes on the same serial command queue.
+            active.close(); fail(AXDTX.Failure("USB gesture cancelled; explicitly reselect to prepare"))
+            return
+        }
         queue.async { [self] in
+            guard lock.withLock({ motionGeneration == generation && !retired }) else { return }
             if let client = lock.withLock({ self.client }), client.sessionID != nil { try? client.send("cancel") }
         }
     }
@@ -173,10 +257,32 @@ final class USBDeviceInput {
         do { try current().send(operation, points: [point]) } catch { fail(error) }
     }
     func retire() {
+        wheelGate.cancel()
         let old = lock.withLock { () -> USBTouchClient? in
-            retired = true; readiness = .disconnected; gestureHeld = false; pendingMotion = nil
-            let old = client; client = nil; return old
+            retired = true; readiness = .disconnected; gestureHeld = false; pendingMotion = nil; motionScheduled = nil
+            return client
         }
         old?.close()
     }
+    func retireAndWait() -> Bool {
+        retire()
+        return queue.sync {
+            let clients = lock.withLock { closingClients + (client.map { [$0] } ?? []) }
+            return clients.map { $0.closeAndWait() }.allSatisfy { $0 }
+        }
+    }
+}
+
+/// At most one queued/in-flight wheel swipe. Drop excess events rather than
+/// replaying a backlog after the user has stopped scrolling or changed backend.
+final class USBWheelGate {
+    private let lock = NSLock()
+    private var active: UUID?
+    func begin() -> UUID? { lock.withLock {
+        guard active == nil else { return nil }
+        let token = UUID(); active = token; return token
+    } }
+    func isCurrent(_ token: UUID) -> Bool { lock.withLock { active == token } }
+    func finish(_ token: UUID) { lock.withLock { if active == token { active = nil } } }
+    func cancel() { lock.withLock { active = nil } }
 }

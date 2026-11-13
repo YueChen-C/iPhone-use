@@ -17,11 +17,12 @@ struct USBTouchPoint: Codable, Equatable {
 final class USBTouchContact {
     private let send: (USBTouchPoint, Bool) throws -> Void
     private(set) var point: USBTouchPoint?
+    private(set) var releaseConfirmed = true
     init(send: @escaping (USBTouchPoint, Bool) throws -> Void) { self.send = send }
     func down(_ value: USBTouchPoint) throws {
         try value.validate()
         guard point == nil else { throw AXDTX.Failure("USB contact already held") }
-        point = value // A partial write may already have reached the device.
+        point = value; releaseConfirmed = false // A partial write may already have reached the device.
         do { try send(value, true) } catch { cancel(); throw error }
     }
     func move(_ value: USBTouchPoint) throws {
@@ -34,10 +35,12 @@ final class USBTouchContact {
         try value.validate()
         guard point != nil else { return }
         point = value
-        do { try send(value, false); point = nil } catch { cancel(); throw error }
+        do { try send(value, false); point = nil; releaseConfirmed = true } catch { cancel(); throw error }
     }
     func cancel() {
-        if let point { try? send(point, false) }
+        if let point {
+            do { try send(point, false); releaseConfirmed = true } catch { releaseConfirmed = false }
+        }
         point = nil
     }
 }
@@ -64,6 +67,10 @@ final class USBTouchSession {
 
     static func display(_ client: USBRemoteXPC, identifier: String) throws -> (Int, Int) {
         let answer = try client.request(command("com.apple.coredevice.feature.getdisplayinfo", identifier: identifier))
+        return try displayDimensions(answer)
+    }
+
+    static func displayDimensions(_ answer: [String: Any]) throws -> (Int, Int) {
         guard answer["CoreDevice.error"] == nil,
               let output = answer["CoreDevice.output"] as? [String: Any],
               let displays = output["displays"] as? [[String: Any]],
@@ -72,10 +79,16 @@ final class USBTouchSession {
               primary["currentOrientation"] as? String == "rot0",
               primary["nativeOrientation"] as? String == "rot0",
               output["backlightState"] as? String == "activeOn",
-              let mode = primary["currentMode"] as? [String: Any], let size = mode["size"] as? [Int],
-              size.count == 2, size[0] > 0, size[1] > size[0] else {
+              let mode = primary["currentMode"] as? [String: Any], let rawSize = mode["size"] as? [NSNumber],
+              rawSize.count == 2 else {
             throw AXDTX.Failure("USB touch requires an active portrait primary display")
         }
+        let values = rawSize.map(\.doubleValue)
+        guard values.allSatisfy({ $0.isFinite && $0 > 0 && $0 <= 8192 && $0.rounded() == $0 }),
+              values[1] > values[0] else {
+            throw AXDTX.Failure("Invalid USB display dimensions")
+        }
+        let size = values.map { Int($0) }
         return (size[0], size[1])
     }
 
@@ -126,6 +139,12 @@ final class USBTouchSession {
         if let point = contact.point { try contact.move(point) }
     }
     func cancel() { contact.cancel(); downSince = nil }
+    func finish() throws {
+        if let point = contact.point { try contact.up(point) }
+        guard contact.releaseConfirmed else { throw AXDTX.Failure("USB contact release unconfirmed") }
+        downSince = nil
+        try sender.ping()
+    }
     func execute(_ operation: String, points: [USBTouchPoint], duration: Double) throws {
         for point in points { try point.validate() }
         guard duration.isFinite, (0...60).contains(duration) else { throw AXDTX.Failure("Invalid USB gesture duration") }

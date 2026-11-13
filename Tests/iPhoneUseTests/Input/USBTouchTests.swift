@@ -2,6 +2,79 @@ import XCTest
 @testable import iPhoneUse
 
 final class USBTouchTests: XCTestCase {
+    private func displayAnswer(size: [NSNumber] = [NSNumber(value: UInt64(1170)), NSNumber(value: UInt64(2532))],
+                               orientation: String = "rot0", backlight: String = "activeOn") -> [String: Any] {
+        ["CoreDevice.output": ["backlightState": backlight, "displays": [
+            ["primary": true, "external": false, "currentOrientation": orientation,
+             "nativeOrientation": "rot0", "currentMode": ["size": size]]]]]
+    }
+    func testUnsignedXPCDisplayDimensionsAreAccepted() throws {
+        let dimensions = try USBTouchSession.displayDimensions(displayAnswer())
+        XCTAssertEqual(dimensions.0, 1170); XCTAssertEqual(dimensions.1, 2532)
+    }
+    func testDisplayDimensionsRejectInvalidNumbersAndUnsafeDisplayState() {
+        for size: [NSNumber] in [[0, 2532], [1170, 1170], [2532, 1170], [1170, 9000],
+                                 [NSNumber(value: UInt64.max), 2532], [1170.5, 2532],
+                                 [NSNumber(value: Double.nan), 2532], [1170]] {
+            XCTAssertThrowsError(try USBTouchSession.displayDimensions(displayAnswer(size: size)))
+        }
+        XCTAssertThrowsError(try USBTouchSession.displayDimensions(displayAnswer(orientation: "rot90")))
+        XCTAssertThrowsError(try USBTouchSession.displayDimensions(displayAnswer(backlight: "off")))
+    }
+    func testSelectionDeniesBothTransportsUntilReleaseAndInvalidatesOldBLELease() {
+        var selection = InputBackendSelection()
+        let oldBLE = selection.generation
+        XCTAssertTrue(selection.permits(.ble, generation: oldBLE))
+        let usb = selection.begin(.usb)
+        XCTAssertFalse(selection.permits(.ble)); XCTAssertFalse(selection.permits(.usb))
+        selection.finish(usb, released: true)
+        XCTAssertTrue(selection.permits(.usb, generation: usb))
+        let ble = selection.begin(.ble)
+        selection.finish(usb, released: true)
+        XCTAssertFalse(selection.permits(.ble)); XCTAssertTrue(selection.transitioning)
+        selection.finish(ble, released: true)
+        XCTAssertTrue(selection.permits(.ble, generation: ble))
+        XCTAssertFalse(selection.permits(.ble, generation: oldBLE))
+    }
+    func testUnconfirmedReleaseFailsClosedAndRequiresAnotherExplicitSelection() {
+        var selection = InputBackendSelection()
+        let token = selection.begin(.usb)
+        selection.finish(token, released: false)
+        XCTAssertFalse(selection.permits(.usb)); XCTAssertFalse(selection.permits(.ble))
+        XCTAssertNotNil(selection.failure)
+        let retry = selection.begin(.usb)
+        XCTAssertFalse(selection.permits(.usb))
+        selection.finish(retry, released: true)
+        XCTAssertTrue(selection.permits(.usb))
+    }
+    func testWheelBackpressureDropsBacklogAndOldCompletionCannotClearNewGesture() throws {
+        let gate = USBWheelGate()
+        let first = try XCTUnwrap(gate.begin())
+        for _ in 0..<1000 { XCTAssertNil(gate.begin()) }
+        gate.cancel(); XCTAssertFalse(gate.isCurrent(first))
+        let second = try XCTUnwrap(gate.begin())
+        gate.finish(first); XCTAssertNil(gate.begin())
+        gate.finish(second); XCTAssertNotNil(gate.begin())
+    }
+    func testFailedReleaseIsNotReportedAsConfirmed() throws {
+        let contact = USBTouchContact { _, down in if !down { throw AXDTX.Failure("synthetic release failure") } }
+        try contact.down(.init(x: 0.5, y: 0.5))
+        contact.cancel(); XCTAssertFalse(contact.releaseConfirmed)
+        contact.cancel(); XCTAssertFalse(contact.releaseConfirmed)
+    }
+    func testBLEBackendRetirementReleasesAndRejectsStaleInput() throws {
+        var reports: [(ReportID, [UInt8])] = []
+        let input = DeviceInput(host: UUID(), session: UUID(), sleep: { _ in },
+                                reportSender: { reports.append(($0, $1)) })
+        input.press(x: 0.5, y: 0.5)
+        XCTAssertTrue(input.releaseForBackendSwitch())
+        XCTAssertTrue(input.isRetired)
+        XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.map { $0.1[0] }, [0, 1, 0])
+        let count = reports.count
+        input.press(x: 0.2, y: 0.3)
+        XCTAssertThrowsError(try input.tap(x: 0.2, y: 0.3))
+        XCTAssertEqual(reports.count, count)
+    }
     func testWireReportMatchesVerifiedLayout() throws {
         let down = try USBTouchWire.report(x: 0.5, y: 1, touching: true, timestamp: 0x010203040506)
         let up = try USBTouchWire.report(x: 0.5, y: 1, touching: false, timestamp: 0x010203040506)

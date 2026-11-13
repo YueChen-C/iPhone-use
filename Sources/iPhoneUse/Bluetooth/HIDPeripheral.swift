@@ -398,6 +398,21 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
         }
     }
 
+    /// A local transport barrier, not proof of the phone UI state. Fail closed
+    /// if CoreBluetooth backpressure keeps an old-session release queued.
+    func waitForInputDrain(host: UUID, session: UUID?, timeout: TimeInterval = 1) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        repeat {
+            let empty = queue.sync {
+                self.drain()
+                return !self.connections.pending.contains { $0.host == host && $0.session == session && $0.channel.isInput }
+            }
+            if empty { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        return false
+    }
+
     // MARK: GATT database
 
     private static func sig(_ short: String) -> CBUUID {

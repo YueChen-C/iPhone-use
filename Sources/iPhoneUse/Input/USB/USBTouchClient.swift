@@ -12,6 +12,8 @@ final class USBTouchClient {
     private var replies: [String: [String: Any]] = [:]
     private var failure: String?
     private var closed = false
+    private var released = false
+    private var exited = false
     private let process = Process()
     private let input = Pipe()
     private let output = Pipe()
@@ -37,7 +39,13 @@ final class USBTouchClient {
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
             self?.receive(handle.availableData)
         }
-        process.terminationHandler = { [weak self] _ in self?.fail("USB worker exited; prepare again to reconnect") }
+        process.terminationHandler = { [weak self] _ in
+            guard let self else { return }
+            self.condition.lock()
+            self.exited = true
+            if !self.closed { self.failure = self.failure ?? "USB worker exited; prepare again to reconnect" }
+            self.condition.broadcast(); self.condition.unlock()
+        }
         do { try process.run() } catch {
             output.fileHandleForReading.readabilityHandler = nil; throw error
         }
@@ -55,7 +63,11 @@ final class USBTouchClient {
     }
     private func receive(_ bytes: Data) {
         condition.lock(); defer { condition.unlock() }
-        if bytes.isEmpty { if !closed { failure = failure ?? "USB worker disconnected" }; condition.broadcast(); return }
+        if bytes.isEmpty {
+            output.fileHandleForReading.readabilityHandler = nil
+            if !closed { failure = failure ?? "USB worker disconnected" }
+            condition.broadcast(); return
+        }
         pending.append(bytes)
         guard pending.count <= 256 * 1024 else { failure = "USB worker output exceeds limit"; condition.broadcast(); return }
         while let newline = pending.firstIndex(of: 10) {
@@ -68,6 +80,8 @@ final class USBTouchClient {
                     failure = "USB worker identity mismatch"; condition.broadcast(); return
                 }
                 ready = object
+            } else if object["event"] as? String == "released" {
+                released = true
             } else if let id = object["id"] as? String {
                 replies[id] = object
             } else if object["event"] as? String == "failed" { failure = object["error"] as? String ?? "USB worker failed" }
@@ -109,7 +123,17 @@ final class USBTouchClient {
                 if child.isRunning { kill(child.processIdentifier, SIGKILL) }
             }
         }
-        output.fileHandleForReading.readabilityHandler = nil
     }
-    deinit { close() }
+    /// A process being killed is not proof of contact release. Keep the next
+    /// transport gated unless the worker confirmed release/PING and then exited.
+    func closeAndWait() -> Bool {
+        close()
+        condition.lock(); defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(4)
+        while !(released && exited) {
+            if !condition.wait(until: deadline) { break }
+        }
+        return released && exited
+    }
+    deinit { close(); output.fileHandleForReading.readabilityHandler = nil }
 }

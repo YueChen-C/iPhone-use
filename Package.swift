@@ -11,7 +11,7 @@ let package = Package(
         .executableTarget(
             name: "iPhoneUse",
             path: "Sources/iPhoneUse",
-            resources: [.copy("Resources/AppIcon.icns"), .copy("Input/USB/UPSTREAM_LICENSE.txt")],
+            resources: [.copy("Resources/AppIcon.icns")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(

@@ -198,7 +198,10 @@ enum Application {
         }
 
         DeviceRegistry.shared.start()
-        HIDPeripheral.shared.start(initialDisplayState: HIDPeripheral.onlineDisplayState())
+        // Allows USB-only operation without registering any CoreBluetooth manager.
+        if ProcessInfo.processInfo.environment["IPHONE_USE_DISABLE_BLUETOOTH"] != "1" {
+            HIDPeripheral.shared.start(initialDisplayState: HIDPeripheral.onlineDisplayState())
+        }
         let powerObservers = installPowerObservers()
         ScreenCaptureManager.shared.start()
         let server = HTTPServer(port: port, handler: ControlAPI.handle)
