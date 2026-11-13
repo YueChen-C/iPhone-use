@@ -51,12 +51,12 @@ final class USBTouchSession {
     let surface: UInt64
     let width: Int
     let height: Int
-    private let control: USBRemoteXPC
-    private let sender: USBRemoteXPC
-    private let identifier: String
+    private let readDisplay: () throws -> (Int, Int)
+    private let ping: () throws -> Void
+    private let now: () -> TimeInterval
     private var contact: USBTouchContact!
-    private var lastDisplayCheck = Date.distantPast
-    private var downSince: Date?
+    private var lastDisplayCheck: TimeInterval = -.infinity
+    private var downSince: TimeInterval?
     var interrupted: () -> Bool = { false }
 
     static func command(_ feature: String, identifier: String) -> [String: USBXPCValue] {
@@ -106,36 +106,54 @@ final class USBTouchSession {
         return number.uint64Value
     }
 
-    init(physicalID: String, control: USBRemoteXPC, discovery: USBRemoteXPC,
+    convenience init(physicalID: String, control: USBRemoteXPC, discovery: USBRemoteXPC,
          sender: USBRemoteXPC, identifier: String) throws {
-        self.physicalID = physicalID; self.control = control; self.sender = sender; self.identifier = identifier
-        (width, height) = try Self.display(control, identifier: identifier)
-        surface = try Self.touchscreen(discovery.request([
+        let dimensions = try Self.display(control, identifier: identifier)
+        let surface = try Self.touchscreen(discovery.request([
             "featureIdentifier": .text("com.apple.coredevice.feature.remote.universalhidservice"),
             "messageType": .text("Request"), "payload": .dictionary(["connectedServices": .dictionary([:])])]))
         // Never query connectedServices on the report-sending connection.
         let target = surface
-        contact = USBTouchContact { point, touching in
+        self.init(physicalID: physicalID, dimensions: dimensions, surface: surface,
+                  readDisplay: { try Self.display(control, identifier: identifier) },
+                  ping: { try sender.ping() }, send: { point, touching in
             let bytes = try USBTouchWire.report(x: point.x, y: point.y, touching: touching,
                                                 timestamp: DispatchTime.now().uptimeNanoseconds)
             try sender.send(["featureIdentifier": .text("com.apple.coredevice.feature.remote.universalhidservice"),
                 "messageType": .text("Request"), "payload": .dictionary([
                     "send": .dictionary(["_0": .data(bytes), "_1": .uint(target)])])])
-        }
+        })
         Thread.sleep(forTimeInterval: 0.4)
+    }
+    /// Transport injection for focused lifecycle tests; production supplies the
+    /// same native sockets above. No alternate runtime/helper input path.
+    init(physicalID: String, dimensions: (Int, Int), surface: UInt64,
+         readDisplay: @escaping () throws -> (Int, Int), ping: @escaping () throws -> Void,
+         send: @escaping (USBTouchPoint, Bool) throws -> Void,
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.physicalID = physicalID; (width, height) = dimensions; self.surface = surface
+        self.readDisplay = readDisplay; self.ping = ping; self.now = now
+        contact = USBTouchContact(send: send)
     }
     deinit { contact?.cancel() }
 
     func checkDisplay() throws {
-        let size = try Self.display(control, identifier: identifier)
-        guard size == (width, height) else { throw AXDTX.Failure("USB display changed; reprepare required") }
-        lastDisplayCheck = Date()
+        do {
+            let size = try readDisplay()
+            guard size == (width, height) else { throw AXDTX.Failure("USB display changed; reprepare required") }
+            lastDisplayCheck = now()
+        } catch { cancel(); throw error }
     }
-    func tick() throws {
-        if Date().timeIntervalSince(lastDisplayCheck) > 0.5 { try checkDisplay() }
-        if let start = downSince, Date().timeIntervalSince(start) > 60 {
+    private func validateHeldContact() throws {
+        // Commands can arrive faster than the worker's poll timeout, so the
+        // idle tick is not a safety boundary for a continuously held drag.
+        if now() - lastDisplayCheck >= 0.5 { try checkDisplay() }
+        if let start = downSince, now() - start > 60 {
             cancel(); throw AXDTX.Failure("USB held contact deadline exceeded")
         }
+    }
+    func tick() throws {
+        try validateHeldContact()
         if let point = contact.point { try contact.move(point) }
     }
     func cancel() { contact.cancel(); downSince = nil }
@@ -143,7 +161,7 @@ final class USBTouchSession {
         if let point = contact.point { try contact.up(point) }
         guard contact.releaseConfirmed else { throw AXDTX.Failure("USB contact release unconfirmed") }
         downSince = nil
-        try sender.ping()
+        try ping()
     }
     func execute(_ operation: String, points: [USBTouchPoint], duration: Double) throws {
         for point in points { try point.validate() }
@@ -151,20 +169,20 @@ final class USBTouchSession {
         switch operation {
         case "down":
             guard points.count == 1 else { throw AXDTX.Failure("Expected one USB point") }
-            try checkDisplay(); try contact.down(points[0]); downSince = Date()
+            try checkDisplay(); try contact.down(points[0]); downSince = now()
         case "move":
             guard points.count == 1 else { throw AXDTX.Failure("Expected one USB point") }
-            try contact.move(points[0])
+            try validateHeldContact(); try contact.move(points[0])
         case "up":
             guard points.count == 1 else { throw AXDTX.Failure("Expected one USB point") }
-            try contact.up(points[0]); downSince = nil; try sender.ping()
-        case "cancel": cancel(); try sender.ping()
+            try validateHeldContact(); try contact.up(points[0]); downSince = nil; try ping()
+        case "cancel": cancel(); try ping()
         case "tap", "swipe":
             guard operation == "tap" ? points.count == 1 : (2...2048).contains(points.count),
                   operation != "swipe" || duration > 0 else { throw AXDTX.Failure("Invalid USB gesture path") }
             try checkDisplay()
             defer { cancel() }
-            try contact.down(points[0]); downSince = Date()
+            try contact.down(points[0]); downSince = now()
             let steps = max(4, Int(ceil(duration / 0.02)))
             for index in 1...steps {
                 guard !interrupted() else { throw AXDTX.Failure("USB gesture cancelled; replayAllowed=false") }
@@ -175,10 +193,10 @@ final class USBTouchSession {
                 let point = USBTouchPoint(x: points[segment].x + (points[next].x - points[segment].x) * fraction,
                                           y: points[segment].y + (points[next].y - points[segment].y) * fraction)
                 Thread.sleep(forTimeInterval: max(0.02, duration / Double(steps)))
-                if Date().timeIntervalSince(lastDisplayCheck) > 0.5 { try checkDisplay() }
+                try validateHeldContact()
                 try contact.move(point)
             }
-            try contact.up(points.last!); downSince = nil; try sender.ping()
+            try contact.up(points.last!); downSince = nil; try ping()
         default: throw AXDTX.Failure("Unsupported USB touch operation")
         }
     }

@@ -2,6 +2,43 @@ import XCTest
 @testable import iPhoneUse
 
 final class USBTouchTests: XCTestCase {
+    func testContinuousDragRechecksDisplayWithoutIdleTickAndReleasesLastSafePoint() throws {
+        var time = 0.0, rotated = false, checks = 0
+        var reports: [(USBTouchPoint, Bool)] = []
+        let session = USBTouchSession(physicalID: "fixture", dimensions: (1170, 2532), surface: 99,
+            readDisplay: { checks += 1; if rotated { throw AXDTX.Failure("fixture landscape") }; return (1170, 2532) },
+            ping: {}, send: { reports.append(($0, $1)) }, now: { time })
+        let first = USBTouchPoint(x: 0.2, y: 0.4), last = USBTouchPoint(x: 0.2, y: 0.5)
+        try session.execute("down", points: [first], duration: 0)
+        for index in 1...100 { time = Double(index) / 1000; try session.execute("move", points: [last], duration: 0) }
+        XCTAssertEqual(checks, 1) // No per-move RPC while cached validation is fresh.
+        rotated = true; time = 0.51
+        XCTAssertThrowsError(try session.execute("move", points: [.init(x: 0.8, y: 0.8)], duration: 0))
+        XCTAssertEqual(checks, 2); XCTAssertEqual(reports.last?.0, last); XCTAssertEqual(reports.last?.1, false)
+        XCTAssertFalse(reports.contains { $0.0 == USBTouchPoint(x: 0.8, y: 0.8) })
+        try session.finish()
+    }
+    func testContinuousDragEnforcesMonotonicHeldDeadlineWithoutIdleTick() throws {
+        var time = 0.0, sent: [Bool] = []
+        let session = USBTouchSession(physicalID: "fixture", dimensions: (1170, 2532), surface: 99,
+            readDisplay: { (1170, 2532) }, ping: {}, send: { _, down in sent.append(down) }, now: { time })
+        let point = USBTouchPoint(x: 0.3, y: 0.5)
+        try session.execute("down", points: [point], duration: 0)
+        time = 61
+        XCTAssertThrowsError(try session.execute("move", points: [point], duration: 0))
+        XCTAssertEqual(sent, [true, false]); try session.finish()
+    }
+    func testDisplaySizeChangeOnUpStillReleasesPreviousPoint() throws {
+        var dimensions = (1170, 2532), time = 0.0
+        var reports: [(USBTouchPoint, Bool)] = []
+        let session = USBTouchSession(physicalID: "fixture", dimensions: dimensions, surface: 99,
+            readDisplay: { dimensions }, ping: {}, send: { reports.append(($0, $1)) }, now: { time })
+        let point = USBTouchPoint(x: 0.2, y: 0.3)
+        try session.execute("down", points: [point], duration: 0)
+        dimensions = (2532, 1170); time = 0.6
+        XCTAssertThrowsError(try session.execute("up", points: [.init(x: 0.9, y: 0.9)], duration: 0))
+        XCTAssertEqual(reports.map(\.0), [point, point]); XCTAssertEqual(reports.map(\.1), [true, false])
+    }
     private func displayAnswer(size: [NSNumber] = [NSNumber(value: UInt64(1170)), NSNumber(value: UInt64(2532))],
                                orientation: String = "rot0", backlight: String = "activeOn") -> [String: Any] {
         ["CoreDevice.output": ["backlightState": backlight, "displays": [
