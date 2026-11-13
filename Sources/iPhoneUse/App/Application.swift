@@ -17,6 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var showAllItem: NSMenuItem?
     private var minimizeItem: NSMenuItem?
     private var bringToFrontItem: NSMenuItem?
+    private var ddiReviewItem: NSMenuItem?
+    private var ddiReviewWindow: DDIReviewWindowController?
     private var languageItems: [NSMenuItem] = []
     private var languageObserver: NSObjectProtocol?
     private var runModeObserver: NSObjectProtocol?
@@ -80,6 +82,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showAllDevices(_ sender: Any?) { windows.showAllDevices() }
 
+    @objc private func showDDIReview(_ sender: Any?) {
+        if ddiReviewWindow == nil {
+            ddiReviewWindow = DDIReviewWindowController(language: AppLanguageStore.shared.language)
+        }
+        ddiReviewWindow?.showWindow(nil)
+        ddiReviewWindow?.window?.makeKeyAndOrderFront(nil)
+    }
+
     @objc private func toggleQuietBackgroundMode(_ sender: NSMenuItem) {
         let next: AppRunMode = AppRunModeStore.shared.mode == .residentQuiet ? .desktop : .residentQuiet
         AppRunModeStore.shared.set(next)
@@ -120,6 +130,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quietMode.toolTip = StringsUI.current.quietBackgroundModeHelp
         appMenu.addItem(quietMode)
         quietModeItem = quietMode
+        let review = NSMenuItem(title: StringsDDIReview.current.title, action: #selector(showDDIReview(_:)), keyEquivalent: "")
+        review.target = self
+        appMenu.addItem(review)
+        ddiReviewItem = review
         appMenu.addItem(.separator())
 
         let quit = NSMenuItem(
@@ -160,6 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let table = StringsUI.current
         quietModeItem?.title = table.quietBackgroundMode
         quietModeItem?.toolTip = table.quietBackgroundModeHelp
+        ddiReviewItem?.title = StringsDDIReview.current.title
         quitItem?.title = table.quitApp
         windowMenu?.title = table.windowMenu
         windowItem?.title = table.windowMenu

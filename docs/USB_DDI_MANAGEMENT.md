@@ -4,6 +4,31 @@ DDI lifecycle management is separate from touch. Neither input preparation nor
 HTTP/MCP touch requests invoke this CLI. The app does not download, redistribute,
 or bundle Apple images, run Python, or invoke a third-party mounting tool.
 
+## Desktop plan and review
+
+The local **iPhone Use → DDI Plan & Review (Experimental)** menu opens a native
+window for an exact full USB UDID, read-only inspection, candidate/baseline bundle
+and receipt pickers, a new transaction directory, and opening an existing journal.
+Creating a plan invokes the same application's `ddi plan` entry in an isolated
+child. Hashing and staging stay off the AppKit/video thread. It shows the complete
+JSON review including current/candidate/baseline versions, sources, digests,
+device/OS identity, plan hash and phase. Local output is private and bounded.
+
+The window has **no mount/restore action** and its request type can construct only
+`inspect`, `plan` or `status`. Copyable status/apply/restore commands quote local
+paths and are text only, not shell execution or a mount authorization. Both
+mutation templates are commented out so pasting the copied text cannot apply and
+restore as an accidental batch; explicitly select/uncomment only the intended
+operation after reviewing the plan. Close all
+input owners cleanly, review the exact plan and source-risk warning, then use the
+offline CLI below. The running GUI's lifetime lease is never bypassed. Existing
+transactions can be opened even without input preparation; failed/pending phases
+are not automatically retried. If an interrupted transaction's global pending
+barrier blocks a fresh GUI start, use local `ddi status` / explicit `ddi restore`
+instead; the review window never bypasses that startup barrier. This is a plan/review integration, not accepted
+whole hardware recovery or authenticated source policy. Interactive window
+validation still requires an unlocked desktop.
+
 ## Available read-only commands
 
 Run the app's executable directly; no running GUI is required:
@@ -152,7 +177,8 @@ a real `apply` was correctly refused while other app/MCP/AX processes were live,
 leaving its journal in preflight and mounted image unchanged. These results do
 **not** prove successful native hardware switch/recovery or crash-time touch
 release. Whole hardware restore, interrupted native-call acceptance, source
-policy and UI management integration remain unaccepted. Do not substitute the
+policy and interactive UI acceptance remain unaccepted. The plan/review-only
+window does not replace offline management or hardware acceptance. Do not substitute the
 historical experiment's constituent calls for this product-entry acceptance.
 Source rollback does not restore a phone's DDI or clear a recovery barrier.
 
