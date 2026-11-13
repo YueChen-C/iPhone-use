@@ -222,9 +222,22 @@ class MCPStdioTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=15,
             )
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertIn("16 tools", process.stdout)
+        self.assertIn("17 tools", process.stdout)
         # The checker's initialize fetches /config; tools/list reuses the value.
         self.assertEqual(self.server.events, [("GET", "/config")])
+
+    def test_backend_selection_posts_exact_route_without_input_or_replay(self):
+        results = self.exchange([
+            ("set_input_backend", {"backend": "usb", "device": "First", "observe": "none"}),
+            ("set_input_backend", {"backend": "ble", "device": "First", "observe": "none"}),
+        ])
+        self.assertTrue(all("isError" not in result for result in results))
+        self.assertEqual(self.server.events, [
+            ("GET", "/config"), ("GET", "/devices"),
+            ("POST", "/input/backend", {"backend": "usb", "device": "phone-1"}),
+            ("POST", "/input/backend", {"backend": "ble", "device": "phone-1"}),
+        ])
+        self.assertEqual(self.server.stability_events, [])
 
     def test_device_list_and_tap_preserve_routing_scaling_and_confirmation_image(self):
         listed, tapped = self.exchange([
@@ -611,7 +624,11 @@ class MCPStdioTests(unittest.TestCase):
         self.assertIn("控制真实 iPhone", replies[0]["result"]["instructions"])
         tools = replies[1]["result"]["tools"]
         # Tool and parameter names are the client contract and stay English.
-        self.assertEqual(len(tools), 16)
+        self.assertEqual(len(tools), 17)
+        backend = next(tool for tool in tools if tool["name"] == "set_input_backend")
+        self.assertEqual(backend["inputSchema"]["required"], ["backend"])
+        self.assertEqual(backend["inputSchema"]["properties"]["backend"]["enum"], ["ble", "usb"])
+        self.assertIn("不自动回退", backend["description"])
         home = next(tool for tool in tools if tool["name"] == "home")
         self.assertEqual(home["description"], "回到主屏幕。")
         error = replies[2]["result"]["content"][0]["text"]

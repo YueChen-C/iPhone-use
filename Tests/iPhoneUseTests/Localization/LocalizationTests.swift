@@ -139,7 +139,7 @@ final class LocalizationTests: XCTestCase {
         let enTools = MCPToolCatalog.tools(for: .en)
         let zhTools = MCPToolCatalog.tools(for: .zh)
         let required: Set<String> = [
-            "list_devices", "screenshot", "get_ax_tree", "ocr_screen", "tap_text", "move_pointer", "adjust_pointer", "click_pointer",
+            "list_devices", "set_input_backend", "screenshot", "get_ax_tree", "ocr_screen", "tap_text", "move_pointer", "adjust_pointer", "click_pointer",
             "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home", "act",
         ]
         func names(_ tools: [[String: Any]]) -> Set<String> {
@@ -166,6 +166,21 @@ final class LocalizationTests: XCTestCase {
                 as? [String: Any])
         XCTAssertEqual(dx["minimum"] as? Int, -32)
         XCTAssertEqual(dx["maximum"] as? Int, 32)
+
+        // Backend values are protocol tokens, not localized labels or an
+        // implicit USB default. Selecting a route is a mutating operation.
+        for tools in [enTools, zhTools] {
+            let backend = try XCTUnwrap(tools.first { $0["name"] as? String == "set_input_backend" })
+            let schema = try XCTUnwrap(backend["inputSchema"] as? [String: Any])
+            let properties = try XCTUnwrap(schema["properties"] as? [String: [String: Any]])
+            let selection = try XCTUnwrap(properties["backend"])
+            XCTAssertEqual(selection["type"] as? String, "string")
+            XCTAssertEqual(selection["enum"] as? [String], ["ble", "usb"])
+            XCTAssertNil(selection["default"])
+            XCTAssertEqual(schema["required"] as? [String], ["backend"])
+            XCTAssertNotNil(properties["device"])
+            XCTAssertEqual((backend["annotations"] as? [String: Bool])?["readOnlyHint"], false)
+        }
     }
 
     func testMCPServerServesToolsInTheConfiguredLanguage() throws {
