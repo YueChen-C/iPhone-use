@@ -81,6 +81,27 @@ candidate, iOS can apply it only to the current composition, leaving preceding t
 Commit/cancel the composition explicitly before replacing the whole field. This limitation was
 observed in Settings search; it is not treated as successful full-field replacement.
 
+### Window keyboard backpressure and native cancellation
+
+Window key-repeat now reserves whole events within a 32-stroke outstanding budget. An event
+waiting more than 0.5 seconds is discarded before sending, not replayed after a slow command.
+Focus/cancel/retirement invalidates queued tickets; a pointer down also invalidates queued keys.
+The explicit HTTP text batch retains its separate validated 512-stroke limit and is not silently
+truncated by the window-repeat limit.
+
+An identical blocked-transport fixture using the actual `USBDeviceInput` source accepted and
+dispatched 1001 events before this change. Afterward it accepted 32 and dispatched only the
+already-started first event after the queue expired. This is injected scheduling evidence, not
+hardware throughput. Twenty-three focused keyboard/shutdown/worker-lifetime checks passed.
+
+On the same supported phone, a 128-character HTTP input was explicitly cancelled by selecting
+BLE 1.5 seconds after starting. The input returned `uncertain; replayAllowed=false` about 24 ms
+after selection began; the old USB worker exited and BLE remained disconnected/disabled. A
+screenshot/OCR showed only the partial text, not the requested full 128 characters. Explicit USB
+reselection passed the existing release/exit gate and returned ready; subsequent desktop keys
+produced `Gu`. The second phone's before/after frames were byte-identical. No DDI or AssistiveTouch
+change occurred. This is not physical unplug, connected-BLE, or packet-level release acceptance.
+
 ## Unsupported-device fallback
 
 Runtime `80908a47314a6626e2459e95dca32d339b3251ed` was deployed after the owned

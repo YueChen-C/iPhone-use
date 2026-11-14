@@ -157,6 +157,7 @@ final class USBDeviceInput {
     private var gestureHeld = false
     private var synchronousGesture = false
     private let wheelGate = USBWheelGate()
+    private let keyboardGate = USBKeyboardGate()
     private var motionGeneration: UInt64 = 0
     private var screenValid: Bool {
         guard let screen else { return false }
@@ -209,6 +210,7 @@ final class USBDeviceInput {
     }
     func validateCapture() { if !screenValid { retire() } }
     private func fail(_ error: Error) {
+        keyboardGate.cancel()
         let old = lock.withLock { () -> USBTouchClient? in
             readiness = .failed; detail = "\(error)"; let old = client; client = nil; gestureHeld = false
             if let old { closingClients.append(old) }
@@ -270,8 +272,13 @@ final class USBDeviceInput {
     private func enqueueKeyboard(_ strokes: [USBKeyboardStroke]) -> Bool {
         guard isKeyboardReady else { return false }
         if strokes.isEmpty { return true }
+        guard let ticket = keyboardGate.begin(strokes: strokes.count) else { return false }
         let generation = lock.withLock { motionGeneration }
-        queue.async { [self] in try? performKeyboard(strokes, generation: generation) }
+        queue.async { [self] in
+            defer { keyboardGate.finish(ticket) }
+            guard keyboardGate.isCurrent(ticket) else { return }
+            try? performKeyboard(strokes, generation: generation)
+        }
         return true
     }
     private func performKeyboard(_ strokes: [USBKeyboardStroke], generation: UInt64) throws {
@@ -305,6 +312,7 @@ final class USBDeviceInput {
     }
     func down(_ point: USBTouchPoint) {
         wheelGate.cancel()
+        keyboardGate.cancel()
         let generation = lock.withLock { () -> UInt64 in
             gestureHeld = true; pendingMotion = nil; motionScheduled = nil
             return motionGeneration
@@ -337,6 +345,7 @@ final class USBDeviceInput {
     }
     func cancel() {
         wheelGate.cancel()
+        keyboardGate.cancel()
         let (generation, active) = lock.withLock { () -> (UInt64, USBTouchClient?) in
             gestureHeld = false; pendingMotion = nil; motionScheduled = nil; motionGeneration &+= 1
             return (motionGeneration, synchronousGesture ? client : nil)
@@ -363,6 +372,7 @@ final class USBDeviceInput {
     }
     func retire() {
         wheelGate.cancel()
+        keyboardGate.cancel()
         let old = lock.withLock { () -> [USBTouchClient] in
             retired = true; readiness = .disconnected; gestureHeld = false; pendingMotion = nil; motionScheduled = nil
             return closingClients + (client.map { [$0] } ?? [])

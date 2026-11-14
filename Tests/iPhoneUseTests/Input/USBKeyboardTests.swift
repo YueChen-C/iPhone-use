@@ -2,6 +2,34 @@ import XCTest
 @testable import iPhoneUse
 
 final class USBKeyboardTests: XCTestCase {
+    func testWindowKeyboardBackpressureReservesWholeEventsAndBoundsRepeat() throws {
+        let gate = USBKeyboardGate()
+        XCTAssertNil(gate.begin(strokes: 0)); XCTAssertNil(gate.begin(strokes: -1))
+        XCTAssertNil(gate.begin(strokes: 33))
+        let first = try XCTUnwrap(gate.begin(strokes: 31))
+        XCTAssertNil(gate.begin(strokes: 2)) // Not a partial two-stroke event.
+        let last = try XCTUnwrap(gate.begin(strokes: 1))
+        for _ in 0..<10_000 { XCTAssertNil(gate.begin(strokes: 1)) }
+        gate.finish(first)
+        XCTAssertNotNil(gate.begin(strokes: 31)); XCTAssertNil(gate.begin(strokes: 1))
+        gate.finish(last); XCTAssertNotNil(gate.begin(strokes: 1))
+    }
+    func testWindowKeyboardExpiryUsesMonotonicClockBeforeDispatch() throws {
+        var time = 7.0
+        let gate = USBKeyboardGate(now: { time })
+        let ticket = try XCTUnwrap(gate.begin(strokes: 1))
+        time = 7.5; XCTAssertTrue(gate.isCurrent(ticket))
+        time = 7.501; XCTAssertFalse(gate.isCurrent(ticket))
+        gate.finish(ticket); XCTAssertNotNil(gate.begin(strokes: 32))
+    }
+    func testWindowKeyboardCancelInvalidatesOldTicketsWithoutFreeingNewOnes() throws {
+        let gate = USBKeyboardGate()
+        let old = try XCTUnwrap(gate.begin(strokes: 32))
+        gate.cancel(); XCTAssertFalse(gate.isCurrent(old))
+        let current = try XCTUnwrap(gate.begin(strokes: 32))
+        gate.finish(old); XCTAssertTrue(gate.isCurrent(current)); XCTAssertNil(gate.begin(strokes: 1))
+        gate.finish(current); gate.finish(current); XCTAssertNotNil(gate.begin(strokes: 32))
+    }
     func testReportIsBitmapNotBootKeyboardAndIncludesModifierUsages() throws {
         let report = try USBKeyboardReport.encode(code: 4, modifiers: 0x8A)
         XCTAssertEqual(report.count, 31)

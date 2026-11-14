@@ -88,3 +88,32 @@ enum USBKeyboardRequest {
         return USBKeyboardStroke(code: code, modifiers: mask)
     }
 }
+
+/// Window key-repeat must not build a delayed typing backlog behind HTTP text
+/// or a slow device. Reserve the whole event (never half a shortcut), bound the
+/// outstanding stroke cost, and discard stale events before the first report.
+final class USBKeyboardGate {
+    struct Ticket { fileprivate let id: UUID; fileprivate let deadline: TimeInterval }
+    static let maximumWindowStrokes = 32
+    private let lock = NSLock()
+    private let now: () -> TimeInterval
+    private var pending: [UUID: Int] = [:]
+    private var cost = 0
+
+    init(now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) { self.now = now }
+    func begin(strokes: Int) -> Ticket? {
+        lock.withLock {
+            guard strokes > 0, strokes <= Self.maximumWindowStrokes - cost else { return nil }
+            let ticket = Ticket(id: UUID(), deadline: now() + 0.5)
+            pending[ticket.id] = strokes; cost += strokes
+            return ticket
+        }
+    }
+    func isCurrent(_ ticket: Ticket) -> Bool {
+        lock.withLock { pending[ticket.id] != nil && now() <= ticket.deadline }
+    }
+    func finish(_ ticket: Ticket) {
+        lock.withLock { if let strokes = pending.removeValue(forKey: ticket.id) { cost -= strokes } }
+    }
+    func cancel() { lock.withLock { pending.removeAll(); cost = 0 } }
+}
