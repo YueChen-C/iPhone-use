@@ -101,6 +101,31 @@ Backspace produced `natie`. An unsupported emoji request returned HTTP 400 befor
 Bluetooth remained disabled, AssistiveTouch/DDI were unchanged, and the macOS clipboard
 was not written. Universal Clipboard and arbitrary Unicode input remain unaccepted.
 
+### Guard input-mode changes before editing
+
+USB text now preflights the entire edit and serializes observation, an optional single
+Ctrl-Space, and the eventual atomic text edit on the same device input queue. After a
+toggle it polls keyboard OCR at most eight times, checking session/capture/cancellation
+before and after each wait. Only positive target-mode evidence admits clear/type/submit.
+Unknown or wrong-mode observations return HTTP 409 `input_mode_unconfirmed` with
+`textDispatched=false` and `replayAllowed=false`; the keyboard mode may already have changed.
+No toggle cycling, partial-edit retry or Bluetooth fallback is performed. The session remains
+usable for explicit inspection and correction. Initial unknown OCR retains the existing raw
+keyboard behavior; neither this heuristic nor a transport acknowledgement guarantees text.
+
+MCP `keyboard_sequence` retains each text/options step as one `/type` transaction instead
+of sending its clear/commit shortcuts as earlier independent requests. This ensures USB
+preflight and input-mode checks also precede destructive shortcuts in sequences.
+
+On the Bluetooth-disabled phone, an ASCII request with `clear_before` and `submit` returned
+409 after the toggle; screenshots showed the previous `蓝牙` field and result list intact,
+with no new text or submission. The session stayed ready. A subsequent explicit native MCP
+text/options sequence produced `usb`; selecting full pinyin and issuing a new Chinese
+request produced `蓝牙`. The field was cleared and full pinyin restored afterward.
+Thirty-three focused Swift checks and four actual-native-MCP/mock-HTTP checks passed.
+These prove the observed refusal and tested paths, not authoritative IME identity, arbitrary
+Unicode, physical reconnect or connected-Bluetooth regression.
+
 ### Window keyboard backpressure and native cancellation
 
 Window key-repeat now reserves whole events within a 32-stroke outstanding budget. An event

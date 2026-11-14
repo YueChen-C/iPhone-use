@@ -249,14 +249,14 @@ final class USBDeviceInput {
         try queue.sync { try performKeyboard(strokes, generation: generation) }
     }
     func type(_ request: TypeTextRequest, ocr: () -> ScreenOCR.Result?) throws {
-        let strokes = try request.usbStrokes(ocr: ocr())
-        // Validate the complete batch before clear_before or clipboard writes.
-        if !strokes.isEmpty { try USBKeyboardRequest.validate(strokes) }
-        guard isKeyboardReady else { throw AXDTX.Failure("USB keyboard not ready; no Bluetooth fallback") }
-        for action in request.actions {
-            if case .clipboard(let text) = action { try TextEntry.writeClipboard(text) }
+        let generation = lock.withLock { motionGeneration }
+        try queue.sync {
+            try withKeyboardSession(generation: generation) { active in
+                try request.performUSB(ocr: ocr,
+                    checkCurrent: { try self.checkKeyboardSession(active, generation: generation) },
+                    send: { try self.sendKeyboard($0, on: active, generation: generation) })
+            }
         }
-        try keyboard(strokes)
     }
     func key(_ name: String, modifiers: [String]) throws {
         try keyboard([USBKeyboardRequest.key(name, modifiers: modifiers)])
@@ -282,6 +282,11 @@ final class USBDeviceInput {
         return true
     }
     private func performKeyboard(_ strokes: [USBKeyboardStroke], generation: UInt64) throws {
+        try withKeyboardSession(generation: generation) { active in
+            try sendKeyboard(strokes, on: active, generation: generation)
+        }
+    }
+    private func withKeyboardSession(generation: UInt64, perform: (USBTouchClient) throws -> Void) throws {
         let accepted = lock.withLock { () -> Bool in
             guard !retired, !gestureHeld, motionGeneration == generation else { return false }
             synchronousGesture = true; return true
@@ -290,6 +295,16 @@ final class USBDeviceInput {
         defer { lock.withLock { synchronousGesture = false } }
         let active = try current()
         guard active.supportsKeyboard else { throw AXDTX.Failure("USB keyboard surface unavailable") }
+        try perform(active)
+    }
+    private func checkKeyboardSession(_ active: USBTouchClient, generation: UInt64) throws {
+        guard lock.withLock({ !retired && !gestureHeld && motionGeneration == generation }),
+            try current() === active else {
+            throw AXDTX.Failure("USB keyboard busy or stale; replayAllowed=false")
+        }
+    }
+    private func sendKeyboard(_ strokes: [USBKeyboardStroke], on active: USBTouchClient, generation: UInt64) throws {
+        try checkKeyboardSession(active, generation: generation)
         do { try active.send("keyboard", strokes: strokes) } catch { fail(error); throw error }
     }
     func scroll(at point: USBTouchPoint, delta: Double) {

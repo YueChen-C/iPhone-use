@@ -114,12 +114,62 @@ struct TypeTextRequest {
         }
     }
 
-    /// One worker command owns the complete text edit, including shortcuts and
-    /// IME toggle. No other API/window gesture can interleave its individual keys.
+    struct USBInputModeUnconfirmed: Error, CustomStringConvertible {
+        var description: String {
+            "USB input mode unconfirmed after Ctrl-Space; text was not dispatched; inspect the keyboard before a new request; replayAllowed=false"
+        }
+    }
+
+    /// The caller owns the serial input queue across both observation and input.
+    /// A toggle changes keyboard state, not proof of mode: never clear/type/submit
+    /// until fresh OCR supports the requested mode. No cycling or input replay.
+    func performUSB(
+        ocr: () -> ScreenOCR.Result?,
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        checkCurrent: () throws -> Void = {},
+        clipboard: (String) throws -> Void = TextEntry.writeClipboard,
+        send: ([USBKeyboardStroke]) throws -> Void
+    ) throws {
+        try checkCurrent()
+        let edit = try usbStrokes(ocr: nil)
+        let toggle = try USBKeyboardRequest.key("space", modifiers: ["control"])
+        let needsSwitch = (ensureChineseIME || ensureASCIIIME) && needsUSBInputModeSwitch(ocr())
+        // Include toggle overhead in the existing 512-stroke preflight limit.
+        if needsSwitch { try USBKeyboardRequest.validate([toggle] + edit) }
+        for action in actions {
+            if case .clipboard(let text) = action { try checkCurrent(); try clipboard(text) }
+        }
+        if needsSwitch {
+            try checkCurrent()
+            try send([toggle])
+            var confirmed = false
+            for attempt in 0..<8 {
+                try checkCurrent()
+                sleep(attempt == 0 ? 0.25 : 0.1)
+                try checkCurrent()
+                if let result = ocr(),
+                    ensureChineseIME
+                        ? ChineseIMEHeuristic.isChinese(result)
+                        : ChineseIMEHeuristic.isEnglish(result) && !ChineseIMEHeuristic.isChinese(result) {
+                    confirmed = true; break
+                }
+            }
+            guard confirmed else { throw USBInputModeUnconfirmed() }
+        }
+        try checkCurrent()
+        if !edit.isEmpty { try send(edit) }
+    }
+
+    private func needsUSBInputModeSwitch(_ ocr: ScreenOCR.Result?) -> Bool {
+        (ensureChineseIME && ocr.map(ChineseIMEHeuristic.isEnglish) == true)
+            || (ensureASCIIIME && ocr.map(ChineseIMEHeuristic.isChinese) == true)
+    }
+
+    /// Build/validate a complete edit; USB dispatch separates any IME toggle
+    /// from this edit and observes its result before allowing destructive keys.
     func usbStrokes(ocr: ScreenOCR.Result?) throws -> [USBKeyboardStroke] {
         var strokes: [USBKeyboardStroke] = []
-        if (ensureChineseIME && ocr.map(ChineseIMEHeuristic.isEnglish) == true)
-            || (ensureASCIIIME && ocr.map(ChineseIMEHeuristic.isChinese) == true) {
+        if needsUSBInputModeSwitch(ocr) {
             strokes.append(try USBKeyboardRequest.key("space", modifiers: ["control"]))
         }
         for action in actions {

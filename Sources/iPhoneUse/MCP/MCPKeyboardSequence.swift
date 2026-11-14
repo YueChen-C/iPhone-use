@@ -67,8 +67,12 @@ enum MCPKeyboardSequence {
                 guard !text.isEmpty, textCount <= 256,
                     step["use_clipboard"] as? Bool == true || KeyboardMap.keyboardText(for: text) != nil
                 else { throw MCPServer.MCPError(table.kbAscii(label)) }
-                let request = try TypeTextRequest(step, language: language)
-                return request.actions.map { .request(MCPToolRequest(path: $0.path, body: $0.body)) }
+                _ = try TypeTextRequest(step, language: language)
+                // Preserve one validated text transaction. Splitting clear/commit
+                // shortcuts here would bypass USB's input-mode/preflight gate.
+                var body = step
+                body.removeValue(forKey: "type")
+                return [.request(MCPToolRequest(path: "/type", body: body))]
             }
             if let key = step["key"] as? String,
                 Set(step.keys).isSubset(of: ["type", "key", "modifiers"]),

@@ -431,14 +431,22 @@ class MCPStdioTests(unittest.TestCase):
         ]})])[0]
         self.assertNotIn("isError", result)
         self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
-            ("POST", "/key", {"key": "a", "modifiers": ["command"], "device": "phone-1"}),
-            ("POST", "/key", {"key": "backspace", "modifiers": [], "device": "phone-1"}),
-            ("POST", "/type", {"text": "nihao", "device": "phone-1"}),
-            ("POST", "/key", {"key": "space", "modifiers": [], "device": "phone-1"}),
-            ("POST", "/key", {"key": "enter", "modifiers": [], "device": "phone-1"}),
+            ("POST", "/type", {"text": "nihao", "device": "phone-1", "clear_before": True,
+                               "commit_ime": True, "press_enter": True}),
             ("POST", "/key", {"key": "tab", "modifiers": [], "device": "phone-1"}),
         ])
         self.assertEqual(sum(event[1].startswith("/screenshot") for event in self.server.events), 1)
+
+    def test_text_preflight_failure_in_sequence_never_sends_independent_clear_or_submit(self):
+        self.server.fail_actions = True
+        result = self.exchange([("keyboard_sequence", {"steps": [
+            {"text": "usb", "clear_before": True, "submit": True}, {"key": "enter"},
+        ]})])[0]
+        self.assertTrue(result["isError"])
+        self.assertIn("stopped at step 1/2", result["content"][0]["text"])
+        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+            ("POST", "/type", {"text": "usb", "device": "phone-1", "clear_before": True, "submit": True}),
+        ])
 
     def test_chinese_text_and_sequence_forward_ime_option(self):
         results = self.exchange([

@@ -122,6 +122,9 @@ enum ControlAPI {
                 }
                 return try perform(action, body: body, deviceQuery: deviceQuery)
             }
+        } catch let error as TypeTextRequest.USBInputModeUnconfirmed {
+            return .json(["error": error.description, "code": "input_mode_unconfirmed", "backend": "usb",
+                          "textDispatched": false, "replayAllowed": false], status: 409)
         } catch DeviceInput.InputError.pointerBusy {
             return .error("\(DeviceInput.InputError.pointerBusy)", status: 409)
         } catch {

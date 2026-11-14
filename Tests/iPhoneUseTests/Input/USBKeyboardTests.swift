@@ -153,4 +153,80 @@ final class USBKeyboardTests: XCTestCase {
         let clipboard = try TypeTextRequest(["text": "native", "use_clipboard": true])
         XCTAssertEqual(try clipboard.usbStrokes(ocr: ocr), try clipboard.usbStrokes(ocr: nil))
     }
+
+    private func keyboardOCR(_ text: String) -> ScreenOCR.Result {
+        .init(width: 100, height: 100, items: [.init(text: text, x: 50, y: 90)])
+    }
+    func testUSBToggleMustConfirmBeforeClearTextAndSubmit() throws {
+        let request = try TypeTextRequest(["text": "usb", "clear_before": true, "submit": true])
+        let chinese = keyboardOCR("拼")
+        var sent: [[USBKeyboardStroke]] = [], reads = 0, waits: [TimeInterval] = []
+        XCTAssertThrowsError(try request.performUSB(ocr: { reads += 1; return chinese },
+            sleep: { waits.append($0) }, send: { sent.append($0) })) { error in
+                XCTAssertTrue(error is TypeTextRequest.USBInputModeUnconfirmed)
+            }
+        XCTAssertEqual(sent, [[try USBKeyboardRequest.key("space", modifiers: ["control"])]])
+        XCTAssertEqual(reads, 9); XCTAssertEqual(waits.count, 8)
+        XCTAssertEqual(waits.reduce(0, +), 0.95, accuracy: 0.0001)
+    }
+    func testUSBConfirmedModeSendsOneAtomicEditAfterToggle() throws {
+        let request = try TypeTextRequest(["text": "usb", "clear_before": true, "submit": true])
+        let chinese = keyboardOCR("拼"), english = keyboardOCR("space")
+        var sent: [[USBKeyboardStroke]] = [], reads = 0
+        try request.performUSB(ocr: { reads += 1; return reads < 3 ? chinese : english },
+            sleep: { _ in }, send: { sent.append($0) })
+        XCTAssertEqual(reads, 3)
+        XCTAssertEqual(sent, [[try USBKeyboardRequest.key("space", modifiers: ["control"])],
+                              try request.usbStrokes(ocr: nil)])
+    }
+    func testUSBUnknownPostToggleModeNeverTypesOrRetriesToggle() throws {
+        let request = try TypeTextRequest(["text": "usb", "clear_before": true])
+        let chinese = keyboardOCR("拼")
+        var sent: [[USBKeyboardStroke]] = [], reads = 0
+        XCTAssertThrowsError(try request.performUSB(ocr: { reads += 1; return reads == 1 ? chinese : nil },
+            sleep: { _ in }, send: { sent.append($0) }))
+        XCTAssertEqual(sent, [[try USBKeyboardRequest.key("space", modifiers: ["control"])]])
+    }
+    func testUSBModeWaitCancellationCannotDispatchEdit() throws {
+        let request = try TypeTextRequest(["text": "usb", "clear_before": true])
+        let chinese = keyboardOCR("拼")
+        var cancelled = false, sent: [[USBKeyboardStroke]] = []
+        XCTAssertThrowsError(try request.performUSB(ocr: { chinese }, sleep: { _ in cancelled = true },
+            checkCurrent: { if cancelled { throw AXDTX.Failure("stale") } },
+            send: { sent.append($0) }))
+        XCTAssertEqual(sent, [[try USBKeyboardRequest.key("space", modifiers: ["control"])]])
+    }
+    func testUSBCompletePreflightPrecedesToggleOrClipboard() throws {
+        let oversized = try TypeTextRequest(["text": String(repeating: "a", count: 511), "clear_before": true])
+        XCTAssertThrowsError(try oversized.performUSB(ocr: { XCTFail("before OCR"); return nil },
+            sleep: { _ in XCTFail("before wait") }, clipboard: { _ in XCTFail("before clipboard") },
+            send: { _ in XCTFail("before input") }))
+        let chinese = keyboardOCR("拼")
+        let noRoomForToggle = try TypeTextRequest(["text": String(repeating: "a", count: 510), "clear_before": true])
+        XCTAssertThrowsError(try noRoomForToggle.performUSB(ocr: { chinese },
+            sleep: { _ in XCTFail("before wait") }, send: { _ in XCTFail("before input") }))
+        let clipboard = try TypeTextRequest(["text": "🙂", "clear_before": true, "use_clipboard": true])
+        XCTAssertThrowsError(try clipboard.performUSB(ocr: { XCTFail("clipboard needs no mode"); return nil },
+            clipboard: { _ in throw AXDTX.Failure("clipboard failed") }, send: { _ in XCTFail("before input") }))
+    }
+    func testUSBChineseModeConfirmationAndAlreadySelectedMode() throws {
+        let request = try TypeTextRequest(["text": "蓝牙"])
+        let english = keyboardOCR("space"), chinese = keyboardOCR("拼")
+        var sent: [[USBKeyboardStroke]] = [], reads = 0
+        try request.performUSB(ocr: { reads += 1; return reads == 1 ? english : chinese },
+            sleep: { _ in }, send: { sent.append($0) })
+        XCTAssertEqual(sent, [[try USBKeyboardRequest.key("space", modifiers: ["control"])],
+                              try request.usbStrokes(ocr: nil)])
+        sent.removeAll()
+        try request.performUSB(ocr: { chinese }, sleep: { _ in XCTFail("no wait") }, send: { sent.append($0) })
+        XCTAssertEqual(sent, [try request.usbStrokes(ocr: nil)])
+    }
+    func testUSBFailedToggleIsNotRetriedOrFollowedByEdit() throws {
+        let request = try TypeTextRequest(["text": "usb", "clear_before": true])
+        let chinese = keyboardOCR("拼")
+        var sends = 0
+        XCTAssertThrowsError(try request.performUSB(ocr: { chinese }, sleep: { _ in XCTFail("send failed") },
+            send: { _ in sends += 1; throw AXDTX.Failure("uncertain") }))
+        XCTAssertEqual(sends, 1)
+    }
 }
