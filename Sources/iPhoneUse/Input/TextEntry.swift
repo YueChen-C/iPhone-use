@@ -113,6 +113,92 @@ struct TypeTextRequest {
             }
         }
     }
+
+    struct USBInputModeUnconfirmed: Error, CustomStringConvertible {
+        enum Reason: String {
+            case observationUnavailable = "observation_unavailable"
+            case observationStale = "observation_stale"
+            case modeUnconfirmed = "mode_unconfirmed"
+        }
+        var reason: Reason = .modeUnconfirmed
+        var description: String {
+            "USB input mode or fresh screen observation unconfirmed (\(reason.rawValue)); text was not dispatched; inspect the keyboard before a new request; replayAllowed=false"
+        }
+    }
+
+    /// The caller owns the serial input queue across both observation and input.
+    /// A toggle changes keyboard state, not proof of mode: never clear/type/submit
+    /// until fresh OCR supports the requested mode. Receive times must belong to
+    /// the recognized frame and postdate the toggle ACK. No cycling or replay.
+    func performUSB(
+        ocr: () -> USBKeyboardObservation?,
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        checkCurrent: () throws -> Void = {},
+        clipboard: (String) throws -> Void = TextEntry.writeClipboard,
+        send: ([USBKeyboardStroke]) throws -> Void
+    ) throws {
+        try checkCurrent()
+        let edit = try usbStrokes(ocr: nil)
+        let toggle = try USBKeyboardRequest.key("space", modifiers: ["control"])
+        var observation: USBKeyboardObservation?
+        if ensureChineseIME || ensureASCIIIME {
+            guard let initial = ocr() else { throw USBInputModeUnconfirmed(reason: .observationUnavailable) }
+            guard initial.isFresh(at: now()) else { throw USBInputModeUnconfirmed(reason: .observationStale) }
+            observation = initial
+        }
+        let needsSwitch = needsUSBInputModeSwitch(observation?.result)
+        // Include toggle overhead in the existing 512-stroke preflight limit.
+        if needsSwitch { try USBKeyboardRequest.validate([toggle] + edit) }
+        for action in actions {
+            if case .clipboard(let text) = action { try checkCurrent(); try clipboard(text) }
+        }
+        if needsSwitch {
+            try checkCurrent()
+            try send([toggle])
+            let switchedAt = now()
+            var confirmed = false
+            for attempt in 0..<8 {
+                try checkCurrent()
+                sleep(attempt == 0 ? 0.25 : 0.1)
+                try checkCurrent()
+                if let fresh = ocr(), fresh.isFresh(at: now(), after: switchedAt),
+                    ensureChineseIME
+                        ? ChineseIMEHeuristic.isChinese(fresh.result)
+                        : ChineseIMEHeuristic.isEnglish(fresh.result) && !ChineseIMEHeuristic.isChinese(fresh.result) {
+                    observation = fresh
+                    confirmed = true; break
+                }
+            }
+            guard confirmed else { throw USBInputModeUnconfirmed() }
+        }
+        try checkCurrent()
+        if let observation, !observation.isFresh(at: now()) { throw USBInputModeUnconfirmed(reason: .observationStale) }
+        if !edit.isEmpty { try send(edit) }
+    }
+
+    private func needsUSBInputModeSwitch(_ ocr: ScreenOCR.Result?) -> Bool {
+        (ensureChineseIME && ocr.map(ChineseIMEHeuristic.isEnglish) == true)
+            || (ensureASCIIIME && ocr.map(ChineseIMEHeuristic.isChinese) == true)
+    }
+
+    /// Build/validate a complete edit; USB dispatch separates any IME toggle
+    /// from this edit and observes its result before allowing destructive keys.
+    func usbStrokes(ocr: ScreenOCR.Result?) throws -> [USBKeyboardStroke] {
+        var strokes: [USBKeyboardStroke] = []
+        if needsUSBInputModeSwitch(ocr) {
+            strokes.append(try USBKeyboardRequest.key("space", modifiers: ["control"]))
+        }
+        for action in actions {
+            switch action {
+            case .text(let text, _): strokes += try USBKeyboardRequest.text(text, convertHanzi: true)
+            case .clipboard: strokes.append(try USBKeyboardRequest.key("v", modifiers: ["command"]))
+            case .key(let name, let modifiers): strokes.append(try USBKeyboardRequest.key(name, modifiers: modifiers))
+            }
+        }
+        if !strokes.isEmpty { try USBKeyboardRequest.validate(strokes) }
+        return strokes
+    }
 }
 
 /// Best-effort keyboard-region heuristic, not a verified iOS input-mode API.
@@ -132,7 +218,7 @@ enum ChineseIMEHeuristic {
         guard result.height > 0 else { return false }
         let labels = result.items.filter { Double($0.y) / Double(result.height) > 0.65 }
             .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-        let chineseMarkers: Set<String> = ["空格", "选定", "拼音", "双拼", "双", "中", "中/英", "中英"]
+        let chineseMarkers: Set<String> = ["空格", "选定", "拼音", "拼", "双拼", "双", "中", "中/英", "中英"]
         return labels.contains(where: { chineseMarkers.contains($0) })
     }
 }

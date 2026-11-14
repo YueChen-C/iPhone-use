@@ -43,7 +43,7 @@ def check(command, live=False):
     if "tools" not in initialized.get("capabilities", {}):
         raise ValueError("Server did not advertise tools")
     tools = replies[1]["result"].get("tools", [])
-    required = {"list_devices", "screenshot", "move_pointer", "adjust_pointer", "click_pointer",
+    required = {"list_devices", "set_input_backend", "screenshot", "move_pointer", "adjust_pointer", "click_pointer",
                 "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home"}
     if not required.issubset({tool.get("name") for tool in tools}):
         raise ValueError("Server is missing iPhone Use tools")

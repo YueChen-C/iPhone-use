@@ -57,6 +57,13 @@ enum ControlAPI {
                 return status()
             case ("GET", "/devices"):
                 return deviceList()
+            case ("POST", "/input/backend"):
+                guard let raw = body["backend"] as? String, let backend = InputBackendKind(rawValue: raw) else {
+                    return .error("backend must be ble or usb")
+                }
+                let device = try DeviceRegistry.shared.find(deviceQuery)
+                USBInputController.shared.select(backend, device: device)
+                return .json(["ok": true, "device": device.id, "input": USBInputController.shared.status(device)])
             case ("GET", "/ax_tree"), ("POST", "/ax_tree"):
                 return AXTreeEndpoint.response(request,
                     resolve: { try DeviceRegistry.shared.find($0).id }, capture: axCapture)
@@ -115,6 +122,9 @@ enum ControlAPI {
                 }
                 return try perform(action, body: body, deviceQuery: deviceQuery)
             }
+        } catch let error as TypeTextRequest.USBInputModeUnconfirmed {
+            return .json(["error": error.description, "code": "input_mode_unconfirmed", "backend": "usb",
+                          "reason": error.reason.rawValue, "textDispatched": false, "replayAllowed": false], status: 409)
         } catch DeviceInput.InputError.pointerBusy {
             return .error("\(DeviceInput.InputError.pointerBusy)", status: 409)
         } catch {
@@ -150,6 +160,9 @@ enum ControlAPI {
                     $0.id == target.screen.id && $0.size != nil
                 }
                 guard controlPaths.contains(request.path) else { return frameReady }
+                if USBInputController.shared.selected(target.id) == .usb {
+                    return frameReady && USBInputController.shared.input(target)?.isReady == true
+                }
                 return frameReady && target.host != nil
                     && (try? DeviceRegistry.shared.input(for: target).isPointerReady) == true
             }
@@ -203,7 +216,8 @@ enum ControlAPI {
             return info
         }
         return .json([
-            "bluetooth": HIDPeripheral.shared.state,
+            "bluetooth": ProcessInfo.processInfo.environment["IPHONE_USE_DISABLE_BLUETOOTH"] == "1"
+                ? "disabled" : HIDPeripheral.shared.state,
             "bluetoothHosts": hosts,
             "capture": captureStatus(),
             "devices": DeviceRegistry.shared.status(),
@@ -301,6 +315,10 @@ enum ControlAPI {
 
     private static func tapTextPoint(_ id: String, _ x: Double, _ y: Double, _ hold: Double) throws {
         let device = try DeviceRegistry.shared.find(id)
+        if USBInputController.shared.selected(device.id) == .usb {
+            try usbInput(device).gesture("tap", points: [.init(x: x, y: y)], duration: hold)
+            return
+        }
         let input = try DeviceRegistry.shared.input(for: device)
         guard input.isPointerReady else {
             input.invalidatePointerEstimate(preservingBackgroundMotion: true)
@@ -314,6 +332,38 @@ enum ControlAPI {
         _ action: Action, body: [String: Any], deviceQuery: String?
     ) throws -> HTTPResponse {
         let device = try DeviceRegistry.shared.find(deviceQuery)
+        if USBInputController.shared.selected(device.id) == .usb {
+            let input = try usbInput(device)
+            guard input.isReady else { return .error("USB input not ready; no Bluetooth fallback", status: 503) }
+            switch action {
+            case .tap:
+                let (x, y) = try point(body, "x", "y", on: device)
+                try input.gesture("tap", points: [.init(x: x, y: y)], duration: (body["hold"] as? Double) ?? 0.08)
+            case .swipe:
+                let swipe = try SwipeRequest(body, screenSize: device.screen.size, screenName: device.screen.name)
+                try input.gesture("swipe", points: swipe.points.map { .init(x: $0.0, y: $0.1) }, duration: swipe.duration)
+            case .type, .key:
+                guard input.isKeyboardReady else {
+                    return .json(["error": "Keyboard unavailable on selected USB session; no Bluetooth fallback",
+                                  "code": "unsupported_capability", "backend": "usb"], status: 400)
+                }
+                if action == .type {
+                    let request = try TypeTextRequest(body, language: AppLanguageStore.shared.language)
+                    try input.type(request, ocr: {
+                        guard let frame = device.screen.snapshotObservation(png: false, maxEdge: 1600) else { return nil }
+                        return USBKeyboardObservation(result: ScreenOCR.recognize(frame.data, device: device.id),
+                                                      receivedAt: frame.receivedAt)
+                    })
+                } else {
+                    guard let key = body["key"] as? String else { return .error(StringsAPI.current.keyRequired) }
+                    try input.key(key, modifiers: (body["modifiers"] as? [String]) ?? [])
+                }
+            default:
+                return .json(["error": "Operation unsupported by selected USB touch backend",
+                              "code": "unsupported_capability", "backend": "usb"], status: 400)
+            }
+            return .json(["ok": true, "device": device.id, "backend": "usb", "uiVerified": false])
+        }
         // Reject unverified coordinates before cancellation so retrying clients
         // cannot repeatedly interrupt the calibration needed to serve them.
         // Ready gestures and keyboard/raw input still preempt background work.
@@ -367,6 +417,13 @@ enum ControlAPI {
     ) throws -> (Double, Double) {
         try RequestCoordinates.point(
             body, xKey, yKey, screenSize: device.screen.size, screenName: device.screen.name)
+    }
+
+    private static func usbInput(_ device: Device) throws -> USBDeviceInput {
+        guard let input = USBInputController.shared.input(device) else {
+            throw DeviceError("USB session unavailable; select USB explicitly to prepare")
+        }
+        return input
     }
 }
 

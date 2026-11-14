@@ -17,6 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var showAllItem: NSMenuItem?
     private var minimizeItem: NSMenuItem?
     private var bringToFrontItem: NSMenuItem?
+    private var ddiReviewItem: NSMenuItem?
+    private var ddiReviewWindow: DDIReviewWindowController?
     private var languageItems: [NSMenuItem] = []
     private var languageObserver: NSObjectProtocol?
     private var runModeObserver: NSObjectProtocol?
@@ -52,6 +54,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard USBInputController.shared.stop(waitTimeout: Application.inputShutdownWaitTimeout) else {
+            log("USB input shutdown incomplete: release/worker exit unconfirmed; quit cancelled, input remains gated")
+            return .terminateCancel
+        }
+        return .terminateNow
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         if let languageObserver { NotificationCenter.default.removeObserver(languageObserver) }
         languageObserver = nil
@@ -59,6 +69,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runModeObserver = nil
         QuietModeActivityController.shared.stop()
         windows.stop()
+        let inputReleased = USBInputController.shared.stop(waitTimeout: Application.inputShutdownWaitTimeout)
+        if !inputReleased { log("USB input shutdown incomplete: release/worker exit unconfirmed") }
         let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Application.shutdownWaitTimeout)
         if !stopResult.isClean {
             log(
@@ -69,6 +81,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showAllDevices(_ sender: Any?) { windows.showAllDevices() }
+
+    @objc private func showDDIReview(_ sender: Any?) {
+        if ddiReviewWindow == nil {
+            ddiReviewWindow = DDIReviewWindowController(language: AppLanguageStore.shared.language)
+        }
+        ddiReviewWindow?.showWindow(nil)
+        ddiReviewWindow?.window?.makeKeyAndOrderFront(nil)
+    }
 
     @objc private func toggleQuietBackgroundMode(_ sender: NSMenuItem) {
         let next: AppRunMode = AppRunModeStore.shared.mode == .residentQuiet ? .desktop : .residentQuiet
@@ -110,6 +130,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quietMode.toolTip = StringsUI.current.quietBackgroundModeHelp
         appMenu.addItem(quietMode)
         quietModeItem = quietMode
+        let review = NSMenuItem(title: StringsDDIReview.current.title, action: #selector(showDDIReview(_:)), keyEquivalent: "")
+        review.target = self
+        appMenu.addItem(review)
+        ddiReviewItem = review
         appMenu.addItem(.separator())
 
         let quit = NSMenuItem(
@@ -150,6 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let table = StringsUI.current
         quietModeItem?.title = table.quietBackgroundMode
         quietModeItem?.toolTip = table.quietBackgroundModeHelp
+        ddiReviewItem?.title = StringsDDIReview.current.title
         quitItem?.title = table.quitApp
         windowMenu?.title = table.windowMenu
         windowItem?.title = table.windowMenu
@@ -171,9 +196,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// MCP mode bypasses this path entirely and never starts AppKit or hardware.
 enum Application {
     static let shutdownWaitTimeout: TimeInterval = 3.0
+    static let inputShutdownWaitTimeout: TimeInterval = 4.0
 
-    static func terminationExitCode(for stopResult: ScreenCaptureStopResult) -> Int32 {
-        stopResult.isClean ? 0 : 1
+    static func terminationExitCode(for stopResult: ScreenCaptureStopResult, usbInputReleased: Bool = true) -> Int32 {
+        stopResult.isClean && usbInputReleased ? 0 : 1
     }
 
     static func run() {
@@ -191,8 +217,16 @@ enum Application {
         let appDelegate = AppDelegate()
         app.delegate = appDelegate
 
+        // Explicit launch-only selection; BLE remains the default otherwise.
+        if let device = ProcessInfo.processInfo.environment["IPHONE_USE_USB_DEVICE"], !device.isEmpty {
+            USBInputController.shared.selectAtLaunch(physicalID: device)
+        }
+
         DeviceRegistry.shared.start()
-        HIDPeripheral.shared.start(initialDisplayState: HIDPeripheral.onlineDisplayState())
+        // Allows USB-only operation without registering any CoreBluetooth manager.
+        if ProcessInfo.processInfo.environment["IPHONE_USE_DISABLE_BLUETOOTH"] != "1" {
+            HIDPeripheral.shared.start(initialDisplayState: HIDPeripheral.onlineDisplayState())
+        }
         let powerObservers = installPowerObservers()
         ScreenCaptureManager.shared.start()
         let server = HTTPServer(port: port, handler: ControlAPI.handle)
@@ -249,6 +283,10 @@ enum Application {
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler {
                 server.stop()
+                let inputReleased = USBInputController.shared.stop(waitTimeout: Self.inputShutdownWaitTimeout)
+                log(inputReleased
+                    ? "USB input shutdown confirmed: release/worker exit barrier passed"
+                    : "USB input shutdown incomplete: release/worker exit unconfirmed")
                 let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Self.shutdownWaitTimeout)
                 if !stopResult.isClean {
                     log(
@@ -256,7 +294,7 @@ enum Application {
                     )
                 }
                 HIDPeripheral.shared.stop()
-                exit(Self.terminationExitCode(for: stopResult))
+                exit(Self.terminationExitCode(for: stopResult, usbInputReleased: inputReleased))
             }
             source.resume()
             return source
