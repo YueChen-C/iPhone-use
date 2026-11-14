@@ -39,6 +39,32 @@ enum DDITransaction {
         let planSHA256: String
         var events: [Event]
         var phase: Phase { events.last!.phase }
+
+        func validate() throws {
+            guard !events.isEmpty, events.count <= 512,
+                  events[0].phase == .preflight, events[0].error == nil else {
+                throw DDIManagementError("DDI journal must begin with preflight and stay within its event limit")
+            }
+            for (previous, event) in zip(events, events.dropFirst()) {
+                // Failed operations append an error at the last persisted phase.
+                // Only explicit recovery may proceed from such an uncertain result.
+                if event.phase == previous.phase, event.phase != .preflight,
+                   let error = event.error, !error.isEmpty { continue }
+                if event.phase == .restoreAuthorized, event.error == nil { continue }
+                guard previous.error == nil, event.error == nil else {
+                    throw DDIManagementError("DDI journal cannot continue an uncertain operation without explicit recovery")
+                }
+                switch (previous.phase, event.phase) {
+                case (.preflight, .authorized), (.authorized, .unmounting),
+                     (.unmounting, .unmounted), (.unmounted, .mounting),
+                     (.mounting, .mounted), (.mounted, .independentlyVerified),
+                     (.restoreAuthorized, .restoreUnmounting), (.restoreUnmounting, .restoreUnmounted),
+                     (.restoreUnmounted, .restoring), (.restoring, .restoreMounted),
+                     (.restoreMounted, .restored): break
+                default: throw DDIManagementError("DDI journal contains an invalid phase transition; no replay or barrier cleanup")
+                }
+            }
+        }
     }
     struct Summary: Encodable {
         let transactionPath: String
@@ -167,10 +193,11 @@ enum DDITransaction {
         let plan = try JSONDecoder().decode(Plan.self, from: data)
         let journal = try store.read(Journal.self, name: "journal.json")
         try NativeDDIInspection.validateIdentity(plan.physicalID)
-        guard plan.schemaVersion == 1, journal.planSHA256 == hash, !journal.events.isEmpty,
-              journal.events.count <= 512, plan.sourcePolicy == sourcePolicy, plan.inputPolicy == inputPolicy else {
+        guard plan.schemaVersion == 1, journal.planSHA256 == hash,
+              plan.sourcePolicy == sourcePolicy, plan.inputPolicy == inputPolicy else {
             throw DDIManagementError("DDI transaction plan/journal does not match")
         }
+        try journal.validate()
         return (plan, hash, journal)
     }
     private static func snapshot(_ report: DDIBundlePreflight) throws -> Snapshot {

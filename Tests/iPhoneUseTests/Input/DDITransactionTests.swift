@@ -163,6 +163,54 @@ final class DDITransactionTests: XCTestCase {
         XCTAssertThrowsError(try execute(value.planSHA256, restore: true, clear: { _ in cleared = true }))
         XCTAssertFalse(cleared); XCTAssertEqual(try DDITransaction.status(directory: directory).journal.phase, .restoreMounted)
     }
+    func testRegressedJournalCannotReplayApplyOrAuthorizeRecoveryCleanup() throws {
+        let value = try plan()
+        let invalid: [[DDITransaction.Phase]] = [
+            [.preflight, .authorized, .unmounting, .preflight],
+            [.preflight, .restored],
+            [.authorized],
+            [.preflight, .authorized, .mounting]
+        ]
+        for phases in invalid {
+            do {
+                let store = try DDITransactionStore(root: directory, create: false)
+                try store.write(DDITransaction.Journal(planSHA256: value.planSHA256,
+                    events: phases.map { .init(phase: $0, time: Date(), error: nil) }), name: "journal.json")
+            }
+            let before = try Data(contentsOf: directory.appendingPathComponent("journal.json"))
+            device.calls = []; var marked = false, cleared = false
+            XCTAssertThrowsError(try DDITransaction.status(directory: directory))
+            for restore in [false, true] {
+                XCTAssertThrowsError(try execute(value.planSHA256, restore: restore,
+                    mark: { _ in marked = true }, clear: { _ in cleared = true }))
+            }
+            XCTAssertTrue(device.calls.isEmpty); XCTAssertFalse(marked); XCTAssertFalse(cleared)
+            XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("journal.json")), before)
+        }
+    }
+    func testJournalUncertainPhaseRequiresExplicitRecoveryRatherThanForwardProgress() throws {
+        func event(_ phase: DDITransaction.Phase, _ error: String? = nil) -> DDITransaction.Event {
+            .init(phase: phase, time: Date(), error: error)
+        }
+        let prefix = [event(.preflight), event(.authorized), event(.unmounting), event(.unmounting, "uncertain")]
+        XCTAssertNoThrow(try DDITransaction.Journal(planSHA256: "fixture", events: prefix).validate())
+        XCTAssertThrowsError(try DDITransaction.Journal(planSHA256: "fixture", events: prefix + [event(.unmounted)]).validate())
+        XCTAssertNoThrow(try DDITransaction.Journal(planSHA256: "fixture", events: prefix + [
+            event(.restoreAuthorized), event(.restoreUnmounting), event(.restoreUnmounted), event(.restoring),
+            event(.restoreMounted), event(.restored), event(.restored, "barrier sync failed")
+        ]).validate())
+        XCTAssertThrowsError(try DDITransaction.Journal(planSHA256: "fixture", events: [event(.preflight), event(.authorized, "invented")]).validate())
+        XCTAssertThrowsError(try DDITransaction.Journal(planSHA256: "fixture", events: [event(.preflight), event(.preflight, "invented")]).validate())
+    }
+    func testInterruptedRecoveryCanBeExplicitlyRestartedWithoutReplayingApply() throws {
+        let value = try plan(); device.failMount = true
+        XCTAssertThrowsError(try execute(value.planSHA256, restore: true))
+        XCTAssertEqual(try DDITransaction.status(directory: directory).journal.phase, .restoring)
+        device.failMount = false
+        XCTAssertEqual(try execute(value.planSHA256, restore: true).journal.phase, .restored)
+        let before = device.calls
+        XCTAssertThrowsError(try execute(value.planSHA256)); XCTAssertEqual(before, device.calls)
+    }
     func testRecoveryDoesNotNeedCorruptCandidateButDoesRequireBaseline() throws {
         let value = try plan(); _ = try execute(value.planSHA256)
         try FileManager.default.removeItem(at: directory.appendingPathComponent("candidate"))

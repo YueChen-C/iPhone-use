@@ -184,6 +184,14 @@ baseline; corrupted baseline bytes stop recovery before device mutation. A crash
 after verified restoration but before barrier removal can be finalized by the
 same explicit restore command without remounting.
 
+Before status, apply or restore can use a journal, its ordered events must begin
+with `preflight` and follow the apply/recovery transitions above. An error may
+repeat only the last persisted phase; forward progress after an uncertain error
+requires explicit `restoreAuthorized`. A regressed, skipped or reordered phase is
+refused before device inspection, pending-barrier writes or cleanup. This is
+structural consistency, not tamper authentication: a user able to rewrite the
+entire journal can still fabricate a valid history. Do not edit recovery records.
+
 `plan` has a 240-second process deadline and mutation has a 300-second deadline.
 All phases and errors remain local, not in the public PR. A single per-user
 offline barrier intentionally blocks all new app input, not just one device.
