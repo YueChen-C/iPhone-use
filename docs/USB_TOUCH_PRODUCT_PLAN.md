@@ -11,9 +11,12 @@
 OCR、AX、HTTP/MCP 工具和多窗口设备选择继续使用，不为 USB 触控重新设计屏幕采集。
 
 MVP 的 USB 能力为单指 tap、长按、swipe 和窗口按下/拖动/释放，均需逐项真机验收。
+键盘输入与鼠标同等重要：原生 USB 键盘 surface、文字输入、命名键和修饰键必须走同一个
+USB worker，不能因为触控可用就静默退回 BLE。
 USB 原生触屏不是鼠标：悬停不发送 contact，移动到按钮上不能意外点击。
-键盘、中文输入、Home、Power、相对鼠标 nudge **不因有 HID socket 就视为支持**；
-USB 模式明确禁用未实现操作并返回 unsupported，用户可主动切回 BLE。后续验证后才扩展。
+中文输入、Home、Power、相对鼠标 nudge **不因有 HID socket 就视为支持**；未发现键盘
+surface 时 USB 模式明确返回 unsupported，用户可主动切回 BLE。键盘 surface 已按原生
+Universal HID report 验证后接入；中文输入仍受设备当前 IME/候选词状态约束。
 
 兼容性按实测 host/DDI/iOS/机型登记；当前只有 MobileDevice1827.100.17.100.1/arm64、
 CoreDevice397.24、iPhone12/iOS26.5 与 DDI27B52/651.32 的实验结果。
@@ -160,9 +163,13 @@ DDI恢复与禁用USB回退均实际验证。若未验证机型/方向/能力则
 - M0/M1：已在原分支推送设计与策略契约，PR 保持 Draft。
 - M2：应用自身 `--usb-touch-worker`、原生 wire/broker、完整 USB UDID → CoreDevice UUID、
   动态触屏 surface、capture 物理身份与尺寸门禁已接入。私有 host ABI 仍只支持实测版本。
-- M3：HTTP `/input/backend`、tap/swipe、OCR/act 复用路由和 MCP 后端选择已接入。
-  在蓝牙管理器不启动、host 为空时，HTTP 点击实际打开设置；USB 键盘明确返回 unsupported。
+- M3：HTTP `/input/backend`、tap/swipe、`/type`、`/key`、OCR/act 复用路由和 MCP 后端选择已接入。
+  动态发现 `Keyboard` Universal HID surface（当前实测 service ID 512，不硬编码），使用
+  31-byte bitmap report（report ID 1、修饰键位图、release/all-keys-up）串行发送；蓝牙管理器
+  不启动时，HTTP 文字/命名键仍由 USB worker 执行，未发现 surface 才返回 unsupported。
 - M4：窗口后端选择、鼠标点击、按住拖动/释放、滚轮转 swipe 已接入且有真机前后画面。
+  窗口键盘事件、Command 编辑键和 paste 等价键也按 USB capability 门禁接入；IME 候选提交
+  不伪装成稳定的中文文本结果。
   悬停不发送触点。滚轮一次最多一个待执行/执行中手势，丢弃积压而非停止后继续重放。
 - 切换安全：先失效代际并阻止两条后端输入，取消旧队列，等待 USB release/PING + worker
   退出及 BLE 队列释放排空，再启用下一后端。释放无法确认则保持 failed，不绕过门禁。

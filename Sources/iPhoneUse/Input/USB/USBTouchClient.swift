@@ -41,6 +41,10 @@ final class USBTouchClient {
         return UUID(uuidString: text)
     }
     var error: String? { condition.lock(); defer { condition.unlock() }; return failure }
+    var supportsKeyboard: Bool {
+        condition.lock(); defer { condition.unlock() }
+        return !closed && failure == nil && ready?["keyboard"] as? Bool == true
+    }
 
     init(physicalID: String) throws {
         self.physicalID = physicalID
@@ -111,11 +115,13 @@ final class USBTouchClient {
             condition.broadcast()
         }
     }
-    func send(_ operation: String, points: [USBTouchPoint] = [], duration: Double = 0) throws {
-        try USBTouchRequest.validate(operation, points: points, duration: duration)
+    func send(_ operation: String, points: [USBTouchPoint] = [], duration: Double = 0,
+              strokes: [USBKeyboardStroke]? = nil) throws {
+        try USBTouchRequest.validate(operation, points: points, duration: duration, strokes: strokes)
+        if operation == "keyboard", !supportsKeyboard { throw AXDTX.Failure("USB keyboard surface unavailable") }
         try commandLock.withLock {
             let id = UUID()
-            let command = USBTouchWorkerCommand(id: id, operation: operation, points: points, duration: duration)
+            let command = USBTouchWorkerCommand(id: id, operation: operation, points: points, duration: duration, strokes: strokes)
             let bytes = try JSONEncoder().encode(command) + Data([10])
             condition.lock()
             if closed || failure != nil { let message = failure ?? "USB session closed"; condition.unlock(); throw AXDTX.Failure(message) }
@@ -124,7 +130,7 @@ final class USBTouchClient {
             do { try input.fileHandleForWriting.write(contentsOf: bytes) }
             catch { fail("USB write failed; mayHaveExecuted=true; replayAllowed=false"); close(); throw error }
             condition.lock()
-            let deadline = Date().addingTimeInterval(duration + 8)
+            let deadline = Date().addingTimeInterval(duration + Double(strokes?.count ?? 0) * 0.1 + 8)
             while replies[id.uuidString] == nil && failure == nil && !closed {
                 if !condition.wait(until: deadline) { failure = "USB acknowledgement timed out; mayHaveExecuted=true; replayAllowed=false"; break }
             }

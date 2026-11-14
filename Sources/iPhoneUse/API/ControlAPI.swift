@@ -339,6 +339,20 @@ enum ControlAPI {
             case .swipe:
                 let swipe = try SwipeRequest(body, screenSize: device.screen.size, screenName: device.screen.name)
                 try input.gesture("swipe", points: swipe.points.map { .init(x: $0.0, y: $0.1) }, duration: swipe.duration)
+            case .type, .key:
+                guard input.isKeyboardReady else {
+                    return .json(["error": "Keyboard unavailable on selected USB session; no Bluetooth fallback",
+                                  "code": "unsupported_capability", "backend": "usb"], status: 400)
+                }
+                if action == .type {
+                    let request = try TypeTextRequest(body, language: AppLanguageStore.shared.language)
+                    try input.type(request, ocr: {
+                        device.screen.snapshot(png: false, maxEdge: 1600).map { ScreenOCR.recognize($0, device: device.id) }
+                    })
+                } else {
+                    guard let key = body["key"] as? String else { return .error(StringsAPI.current.keyRequired) }
+                    try input.key(key, modifiers: (body["modifiers"] as? [String]) ?? [])
+                }
             default:
                 return .json(["error": "Operation unsupported by selected USB touch backend",
                               "code": "unsupported_capability", "backend": "usb"], status: 400)

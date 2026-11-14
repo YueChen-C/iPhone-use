@@ -166,12 +166,15 @@ final class USBDeviceInput {
     var isReady: Bool {
         lock.withLock { !retired && readiness == .ready && client?.sessionID != nil } && screenValid
     }
+    var isKeyboardReady: Bool {
+        isReady && lock.withLock { client?.supportsKeyboard == true }
+    }
     var status: [String: Any] {
         let captureValid = screenValid
         return lock.withLock {
             let alive = captureValid && !retired && readiness == .ready && client?.sessionID != nil
             return ["backend": "usb", "state": !captureValid ? "identityUnverified" : (alive ? "ready" : (client?.error == nil ? readiness.rawValue : "failed")),
-                    "capabilities": alive ? ["tap", "swipe", "drag"] : [],
+                    "capabilities": alive ? ["tap", "swipe", "drag"] + (client?.supportsKeyboard == true ? ["text", "key"] : []) : [],
                     "requiresCalibration": false, "sessionCurrent": alive, "detail": client?.error ?? detail]
         }
     }
@@ -236,6 +239,51 @@ final class USBDeviceInput {
             defer { lock.withLock { synchronousGesture = false } }
             do { try current().send(operation, points: points, duration: duration) } catch { fail(error); throw error }
         }
+    }
+    func keyboard(_ strokes: [USBKeyboardStroke]) throws {
+        if strokes.isEmpty { return }
+        try USBKeyboardRequest.validate(strokes)
+        let generation = lock.withLock { motionGeneration }
+        try queue.sync { try performKeyboard(strokes, generation: generation) }
+    }
+    func type(_ request: TypeTextRequest, ocr: () -> ScreenOCR.Result?) throws {
+        let strokes = try request.usbStrokes(ocr: ocr())
+        // Validate the complete batch before clear_before or clipboard writes.
+        if !strokes.isEmpty { try USBKeyboardRequest.validate(strokes) }
+        guard isKeyboardReady else { throw AXDTX.Failure("USB keyboard not ready; no Bluetooth fallback") }
+        for action in request.actions {
+            if case .clipboard(let text) = action { try TextEntry.writeClipboard(text) }
+        }
+        try keyboard(strokes)
+    }
+    func key(_ name: String, modifiers: [String]) throws {
+        try keyboard([USBKeyboardRequest.key(name, modifiers: modifiers)])
+    }
+    func typeFromKeyboard(_ text: String, modifiers: [String]) -> Bool {
+        guard let strokes = try? USBKeyboardRequest.text(text, modifiers: modifiers) else { return false }
+        return enqueueKeyboard(strokes)
+    }
+    func keyFromKeyboard(_ name: String, modifiers: [String]) -> Bool {
+        guard let stroke = try? USBKeyboardRequest.key(name, modifiers: modifiers) else { return false }
+        return enqueueKeyboard([stroke])
+    }
+    private func enqueueKeyboard(_ strokes: [USBKeyboardStroke]) -> Bool {
+        guard isKeyboardReady else { return false }
+        if strokes.isEmpty { return true }
+        let generation = lock.withLock { motionGeneration }
+        queue.async { [self] in try? performKeyboard(strokes, generation: generation) }
+        return true
+    }
+    private func performKeyboard(_ strokes: [USBKeyboardStroke], generation: UInt64) throws {
+        let accepted = lock.withLock { () -> Bool in
+            guard !retired, !gestureHeld, motionGeneration == generation else { return false }
+            synchronousGesture = true; return true
+        }
+        guard accepted else { throw AXDTX.Failure("USB keyboard busy or stale; replayAllowed=false") }
+        defer { lock.withLock { synchronousGesture = false } }
+        let active = try current()
+        guard active.supportsKeyboard else { throw AXDTX.Failure("USB keyboard surface unavailable") }
+        do { try active.send("keyboard", strokes: strokes) } catch { fail(error); throw error }
     }
     func scroll(at point: USBTouchPoint, delta: Double) {
         guard delta.isFinite, abs(delta) > 0.0001, let token = wheelGate.begin() else { return }

@@ -53,6 +53,34 @@ replacement, DDI mutation or local unit-test rerun in this stage. Device-specifi
 commands, literal stdout/stderr, exit statuses, frame hashes and process/resource
 samples are retained in the local verification ledger, not the public PR.
 
+## Native USB keyboard acceptance — 2026-11-14
+
+The same arm64 Swift application was rebuilt with Bluetooth disabled and the target explicitly
+selected over USB. Read-only `universalhidservice` discovery returned a dynamic `Keyboard`
+surface (observed ID 512) whose public usage fields are zero; the implementation matches the
+original HID usage pair (page 1, usage 6) and refuses ambiguity. The exact CoreDevice keyboard
+report is a 31-byte report (ID 1, usage bitmap, modifier usages E0–E7, flags byte); no boot-keyboard
+8-byte report or Python/runtime helper is used.
+
+- HTTP `/type` entered `USB-input` in the iOS Settings search field; the following screenshot showed
+  the exact text. HTTP `/key` sent Backspace and the following screenshot showed the deletion.
+- HTTP `/key` sent Command-A and Enter; iOS showed the native selection/commit behavior. A later
+  `/type` request with Chinese `蓝牙` produced the exact Chinese result and the screenshot/OCR read
+  `蓝牙`; this records the observed IME state, not a universal candidate-selection guarantee.
+- MCP `type_text` and `press_key` reached the same `/type` and `/key` routes; the MCP response and
+  final screenshot/OCR were successful. The desktop window sent Cmd-A, Backspace, letters and
+  Backspace through the USB keyboard capability; no HTTP input was used for that check.
+- `/status` remained `bluetooth=disabled`, target USB `ready`, capabilities `tap/swipe/drag/text/key`,
+  and the other captured phone stayed on BLE with no input. Shutdown logged a confirmed USB
+  release/worker-exit barrier.
+
+This is acceptance of the tested iPhone 12 / iOS 26.5 / DDI 27B52 combination only. It does not
+claim every iOS IME, keyboard surface layout, rotation, reconnect, or alternate CoreDevice ABI.
+In particular, `clear_before` uses native Cmd-A/Backspace: with an uncommitted marked-text
+candidate, iOS can apply it only to the current composition, leaving preceding text intact.
+Commit/cancel the composition explicitly before replacing the whole field. This limitation was
+observed in Settings search; it is not treated as successful full-field replacement.
+
 ## Unsupported-device fallback
 
 Runtime `80908a47314a6626e2459e95dca32d339b3251ed` was deployed after the owned

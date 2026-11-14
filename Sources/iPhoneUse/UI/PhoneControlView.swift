@@ -39,7 +39,8 @@ final class PhoneControlView: NSView {
 
     private var canSendWindowInput: Bool {
         binding.acceptsEvents(isKeyWindow: window?.isKeyWindow == true)
-            && !usbSelected && connectionStatus == .connected && input?.isBluetoothReady == true
+            && connectionStatus == .connected
+            && (usbSelected ? usbInput?.isKeyboardReady == true : input?.isBluetoothReady == true)
     }
 
     /// Pointer input is not tied to key-window focus: the window under the
@@ -214,12 +215,14 @@ final class PhoneControlView: NSView {
 
     override func keyDown(with event: NSEvent) {
         preemptBackgroundPointerMotion()
-        guard canSendWindowInput, let input else { return }
+        guard canSendWindowInput else { return }
         switch ControlKeyboardEvent(event).command {
         case .key(let key, let modifiers):
-            _ = input.keyFromKeyboard(key, modifiers: modifiers)
+            let accepted = usbSelected ? usbInput?.keyFromKeyboard(key, modifiers: modifiers) : input?.keyFromKeyboard(key, modifiers: modifiers)
+            if accepted != true { NSSound.beep() }
         case .text(let text, let modifiers):
-            if !input.typeFromKeyboard(text, modifiers: modifiers) { NSSound.beep() }
+            let accepted = usbSelected ? usbInput?.typeFromKeyboard(text, modifiers: modifiers) : input?.typeFromKeyboard(text, modifiers: modifiers)
+            if accepted != true { NSSound.beep() }
         case nil:
             break
         }
@@ -230,10 +233,23 @@ final class PhoneControlView: NSView {
     // shortcut and can use Universal Clipboard when available.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard window?.isKeyWindow == true else { return super.performKeyEquivalent(with: event) }
+        // AppKit consumes edit menu equivalents before keyDown. Keep app/window
+        // shortcuts (Quit, Close, Hide...) local, but send USB editing to iOS.
+        if usbSelected, event.modifierFlags.contains(.command),
+           let name = event.charactersIgnoringModifiers?.lowercased(), ["a", "c", "x", "v", "z"].contains(name) {
+            guard canSendWindowInput else { return true }
+            switch ControlKeyboardEvent(event).command {
+            case .key(let key, let modifiers): _ = usbInput?.keyFromKeyboard(key, modifiers: modifiers)
+            case .text(let text, let modifiers): _ = usbInput?.typeFromKeyboard(text, modifiers: modifiers)
+            case nil: break
+            }
+            return true
+        }
         if ControlKeyboardEvent.isPasteShortcut(event) {
             preemptBackgroundPointerMotion()
-            guard canSendWindowInput, let input else { return true }
-            _ = input.keyFromKeyboard("v", modifiers: ["cmd"])
+            guard canSendWindowInput else { return true }
+            if usbSelected { _ = usbInput?.keyFromKeyboard("v", modifiers: ["cmd"]) }
+            else { _ = input?.keyFromKeyboard("v", modifiers: ["cmd"]) }
             return true
         }
         return super.performKeyEquivalent(with: event)

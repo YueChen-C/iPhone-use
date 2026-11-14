@@ -113,6 +113,25 @@ struct TypeTextRequest {
             }
         }
     }
+
+    /// One worker command owns the complete text edit, including shortcuts and
+    /// IME toggle. No other API/window gesture can interleave its individual keys.
+    func usbStrokes(ocr: ScreenOCR.Result?) throws -> [USBKeyboardStroke] {
+        var strokes: [USBKeyboardStroke] = []
+        if (ensureChineseIME && ocr.map(ChineseIMEHeuristic.isEnglish) == true)
+            || (ensureASCIIIME && ocr.map(ChineseIMEHeuristic.isChinese) == true) {
+            strokes.append(try USBKeyboardRequest.key("space", modifiers: ["control"]))
+        }
+        for action in actions {
+            switch action {
+            case .text(let text, _): strokes += try USBKeyboardRequest.text(text, convertHanzi: true)
+            case .clipboard: strokes.append(try USBKeyboardRequest.key("v", modifiers: ["command"]))
+            case .key(let name, let modifiers): strokes.append(try USBKeyboardRequest.key(name, modifiers: modifiers))
+            }
+        }
+        if !strokes.isEmpty { try USBKeyboardRequest.validate(strokes) }
+        return strokes
+    }
 }
 
 /// Best-effort keyboard-region heuristic, not a verified iOS input-mode API.

@@ -15,10 +15,16 @@ struct USBTouchPoint: Codable, Equatable {
 /// Pure request validation shared by admission, IPC and the worker. Reject bad
 /// caller parameters before they can retire an otherwise healthy USB session.
 enum USBTouchRequest {
-    static func validate(_ operation: String, points: [USBTouchPoint], duration: Double) throws {
+    static func validate(_ operation: String, points: [USBTouchPoint], duration: Double,
+                         strokes: [USBKeyboardStroke]? = nil) throws {
         guard duration.isFinite, (0...60).contains(duration) else {
             throw AXDTX.Failure("Invalid USB gesture duration")
         }
+        if operation == "keyboard" {
+            guard points.isEmpty, duration == 0, let strokes else { throw AXDTX.Failure("Invalid USB keyboard request") }
+            try USBKeyboardRequest.validate(strokes); return
+        }
+        guard strokes == nil else { throw AXDTX.Failure("Unexpected USB keyboard payload") }
         switch operation {
         case "down", "move", "up", "tap":
             guard points.count == 1 else { throw AXDTX.Failure("Expected one USB point") }
@@ -74,10 +80,12 @@ final class USBTouchSession {
     let surface: UInt64
     let width: Int
     let height: Int
+    let keyboardSurface: UInt64?
     private let readDisplay: () throws -> (Int, Int)
     private let ping: () throws -> Void
     private let now: () -> TimeInterval
     private var contact: USBTouchContact!
+    private var keyboard: USBKeyboardState?
     private var lastDisplayCheck: TimeInterval = -.infinity
     private var downSince: TimeInterval?
     var interrupted: () -> Bool = { false }
@@ -129,15 +137,36 @@ final class USBTouchSession {
         return number.uint64Value
     }
 
+    static func keyboardSurface(_ answer: [String: Any]) -> UInt64? {
+        let matches = (answer["connectedServices"] as? [[String: Any]] ?? []).filter { service in
+            guard service["DeviceTypeHint"] as? String == "Keyboard",
+                  let storage = service["_CoreDevice_codablePropertyStorage"] as? [String: Any],
+                  let virtual = storage["UniversalControlVirtualService"] as? [String: Any], virtual["bool"] as? Bool == true,
+                  let original = storage["_CoreDevice_originalUsages"] as? [String: Any],
+                  let usages = original["array"] as? [[String: Any]] else { return false }
+            // The observed public PrimaryUsage(Page) is 0, NOT 1/6.
+            return usages.contains { entry in
+                guard let pair = entry["dictionary"] as? [String: Any],
+                      let page = pair["DeviceUsagePage"] as? [String: Any],
+                      let usage = pair["DeviceUsage"] as? [String: Any] else { return false }
+                return (page["int"] as? NSNumber)?.intValue == 1 && (usage["int"] as? NSNumber)?.intValue == 6
+            }
+        }
+        guard matches.count == 1, let id = matches[0]["_ServiceID"] as? NSNumber, id.uint64Value > 0 else { return nil }
+        return id.uint64Value
+    }
+
     convenience init(physicalID: String, control: USBRemoteXPC, discovery: USBRemoteXPC,
          sender: USBRemoteXPC, identifier: String) throws {
         let dimensions = try Self.display(control, identifier: identifier)
-        let surface = try Self.touchscreen(discovery.request([
+        let surfaces = try discovery.request([
             "featureIdentifier": .text("com.apple.coredevice.feature.remote.universalhidservice"),
-            "messageType": .text("Request"), "payload": .dictionary(["connectedServices": .dictionary([:])])]))
+            "messageType": .text("Request"), "payload": .dictionary(["connectedServices": .dictionary([:])])])
+        let surface = try Self.touchscreen(surfaces)
+        let keyboardSurface = Self.keyboardSurface(surfaces)
         // Never query connectedServices on the report-sending connection.
         let target = surface
-        self.init(physicalID: physicalID, dimensions: dimensions, surface: surface,
+        self.init(physicalID: physicalID, dimensions: dimensions, surface: surface, keyboardSurface: keyboardSurface,
                   readDisplay: { try Self.display(control, identifier: identifier) },
                   ping: { try sender.ping() }, send: { point, touching in
             let bytes = try USBTouchWire.report(x: point.x, y: point.y, touching: touching,
@@ -145,20 +174,28 @@ final class USBTouchSession {
             try sender.send(["featureIdentifier": .text("com.apple.coredevice.feature.remote.universalhidservice"),
                 "messageType": .text("Request"), "payload": .dictionary([
                     "send": .dictionary(["_0": .data(bytes), "_1": .uint(target)])])])
+        }, sendKeyboard: { bytes in
+            guard let keyboardSurface else { throw AXDTX.Failure("USB keyboard surface unavailable") }
+            try sender.send(["featureIdentifier": .text("com.apple.coredevice.feature.remote.universalhidservice"),
+                "messageType": .text("Request"), "payload": .dictionary([
+                    "send": .dictionary(["_0": .data(bytes), "_1": .uint(keyboardSurface)])])])
         })
         Thread.sleep(forTimeInterval: 0.4)
     }
     /// Transport injection for focused lifecycle tests; production supplies the
     /// same native sockets above. No alternate runtime/helper input path.
-    init(physicalID: String, dimensions: (Int, Int), surface: UInt64,
+    init(physicalID: String, dimensions: (Int, Int), surface: UInt64, keyboardSurface: UInt64? = nil,
          readDisplay: @escaping () throws -> (Int, Int), ping: @escaping () throws -> Void,
          send: @escaping (USBTouchPoint, Bool) throws -> Void,
+         sendKeyboard: ((Data) throws -> Void)? = nil,
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.physicalID = physicalID; (width, height) = dimensions; self.surface = surface
         self.readDisplay = readDisplay; self.ping = ping; self.now = now
         contact = USBTouchContact(send: send)
+        self.keyboardSurface = keyboardSurface
+        if keyboardSurface != nil, let sendKeyboard { keyboard = USBKeyboardState(send: sendKeyboard) }
     }
-    deinit { contact?.cancel() }
+    deinit { contact?.cancel(); keyboard?.cancel() }
 
     func checkDisplay() throws {
         do {
@@ -179,16 +216,29 @@ final class USBTouchSession {
         try validateHeldContact()
         if let point = contact.point { try contact.move(point) }
     }
-    func cancel() { contact.cancel(); downSince = nil }
+    func cancel() { contact.cancel(); keyboard?.cancel(); downSince = nil }
     func finish() throws {
         if let point = contact.point { try contact.up(point) }
         guard contact.releaseConfirmed else { throw AXDTX.Failure("USB contact release unconfirmed") }
+        keyboard?.cancel()
+        guard keyboard?.releaseConfirmed != false else { throw AXDTX.Failure("USB keyboard release unconfirmed") }
         downSince = nil
         try ping()
     }
-    func execute(_ operation: String, points: [USBTouchPoint], duration: Double) throws {
-        try USBTouchRequest.validate(operation, points: points, duration: duration)
+    func execute(_ operation: String, points: [USBTouchPoint], duration: Double,
+                 strokes: [USBKeyboardStroke]? = nil) throws {
+        try USBTouchRequest.validate(operation, points: points, duration: duration, strokes: strokes)
+        guard keyboard?.releaseConfirmed != false else { throw AXDTX.Failure("USB keyboard release unconfirmed") }
         switch operation {
+        case "keyboard":
+            guard let keyboard, let strokes else { throw AXDTX.Failure("USB keyboard surface unavailable") }
+            guard contact.point == nil, contact.releaseConfirmed else { throw AXDTX.Failure("USB pointer busy or release unconfirmed") }
+            try checkDisplay()
+            for stroke in strokes {
+                try validateHeldContact()
+                try keyboard.press(stroke, interrupted: interrupted)
+            }
+            try ping()
         case "down":
             try checkDisplay(); try contact.down(points[0]); downSince = now()
         case "move":

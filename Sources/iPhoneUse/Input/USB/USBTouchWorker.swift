@@ -6,6 +6,7 @@ struct USBTouchWorkerCommand: Codable {
     let operation: String
     let points: [USBTouchPoint]
     let duration: Double
+    var strokes: [USBKeyboardStroke]? = nil
 }
 
 enum USBTouchWorker {
@@ -40,7 +41,8 @@ enum USBTouchWorker {
                     if (try? session.finish()) != nil { emit(["event": "released"]) }
                 }
                 emit(["event": "ready", "physicalID": physicalID, "width": session.width,
-                      "height": session.height, "surface": session.surface, "session": UUID().uuidString])
+                      "height": session.height, "surface": session.surface, "session": UUID().uuidString,
+                      "keyboard": session.keyboardSurface != nil])
                 var pending = Data()
                 while true {
                     var pollFD = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN | POLLHUP), revents: 0)
@@ -62,7 +64,7 @@ enum USBTouchWorker {
                             let line = Data(pending[..<newline]); pending.removeSubrange(...newline)
                             let command = try JSONDecoder().decode(USBTouchWorkerCommand.self, from: line)
                             do {
-                                try session.execute(command.operation, points: command.points, duration: command.duration)
+                                try session.execute(command.operation, points: command.points, duration: command.duration, strokes: command.strokes)
                                 emit(["event": "ack", "id": command.id.uuidString, "uiVerified": false])
                             } catch {
                                 session.cancel()

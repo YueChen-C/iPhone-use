@@ -51,7 +51,9 @@ enum KeyboardMap {
     /// Key commands supply their modifiers separately, so character lookup
     /// returns only the usage code and does not add an implicit Shift modifier.
     static func code(for name: String) -> UInt8? {
-        named[name.lowercased()] ?? stroke(for: Character(name))?.code
+        if let code = named[name.lowercased()] { return code }
+        guard name.count == 1, let character = name.first else { return nil }
+        return stroke(for: character)?.code
     }
 
     static func modifierBit(for name: String) -> UInt8? {
