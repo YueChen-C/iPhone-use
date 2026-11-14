@@ -81,6 +81,26 @@ candidate, iOS can apply it only to the current composition, leaving preceding t
 Commit/cancel the composition explicitly before replacing the whole field. This limitation was
 observed in Settings search; it is not treated as successful full-field replacement.
 
+### Compact pinyin indicator and editing checks
+
+The keyboard-region OCR heuristic now recognizes the exact compact `拼` label. The same
+real screenshot/OCR input previously produced no input-mode toggle; the modified native
+request builder emits Ctrl-Space before the atomic ASCII edit. Source rollback reproduced
+the missing-toggle result. Twenty-one focused text-request/USB-keyboard checks passed.
+
+This fixes detection, not input-mode selection: on the tested phone with several configured
+keyboards, one Ctrl-Space moved from full pinyin to nine-key pinyin, not English. The native
+request still acknowledged successfully while the text remained in composition. Callers must
+inspect the keyboard after switching; neither an acknowledgement nor OCR heuristics prove
+the requested input mode. No automatic retries or cycling were added.
+
+With English explicitly selected, USB `/type` entered `native`; Left, Shift-Left and
+Backspace produced `natie`. An unsupported emoji request returned HTTP 400 before
+`clear_before`, leaving `natie` visible. Returning to full pinyin, USB input produced exact
+`蓝牙`. Screenshots/OCR were reviewed after each check; the field was cleared afterward.
+Bluetooth remained disabled, AssistiveTouch/DDI were unchanged, and the macOS clipboard
+was not written. Universal Clipboard and arbitrary Unicode input remain unaccepted.
+
 ### Window keyboard backpressure and native cancellation
 
 Window key-repeat now reserves whole events within a 32-stroke outstanding budget. An event

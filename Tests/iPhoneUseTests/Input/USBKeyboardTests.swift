@@ -138,4 +138,19 @@ final class USBKeyboardTests: XCTestCase {
         XCTAssertEqual(try clipboard.usbStrokes(ocr: nil), [.init(code: 0x19, modifiers: 8)])
         XCTAssertFalse(try USBKeyboardRequest.text("你好", convertHanzi: true).isEmpty)
     }
+    func testCompactPinyinMarkerTogglesBeforeAtomicASCIIEdit() throws {
+        let marker = ScreenOCR.Item(text: "拼", x: 521, y: 1433)
+        let ocr = ScreenOCR.Result(width: 740, height: 1600, items: [marker])
+        let request = try TypeTextRequest(["text": "native", "clear_before": true])
+        let expected = [try USBKeyboardRequest.key("space", modifiers: ["control"])]
+            + (try request.usbStrokes(ocr: nil))
+        XCTAssertEqual(try request.usbStrokes(ocr: ocr), expected)
+
+        // App text and hidden/unknown keyboards are not input-mode evidence.
+        let outside = ScreenOCR.Result(width: 740, height: 1600,
+            items: [.init(text: "拼", x: 521, y: 100)])
+        XCTAssertEqual(try request.usbStrokes(ocr: outside), try request.usbStrokes(ocr: nil))
+        let clipboard = try TypeTextRequest(["text": "native", "use_clipboard": true])
+        XCTAssertEqual(try clipboard.usbStrokes(ocr: ocr), try clipboard.usbStrokes(ocr: nil))
+    }
 }

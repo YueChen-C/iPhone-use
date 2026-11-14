@@ -614,6 +614,8 @@ final class TypeTextRequestTests: XCTestCase {
         XCTAssertFalse(ChineseIMEHeuristic.isEnglish(result(["q", "w", "e", "完成"])))
         XCTAssertFalse(ChineseIMEHeuristic.isEnglish(result([])))
         XCTAssertTrue(ChineseIMEHeuristic.isChinese(result(["123", "双", "英", "搜索"])))
+        XCTAssertTrue(ChineseIMEHeuristic.isChinese(result(["123", "拼"])))
+        XCTAssertFalse(ChineseIMEHeuristic.isChinese(result(["拼写", "拼音输入法"])))
         XCTAssertTrue(ChineseIMEHeuristic.isChinese(result(["123", "空格", "换行"])))
         XCTAssertTrue(ChineseIMEHeuristic.isChinese(result(["选定"])))
         XCTAssertFalse(ChineseIMEHeuristic.isChinese(result(["q", "w", "e", "搜索"])))

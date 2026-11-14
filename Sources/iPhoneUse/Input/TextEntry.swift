@@ -151,7 +151,7 @@ enum ChineseIMEHeuristic {
         guard result.height > 0 else { return false }
         let labels = result.items.filter { Double($0.y) / Double(result.height) > 0.65 }
             .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-        let chineseMarkers: Set<String> = ["空格", "选定", "拼音", "双拼", "双", "中", "中/英", "中英"]
+        let chineseMarkers: Set<String> = ["空格", "选定", "拼音", "拼", "双拼", "双", "中", "中/英", "中英"]
         return labels.contains(where: { chineseMarkers.contains($0) })
     }
 }
