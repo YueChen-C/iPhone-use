@@ -171,7 +171,8 @@ USB 拔插后若某条采集流一直没有首帧，程序会对该空流自动�
   不要升级 iOS 或替换主机框架来绕过版本检查。实测时 AssistiveTouch 开启，关闭后的
   行为尚未验收。
 - USB 只支持单点点击、按住拖动/释放、长按、滑动和滚轮转滑动；悬停不发送触点。
-  键盘、Home、电源、音量、粘贴等能力不支持，选择 USB 后不会暗中借用蓝牙执行。
+  动态发现键盘 surface 后支持窗口按键、HTTP `/type`/`/key` 及 MCP 文字/命名键；
+  Home、电源、音量等未支持能力会明确拒绝，不会暗中借用蓝牙执行。
 - 按完整物理设备身份和画面尺寸绑定，不按设备列表顺序或视频源名猜手机。画面身份
   未确认、方向/尺寸/亮屏状态不符时拒绝输入；持续拖动也会定期检查，并有 60 秒期限。
 
@@ -203,6 +204,21 @@ MCP 使用 `set_input_backend({"device":"FULL_USB_UDID","backend":"usb"})`；先
 ```sh
 IPHONE_USE_DISABLE_BLUETOOTH=1 IPHONE_USE_USB_DEVICE=FULL_USB_UDID .build/release/iphone-use
 ```
+
+### USB 文字输入与画面时效
+
+USB `/type` 在原生串行队列内校验整次文字和选项，再检查带有单调接收时间的同一帧 OCR。
+文字需要输入法观察时，缺帧、未来时间或超过 2 秒的画面会在清空/输入/提交前返回
+HTTP 409 `input_mode_unconfirmed`；OCR 花费的时间也计入画面年龄，不以识别完成时间刷新。
+`reason` 区分 `observation_unavailable`、`observation_stale` 和 `mode_unconfirmed`。
+若观察到相反输入法，最多发送一次 Ctrl-Space，且只允许接收时间晚于切换 ACK 的新帧确认。
+失败不会自动切换更多输入法、重复文字或改走蓝牙；先重新截图检查，再决定新的请求。
+
+这是有界时效和键盘区域 OCR 启发式，不是系统输入法查询：新鲜但无法识别输入法的
+初始画面仍保留原始按键语义，不能保证 ASCII 原样上屏；中文转拼音依赖当前候选。
+`clear_before` 在未提交组合态中可能只清除当前组合，不保证全字段替换。窗口按键和 `/key`
+是显式原始按键，不执行上述自动输入法观察。粘贴发送原生 Command-V；通用剪贴板是否
+同步、Mac 输入法及任意 Unicode 均未完成 USB 真机验收，不能视为 USB 文本传输保证。
 
 ### DDI 计划、审阅与恢复边界
 

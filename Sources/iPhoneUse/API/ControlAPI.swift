@@ -124,7 +124,7 @@ enum ControlAPI {
             }
         } catch let error as TypeTextRequest.USBInputModeUnconfirmed {
             return .json(["error": error.description, "code": "input_mode_unconfirmed", "backend": "usb",
-                          "textDispatched": false, "replayAllowed": false], status: 409)
+                          "reason": error.reason.rawValue, "textDispatched": false, "replayAllowed": false], status: 409)
         } catch DeviceInput.InputError.pointerBusy {
             return .error("\(DeviceInput.InputError.pointerBusy)", status: 409)
         } catch {
@@ -350,7 +350,9 @@ enum ControlAPI {
                 if action == .type {
                     let request = try TypeTextRequest(body, language: AppLanguageStore.shared.language)
                     try input.type(request, ocr: {
-                        device.screen.snapshot(png: false, maxEdge: 1600).map { ScreenOCR.recognize($0, device: device.id) }
+                        guard let frame = device.screen.snapshotObservation(png: false, maxEdge: 1600) else { return nil }
+                        return USBKeyboardObservation(result: ScreenOCR.recognize(frame.data, device: device.id),
+                                                      receivedAt: frame.receivedAt)
                     })
                 } else {
                     guard let key = body["key"] as? String else { return .error(StringsAPI.current.keyRequired) }

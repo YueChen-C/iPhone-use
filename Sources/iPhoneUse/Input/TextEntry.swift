@@ -115,17 +115,25 @@ struct TypeTextRequest {
     }
 
     struct USBInputModeUnconfirmed: Error, CustomStringConvertible {
+        enum Reason: String {
+            case observationUnavailable = "observation_unavailable"
+            case observationStale = "observation_stale"
+            case modeUnconfirmed = "mode_unconfirmed"
+        }
+        var reason: Reason = .modeUnconfirmed
         var description: String {
-            "USB input mode unconfirmed after Ctrl-Space; text was not dispatched; inspect the keyboard before a new request; replayAllowed=false"
+            "USB input mode or fresh screen observation unconfirmed (\(reason.rawValue)); text was not dispatched; inspect the keyboard before a new request; replayAllowed=false"
         }
     }
 
     /// The caller owns the serial input queue across both observation and input.
     /// A toggle changes keyboard state, not proof of mode: never clear/type/submit
-    /// until fresh OCR supports the requested mode. No cycling or input replay.
+    /// until fresh OCR supports the requested mode. Receive times must belong to
+    /// the recognized frame and postdate the toggle ACK. No cycling or replay.
     func performUSB(
-        ocr: () -> ScreenOCR.Result?,
+        ocr: () -> USBKeyboardObservation?,
         sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         checkCurrent: () throws -> Void = {},
         clipboard: (String) throws -> Void = TextEntry.writeClipboard,
         send: ([USBKeyboardStroke]) throws -> Void
@@ -133,7 +141,13 @@ struct TypeTextRequest {
         try checkCurrent()
         let edit = try usbStrokes(ocr: nil)
         let toggle = try USBKeyboardRequest.key("space", modifiers: ["control"])
-        let needsSwitch = (ensureChineseIME || ensureASCIIIME) && needsUSBInputModeSwitch(ocr())
+        var observation: USBKeyboardObservation?
+        if ensureChineseIME || ensureASCIIIME {
+            guard let initial = ocr() else { throw USBInputModeUnconfirmed(reason: .observationUnavailable) }
+            guard initial.isFresh(at: now()) else { throw USBInputModeUnconfirmed(reason: .observationStale) }
+            observation = initial
+        }
+        let needsSwitch = needsUSBInputModeSwitch(observation?.result)
         // Include toggle overhead in the existing 512-stroke preflight limit.
         if needsSwitch { try USBKeyboardRequest.validate([toggle] + edit) }
         for action in actions {
@@ -142,21 +156,24 @@ struct TypeTextRequest {
         if needsSwitch {
             try checkCurrent()
             try send([toggle])
+            let switchedAt = now()
             var confirmed = false
             for attempt in 0..<8 {
                 try checkCurrent()
                 sleep(attempt == 0 ? 0.25 : 0.1)
                 try checkCurrent()
-                if let result = ocr(),
+                if let fresh = ocr(), fresh.isFresh(at: now(), after: switchedAt),
                     ensureChineseIME
-                        ? ChineseIMEHeuristic.isChinese(result)
-                        : ChineseIMEHeuristic.isEnglish(result) && !ChineseIMEHeuristic.isChinese(result) {
+                        ? ChineseIMEHeuristic.isChinese(fresh.result)
+                        : ChineseIMEHeuristic.isEnglish(fresh.result) && !ChineseIMEHeuristic.isChinese(fresh.result) {
+                    observation = fresh
                     confirmed = true; break
                 }
             }
             guard confirmed else { throw USBInputModeUnconfirmed() }
         }
         try checkCurrent()
+        if let observation, !observation.isFresh(at: now()) { throw USBInputModeUnconfirmed(reason: .observationStale) }
         if !edit.isEmpty { try send(edit) }
     }
 

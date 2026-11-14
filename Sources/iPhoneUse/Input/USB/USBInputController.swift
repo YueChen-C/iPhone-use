@@ -248,7 +248,7 @@ final class USBDeviceInput {
         let generation = lock.withLock { motionGeneration }
         try queue.sync { try performKeyboard(strokes, generation: generation) }
     }
-    func type(_ request: TypeTextRequest, ocr: () -> ScreenOCR.Result?) throws {
+    func type(_ request: TypeTextRequest, ocr: () -> USBKeyboardObservation?) throws {
         let generation = lock.withLock { motionGeneration }
         try queue.sync {
             try withKeyboardSession(generation: generation) { active in

@@ -1,5 +1,18 @@
 import Foundation
 
+/// OCR and the monotonic receive time belong to the same retained capture frame.
+/// Content hashes cannot establish freshness: a paused stream can repeat pixels.
+struct USBKeyboardObservation {
+    let result: ScreenOCR.Result
+    let receivedAt: TimeInterval
+
+    func isFresh(at now: TimeInterval, after boundary: TimeInterval? = nil) -> Bool {
+        guard now.isFinite, receivedAt.isFinite, receivedAt >= 0,
+              now >= receivedAt, now - receivedAt <= 2 else { return false }
+        return boundary.map { $0.isFinite && receivedAt > $0 } ?? true
+    }
+}
+
 struct USBKeyboardStroke: Codable, Equatable {
     let code: UInt8
     let modifiers: UInt8

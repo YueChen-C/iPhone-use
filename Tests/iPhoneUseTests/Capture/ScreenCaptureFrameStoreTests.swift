@@ -46,6 +46,18 @@ final class ScreenCaptureFrameStoreTests: XCTestCase {
         XCTAssertNotNil(store.snapshot())
     }
 
+    func testEncodedObservationRetainsItsFramePixelsAndReceiveTime() throws {
+        let store = ScreenCaptureFrameStore()
+        store.publish(try buffer(width: 8, height: 6), receivedAt: 10)
+        let retained = try XCTUnwrap(store.snapshot())
+        store.publish(try buffer(width: 16, height: 12), receivedAt: 12)
+        let encoded = try XCTUnwrap(ScreenCaptureSource.snapshot(retained, png: true))
+        let decoded = ScreenOCR.recognize(encoded.data, recognition: { _ in [] })
+        XCTAssertEqual(decoded.width, 8); XCTAssertEqual(decoded.height, 6)
+        XCTAssertEqual(encoded.receivedAt, 10)
+        XCTAssertEqual(store.snapshot()?.receivedAt, 12)
+    }
+
     func testPublishReportsFirstFrameOnlyOnceAndFalseWhenStoppedOrInvalid() throws {
         let store = ScreenCaptureFrameStore()
         XCTAssertFalse(store.publish(try buffer(), receivedAt: -1))

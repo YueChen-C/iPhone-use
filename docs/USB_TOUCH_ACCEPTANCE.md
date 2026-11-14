@@ -147,6 +147,41 @@ reselection passed the existing release/exit gate and returned ready; subsequent
 produced `Gu`. The second phone's before/after frames were byte-identical. No DDI or AssistiveTouch
 change occurred. This is not physical unplug, connected-BLE, or packet-level release acceptance.
 
+## USB text observation freshness
+
+The USB `/type` mode gate now binds OCR to the receive time of the exact retained
+capture frame. Initial observations must be at most two monotonic seconds old,
+including recognition cost; absent or future-dated frames are refused. After a
+single Ctrl-Space, a confirming observation must have been received after the
+toggle acknowledgement. A paused pre-toggle frame is not new evidence even if
+OCR labels or hashes are supplied again. The final dispatch rechecks age and the
+existing input generation/capture lease. No extra work runs on frame publication.
+
+This is not a verified system input-mode API. A fresh initial frame with unknown
+keyboard labels retains raw-key behavior; window keys and `/key` remain explicit
+raw keys. Clipboard/Unicode guarantees, physical reconnect/rotation and hardware
+capture-stall acceptance remain open. Injected frame/time checks do not establish
+hardware fault recovery or general IME compatibility.
+
+Forty-four focused Swift checks passed, including retained-frame encoding and
+stale/missing/future timestamps, post-toggle boundaries, cancellation and complete
+text preflight. The actual controller fixture previously accepted a pre-toggle
+timestamp with apparent English labels and dispatched the edit; it now sends
+only the single toggle and refuses the edit. Source rollback reproduced the
+baseline, without hardware input.
+
+On the Bluetooth-disabled phone, the rebuilt native application entered `safe`.
+After explicitly selecting full pinyin, a new request entered `蓝牙`; a subsequent
+ASCII clear/type/submit request returned 409 `reason=mode_unconfirmed` and kept
+`蓝牙`. The field was cleared by an observed USB tap and full pinyin restored.
+An earlier Chinese request from a fresh but unclassified English layout emitted
+literal `lanya`, demonstrating the documented initial-unknown limitation rather
+than successful Chinese output. A prior independent ASCII request also returned
+409 before reason codes were present; its exact refusal cause is not established.
+No capture stall was induced, no clipboard was written, and no AssistiveTouch or
+DDI change occurred. These observations do not close physical reconnect or BLE
+regression acceptance.
+
 ## Unsupported-device fallback
 
 Runtime `80908a47314a6626e2459e95dca32d339b3251ed` was deployed after the owned
