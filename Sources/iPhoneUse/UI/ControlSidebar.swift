@@ -14,6 +14,11 @@ final class ControlSidebar: NSView {
         ]
 
     var onAction: ((ControlShortcut) -> Void)?
+    var onBackendChange: ((InputBackendKind) -> Void)?
+    private let backendSelector = NSPopUpButton(frame: .zero, pullsDown: false)
+    func updateBackend(_ backend: InputBackendKind) {
+        backendSelector.selectItem(at: backend == .usb ? 1 : 0)
+    }
     private var buttons: [ControlShortcut: NSButton] = [:]
     private var groupLabels: [NSTextField] = []
     private let status = NSTextField(wrappingLabelWithString: StringsUI.current.statusInitial)
@@ -61,6 +66,12 @@ final class ControlSidebar: NSView {
         stack.spacing = 7
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
+        backendSelector.addItems(withTitles: ["Bluetooth", "USB Touch"])
+        backendSelector.target = self
+        backendSelector.action = #selector(selectBackend(_:))
+        backendSelector.setAccessibilityLabel("Input backend")
+        stack.addArrangedSubview(backendSelector)
+        backendSelector.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         for group in Self.shortcutGroups {
             addShortcutGroup(titleKey: group.title, shortcuts: group.shortcuts, to: stack)
         }
@@ -138,6 +149,10 @@ final class ControlSidebar: NSView {
         onAction?(shortcut)
     }
 
+    @objc private func selectBackend(_ sender: NSPopUpButton) {
+        onBackendChange?(sender.indexOfSelectedItem == 1 ? .usb : .ble)
+    }
+
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
@@ -204,5 +219,29 @@ enum ControlShortcut: Int, CaseIterable {
         case .volumeDown: input.consumer(0x00EA)
         case .power: input.consumer(0x0030)
         }
+    }
+
+    /// The same named keys as the HTTP/raw-keyboard path, not consumer reports
+    /// borrowed from BLE. Paste sends Cmd-V only; it never reads Mac clipboard.
+    var usbKey: (name: String, modifiers: [String])? {
+        switch self {
+        case .search: ("space", ["cmd"])
+        case .paste: ("v", ["cmd"])
+        case .enter: ("enter", [])
+        case .home, .power, .volumeUp, .volumeDown: nil
+        }
+    }
+
+    var usbButton: USBHardwareButton? {
+        switch self {
+        case .home: .home
+        case .power: .power
+        case .volumeUp: .volumeUp
+        case .volumeDown: .volumeDown
+        default: nil
+        }
+    }
+    func isAvailableUSB(keyboardReady: Bool, buttonsReady: Bool = false) -> Bool {
+        (keyboardReady && usbKey != nil) || (buttonsReady && usbButton != nil)
     }
 }

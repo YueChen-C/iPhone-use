@@ -47,8 +47,9 @@ python3 <本技能目录>/scripts/mcp_call.py tap --arguments '{"device":"完整
 ## 操作与检查
 
 - 首次操作前调用 `screenshot`。点击和滑动使用同一设备最近一次 MCP 截图中的像素坐标，长边最多 1200 像素；不要用桌面浏览器中缩放后的坐标。
-- 可用工具：`tap(x,y)`、`long_press(x,y,seconds)`、`swipe(points,duration)`、`type_text(text)`、`press_key(key,modifiers)`、`keyboard_sequence(steps)`、`home`。其中 `swipe.points` 至少有两个 `{x,y}` 点，`duration` 是整条路径的秒数。
+- 可用工具：`tap(x,y)`、`long_press(x,y,seconds)`、`swipe(points,duration)`、`type_text(text)`、`press_key(key,modifiers)`、`keyboard_sequence(steps)`、`home`、`power`、`volume_up`、`volume_down`。其中 `swipe.points` 至少有两个 `{x,y}` 点，`duration` 是整条路径的秒数。
 - 当前页面与焦点已确认、无需中间判断的键盘步骤可用 `keyboard_sequence`：每步为 `{"key":"l","modifiers":["cmd"]}` 或 `{"text":"ASCII文字"}`；最多 16 步、全部文本合计 256 字符，最后只截图一次。整组持有同一手机的 MCP 锁。失败可能已执行前面的输入，先重新截图，不整组重放。
+- `home` 是手机主屏幕按钮，`press_key(home)` 是键盘导航键。USB 模式的 Home/Power/音量要求状态中存在对应 Indigo 能力；不借用蓝牙。`power` 仅短按，可能熄屏，不保证唤醒或解锁；不确定时先观察，不重放。
 - 动作成功后工具会等待约 0.6 秒并返回截图。依据返回画面检查结果；页面仍加载时再截图，不盲目重复点击。
 - 重复任务按用户要求的次数执行，记录每轮结果。意外页面或相同失败连续出现时停止并报告实际画面与已完成进度。
 - 完成后说明检查到的结果；无法确认的步骤标明原因。

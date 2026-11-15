@@ -8,31 +8,36 @@ protocol AXByteStream: AnyObject {
     func send(_ data: Data) throws
 }
 
+// Owns a duplicated broker FD. CoreDevice returns nonblocking sockets; convert
+// only this owned descriptor to bounded blocking IO, never reconnect to RSD.
 final class AXSocket: AXByteStream {
-    private let fd: Int32
-    init(host: String, port: UInt16) throws {
-        var address = sockaddr_in6()
-        address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-        address.sin6_family = sa_family_t(AF_INET6); address.sin6_port = port.bigEndian
-        guard inet_pton(AF_INET6, host, &address.sin6_addr) == 1 else { throw AXDTX.Failure("Invalid CoreDevice IPv6 address") }
-        fd = socket(AF_INET6, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw AXDTX.Failure("Cannot create AX socket") }
-        var timeout = timeval(tv_sec: 5, tv_usec: 0), enabled: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size))
-        let result = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
-        }
-        guard result == 0 else { close(fd); throw AXDTX.Failure("CoreDevice socket connect failed: \(errno)") }
+    private let descriptor: Int32
+    init(taking descriptor: Int32) throws {
+        guard descriptor >= 0 else { throw AXDTX.Failure("Invalid broker descriptor") }
+        do {
+            let flags = fcntl(descriptor, F_GETFL, 0)
+            guard flags >= 0, fcntl(descriptor, F_SETFL, flags & ~O_NONBLOCK) == 0 else {
+                throw AXDTX.Failure("Broker descriptor blocking mode failed: \(errno)")
+            }
+            var timeout = timeval(tv_sec: 5, tv_usec: 0), enabled: Int32 = 1
+            guard setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0,
+                  setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0,
+                  setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+                throw AXDTX.Failure("Broker descriptor socket options failed: \(errno)")
+            }
+        } catch { close(descriptor); throw error }
+        self.descriptor = descriptor
     }
-    deinit { close(fd) }
+    deinit { close(descriptor) }
     func read(_ count: Int) throws -> Data {
-        guard count >= 0, count <= AXDTX.limit else { throw AXDTX.Failure("AX socket read exceeds limit") }
+        guard count >= 0, count <= AXDTX.limit else { throw AXDTX.Failure("Broker socket read exceeds limit") }
         var bytes = Data(count: count), offset = 0
         while offset < count {
-            let n = bytes.withUnsafeMutableBytes { Darwin.recv(fd, $0.baseAddress!.advanced(by: offset), count - offset, 0) }
-            guard n > 0 else { throw AXDTX.Failure("AX socket receive failed/closed: \(errno)") }
+            let n = bytes.withUnsafeMutableBytes {
+                Darwin.recv(descriptor, $0.baseAddress!.advanced(by: offset), count - offset, 0)
+            }
+            if n < 0, errno == EINTR { continue }
+            guard n > 0 else { throw AXDTX.Failure("Broker socket receive failed/closed: \(n == 0 ? 0 : errno)") }
             offset += n
         }
         return bytes
@@ -40,8 +45,11 @@ final class AXSocket: AXByteStream {
     func send(_ bytes: Data) throws {
         var offset = 0
         while offset < bytes.count {
-            let n = bytes.withUnsafeBytes { Darwin.send(fd, $0.baseAddress!.advanced(by: offset), bytes.count - offset, 0) }
-            guard n > 0 else { throw AXDTX.Failure("AX socket send failed: \(errno)") }
+            let n = bytes.withUnsafeBytes {
+                Darwin.send(descriptor, $0.baseAddress!.advanced(by: offset), bytes.count - offset, 0)
+            }
+            if n < 0, errno == EINTR { continue }
+            guard n > 0 else { throw AXDTX.Failure("Broker socket send failed: \(errno)") }
             offset += n
         }
     }
@@ -53,10 +61,29 @@ enum AXRSD {
         return Data([UInt8((n >> 16) & 255), UInt8((n >> 8) & 255), UInt8(n & 255), type, flags])
             + Data([UInt8((stream >> 24) & 127), UInt8((stream >> 16) & 255), UInt8((stream >> 8) & 255), UInt8(stream & 255)]) + data
     }
-    static func wrapper(flags: UInt32, object: Data? = nil) -> Data {
+    static func wrapper(flags: UInt64, object: Data? = nil, id: UInt64 = 0) -> Data {
         let payload = object.map { AXDTX.number(0x42133742) + AXDTX.number(5) + $0 } ?? Data()
-        return AXDTX.number(0x29b00b92) + AXDTX.number(UInt64(flags)) + AXDTX.number(UInt64(payload.count), bytes: 8)
-            + AXDTX.number(0, bytes: 8) + payload
+        return AXDTX.number(0x29b00b92) + AXDTX.number(flags) + AXDTX.number(UInt64(payload.count), bytes: 8)
+            + AXDTX.number(id, bytes: 8) + payload
+    }
+    /// Incomplete frames stay buffered; complete envelopes consume exactly once.
+    /// Keepalive wrappers decode to NSNull so callers can continue draining.
+    static func decodeWrapper(_ buffer: inout Data, emptyPayloadLimit: UInt64 = 0) throws -> Any? {
+        guard buffer.count >= 24 else { return nil }
+        guard try AXDTX.integer(buffer, 0) == 0x29b00b92 else { throw AXDTX.Failure("Invalid XPC wrapper") }
+        let length = try AXDTX.integer(buffer, 8, 8)
+        guard length <= UInt64(AXDTX.limit - 24) else { throw AXDTX.Failure("XPC payload exceeds limit") }
+        let end = 24 + Int(length)
+        guard buffer.count >= end else { return nil }
+        var result: Any = NSNull()
+        if length > emptyPayloadLimit {
+            guard length >= 8, try AXDTX.integer(buffer, 24) == 0x42133742,
+                  try AXDTX.integer(buffer, 28) == 5 else { throw AXDTX.Failure("Invalid XPC payload header") }
+            var decoder = AXRSDDecoder(data: buffer.subdata(in: 32..<end))
+            result = try decoder.object()
+        }
+        buffer = Data(buffer.dropFirst(end))
+        return result
     }
     static func discover(socket: AXByteStream) throws -> [String: Any] {
         try socket.send(Data("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".utf8))
@@ -82,19 +109,8 @@ enum AXRSD {
             var buffer = buffers[stream] ?? Data()
             guard buffer.count <= AXDTX.limit - bytes.count else { throw AXDTX.Failure("RSD message exceeds limit") }
             buffer += bytes
-            while buffer.count >= 24 {
-                guard try AXDTX.integer(buffer, 0) == 0x29b00b92 else { throw AXDTX.Failure("Invalid RSD XPC wrapper") }
-                let length = try AXDTX.integer(buffer, 8, 8)
-                guard length <= UInt64(AXDTX.limit - 24) else { throw AXDTX.Failure("RSD XPC exceeds limit") }
-                let size = 24 + Int(length)
-                if buffer.count < size { break }
-                if length > 0 {
-                    guard length >= 8, try AXDTX.integer(buffer, 24) == 0x42133742,
-                          try AXDTX.integer(buffer, 28) == 5 else { throw AXDTX.Failure("Invalid RSD XPC payload") }
-                    var decoder = AXRSDDecoder(data: buffer.subdata(in: 32..<size))
-                    if let result = try decoder.object() as? [String: Any], result["Services"] != nil { return result }
-                }
-                buffer = Data(buffer.dropFirst(size))
+            while let object = try decodeWrapper(&buffer) {
+                if let result = object as? [String: Any], result["Services"] != nil { return result }
             }
             buffers[stream] = buffer
         }

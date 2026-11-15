@@ -843,6 +843,10 @@ final class ScreenCaptureSession {
         source.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge)
     }
 
+    func snapshotObservation(png: Bool, maxEdge: Int? = nil) -> (data: Data, receivedAt: TimeInterval)? {
+        source.snapshotObservation(png: png, maxEdge: maxEdge)
+    }
+
     func thumbnail(width: Int, height: Int) -> [UInt8]? { source.thumbnail(width: width, height: height) }
 }
 
@@ -1245,8 +1249,20 @@ final class ScreenCaptureSource:
 
     /// JPEG or PNG of the latest frame, scaled so neither edge exceeds the limits.
     func snapshot(png: Bool, maxWidth: Int? = nil, maxEdge: Int? = nil) -> Data? {
-        guard let buffer = frame() else { return nil }
-        var image = CIImage(cvPixelBuffer: buffer)
+        guard let frame = frames.snapshot() else { return nil }
+        return Self.snapshot(frame, png: png, maxWidth: maxWidth, maxEdge: maxEdge)?.data
+    }
+
+    func snapshotObservation(png: Bool, maxEdge: Int? = nil) -> (data: Data, receivedAt: TimeInterval)? {
+        guard let frame = frames.snapshot() else { return nil }
+        return Self.snapshot(frame, png: png, maxEdge: maxEdge)
+    }
+
+    /// Retain one frame for encoding; never attach a later frame's timestamp to
+    /// older pixels. This runs only on snapshot requests, not frame publication.
+    static func snapshot(_ frame: ScreenCaptureFrameStore.Snapshot, png: Bool,
+                         maxWidth: Int? = nil, maxEdge: Int? = nil) -> (data: Data, receivedAt: TimeInterval)? {
+        var image = CIImage(cvPixelBuffer: frame.buffer)
         var scale = 1.0
         if let maxWidth { scale = min(scale, Double(maxWidth) / image.extent.width) }
         if let maxEdge { scale = min(scale, Double(maxEdge) / max(image.extent.width, image.extent.height)) }
@@ -1258,7 +1274,7 @@ final class ScreenCaptureSource:
         CGImageDestinationAddImage(
             destination, cgImage, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { return nil }
-        return data as Data
+        return (data as Data, frame.receivedAt)
     }
 
     /// Grayscale pixels of the latest frame at a small size, first row at the top.

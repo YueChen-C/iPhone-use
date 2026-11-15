@@ -29,9 +29,11 @@ final class ControlConnectionOverlay: NSView {
     private static var controllerNameLoaded = false
 
     private let title = NSTextField(labelWithString: StringsUI.current.overlayNotConnectedTitle)
+    private let icon = NSImageView()
     private let message = NSTextField(wrappingLabelWithString: "")
     private var hasConnected = false
     private var lastStatus: ControlConnectionStatus = .disconnected
+    private var usbPresentation: ControlUSBPresentation?
     private var instructionsField: NSTextField?
     private var helpField: NSTextField?
 
@@ -75,10 +77,9 @@ final class ControlConnectionOverlay: NSView {
     }
 
     private func makeIconAndConfigureLabels() -> NSImageView {
-        let icon = NSImageView(
-            image: NSImage(
+        icon.image = NSImage(
                 systemSymbolName: "antenna.radiowaves.left.and.right.slash",
-                accessibilityDescription: nil) ?? NSImage())
+                accessibilityDescription: nil)
         icon.contentTintColor = .systemOrange
         icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 28, weight: .medium)
         title.font = .systemFont(ofSize: 19, weight: .semibold)
@@ -248,12 +249,23 @@ final class ControlConnectionOverlay: NSView {
 
     func update(_ status: ControlConnectionStatus) {
         lastStatus = status
+        if let usbPresentation {
+            updateUSBCard(usbPresentation)
+            return
+        }
         if status == .connected {
             hasConnected = true
             setDismissed(false)
         }
         isHidden = !status.showsOverlay
         let table = StringsUI.current
+        setAccessibilityLabel(table.overlayAccessibility)
+        icon.image = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right.slash", accessibilityDescription: nil)
+        message.toolTip = nil
+        helpField?.stringValue = table.overlayHelp
+        viewOnlyButton.title = table.overlayButtonViewOnly
+        pillLabel.stringValue = table.overlayPillTitle
+        pillButton.title = table.overlayPillShowGuidance
         instructionsField?.isHidden = status == .unmatched
         helpField?.isHidden = status == .unmatched
 
@@ -288,6 +300,34 @@ final class ControlConnectionOverlay: NSView {
         case .verifyingScreen, .connected:
             break
         }
+    }
+
+    func updateUSB(_ presentation: ControlUSBPresentation?) {
+        let changedBackend = (usbPresentation == nil) != (presentation == nil)
+        usbPresentation = presentation
+        if changedBackend { setDismissed(false) }
+        update(lastStatus)
+    }
+
+    private func updateUSBCard(_ presentation: ControlUSBPresentation) {
+        let table = StringsUSBControl.current
+        setAccessibilityLabel(table.title)
+        icon.image = NSImage(systemSymbolName: "cable.connector", accessibilityDescription: nil)
+        isHidden = !presentation.showsOverlay
+        if !presentation.showsOverlay || !presentation.hasScreen { setDismissed(false) }
+        instructionsField?.isHidden = true
+        helpField?.isHidden = false
+        reconnectButton.isHidden = true // Never route USB recovery into Bluetooth reconnect.
+        viewOnlyButton.isHidden = !presentation.hasScreen
+        title.stringValue = table.title
+        message.stringValue = table.status(presentation)
+        message.toolTip = presentation.detail.isEmpty ? nil : presentation.detail
+        helpField?.stringValue = table.guidance(presentation.recovery)
+        viewOnlyButton.title = table.viewOnly
+        pillLabel.stringValue = table.pill
+        pillButton.title = table.showGuidance
+        cardView?.isHidden = isDismissed
+        pillView.isHidden = !isDismissed
     }
 
     /// Rebuilds the static card text and replays the last status after a

@@ -158,6 +158,7 @@ enum MCPServer {
                         let data = try client.post(action.path, body)
                         return ["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]]]
                     }
+                    var priorInput = false
                     for (index, action) in actions.enumerated() {
                         do {
                             switch action {
@@ -167,11 +168,13 @@ enum MCPServer {
                                 var body = request.body
                                 body["device"] = device
                                 try client.post(request.path, body)
+                                priorInput = true
                             }
                         } catch {
                             guard name == "keyboard_sequence" else { throw error }
-                            throw MCPError(
-                                table.keyboardStopped(index + 1, actions.count, "\(error)"))
+                            throw MCPAPIError.keyboardSequence(
+                                error, step: index + 1, count: actions.count,
+                                priorInput: priorInput, language: language)
                         }
                         if index < actions.count - 1 {
                             // Let focus changes settle without capturing every intermediate field.
@@ -311,7 +314,10 @@ enum MCPServer {
 
     struct MCPError: Error, CustomStringConvertible {
         let description: String
-        init(_ description: String) { self.description = description }
+        let details: [String: Any]?
+        init(_ description: String, details: [String: Any]? = nil) {
+            self.description = description; self.details = details
+        }
     }
 }
 
@@ -336,17 +342,7 @@ private struct MCPHTTPClient {
     }
 
     private static func check(_ data: Data, status: Int, language: AppLanguage) -> MCPServer.MCPError {
-        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        let message = body?["error"] as? String ?? "HTTP \(status)"
-        guard let body, body["failed_step"] != nil || body["completed"] != nil else {
-            return MCPServer.MCPError(message)
-        }
-        var progress: [String: Any] = ["error": message]
-        progress["failed_step"] = body["failed_step"]
-        progress["completed"] = body["completed"]
-        let encoded = try? JSONSerialization.data(withJSONObject: progress, options: [.sortedKeys])
-        let details = encoded.map { String(decoding: $0, as: UTF8.self) } ?? message
-        return MCPServer.MCPError(details + "\n" + StringsMCP(language: language).actStopped)
+        MCPAPIError.error(data, status: status, language: language)
     }
 
     private func request(_ request: URLRequest, timeout: TimeInterval) throws -> (Data, HTTPURLResponse) {
@@ -369,5 +365,48 @@ private struct MCPHTTPClient {
         }.resume()
         done.wait()
         return try result.get()
+    }
+}
+
+/// Preserve USB delivery evidence across the HTTP-to-stdio bridge. Ordinary
+/// errors retain their existing text form; batch failures also keep progress.
+enum MCPAPIError {
+    /// Keep structured HTTP evidence separately from localized display text.
+    /// A sequence must not parse error strings or lose earlier acknowledged input.
+    static func error(_ data: Data, status: Int, language: AppLanguage) -> MCPServer.MCPError {
+        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let message = body?["error"] as? String ?? "HTTP \(status)"
+        let metadata = USBInputFailure.metadata(from: body ?? [:])
+        var details = metadata
+        details["error"] = message
+        let isBatch = body?["failed_step"] != nil || body?["completed"] != nil
+        var rendered = details
+        rendered["failed_step"] = body?["failed_step"]
+        rendered["completed"] = body?["completed"]
+        let text: String
+        if isBatch || !metadata.isEmpty,
+           let encoded = try? JSONSerialization.data(withJSONObject: rendered, options: [.sortedKeys]) {
+            text = String(decoding: encoded, as: UTF8.self) + (isBatch ? "\n" + StringsMCP(language: language).actStopped : "")
+        } else { text = message }
+        return MCPServer.MCPError(text, details: metadata.isEmpty ? nil : details)
+    }
+
+    static func keyboardSequence(
+        _ error: Error, step: Int, count: Int, priorInput: Bool, language: AppLanguage
+    ) -> MCPServer.MCPError {
+        let summary = StringsMCP(language: language).keyboardStopped(step, count, "\(error)")
+        guard let original = (error as? MCPServer.MCPError)?.details,
+              original["backend"] as? String == "usb" else { return MCPServer.MCPError(summary) }
+        var details = USBInputFailure.metadata(from: original, priorInput: priorInput)
+        details["error"] = original["error"]
+        details["failed_step"] = step
+        details["completed"] = step - 1
+        let encoded = try? JSONSerialization.data(withJSONObject: details, options: [.sortedKeys])
+        let text = encoded.map { String(decoding: $0, as: UTF8.self) }
+        return MCPServer.MCPError(text.map { $0 + "\n" + summary } ?? summary, details: details)
+    }
+
+    static func message(_ data: Data, status: Int, language: AppLanguage) -> String {
+        error(data, status: status, language: language).description
     }
 }

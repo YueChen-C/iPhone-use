@@ -295,7 +295,7 @@ final class MCPOCRTests: XCTestCase {
 final class MCPKeyboardAliasTests: XCTestCase {
     func testEveryToolAdvertisesDeviceAliasAndOriginalWins() throws {
         let tools = MCPToolCatalog.tools(for: .en)
-        XCTAssertEqual(tools.count, 16)
+        XCTAssertEqual(tools.count, 20)
         for tool in tools {
             let schema = try XCTUnwrap(tool["inputSchema"] as? [String: Any])
             let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
@@ -308,7 +308,7 @@ final class MCPKeyboardAliasTests: XCTestCase {
             ("move_pointer", ["x": 1, "y": 2]), ("adjust_pointer", ["dx": 0, "dy": 0]),
             ("click_pointer", [:]), ("tap", ["x": 1, "y": 2]), ("long_press", ["x": 1, "y": 2]),
             ("swipe", ["points": [["x": 0, "y": 0], ["x": 1, "y": 1]]]),
-            ("type_text", ["text": "nihao"]), ("press_key", ["key": "enter"]), ("home", [:]),
+            ("type_text", ["text": "nihao"]), ("press_key", ["key": "enter"]), ("home", [:]), ("power", [:]), ("volume_up", [:]), ("volume_down", [:]),
             ("ocr_screen", [:]), ("tap_text", ["text": "Confirm"]),
         ]
         for (name, parameters) in cases {
@@ -335,15 +335,18 @@ final class MCPKeyboardAliasTests: XCTestCase {
             if case .request(let request) = action { return request }
             return nil
         }
-        XCTAssertEqual(requests.map(\.path), ["/key", "/key", "/type", "/key", "/key", "/key"])
-        XCTAssertEqual(requests.compactMap { $0.body["key"] as? String }, ["a", "backspace", "space", "enter", "tab"])
-        XCTAssertEqual(requests[0].body["modifiers"] as? [String], ["command"])
+        XCTAssertEqual(requests.map(\.path), ["/type", "/key"])
+        XCTAssertEqual(requests.compactMap { $0.body["key"] as? String }, ["tab"])
+        XCTAssertEqual(requests[0].body["clear_before"] as? Bool, true)
+        XCTAssertEqual(requests[0].body["commit_ime"] as? Bool, true)
+        XCTAssertEqual(requests[0].body["press_enter"] as? Bool, true)
+        XCTAssertNil(requests[0].body["type"])
         let delays = actions.compactMap { action -> Double? in
             if case .delay(let seconds) = action { return seconds }
             return nil
         }
         XCTAssertEqual(delays, [0, 5, 0.25, 1])
-        XCTAssertEqual(try MCPKeyboardSequence.actions(arguments: ["steps": steps, "actions": steps]).count, 10)
+        XCTAssertEqual(try MCPKeyboardSequence.actions(arguments: ["steps": steps, "actions": steps]).count, 6)
         XCTAssertThrowsError(try MCPKeyboardSequence.actions(arguments: ["steps": steps, "actions": [["wait": 0]]]))
     }
 
