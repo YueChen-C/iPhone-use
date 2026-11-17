@@ -8,7 +8,7 @@
 ![Swift 6.0+](https://img.shields.io/badge/Swift-6.0%2B-F05138?logo=swift&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Mirror a real iPhone screen to your Mac over **USB**, then use your Mac’s mouse and keyboard to control it over **Bluetooth**. Connect an AI agent through MCP to let it see the screen and interact with your phone.
+Mirror a real iPhone screen to your Mac over **USB**, then use your Mac’s mouse and keyboard over **Bluetooth** by default. On **iOS 17+**, compatible hosts can also use native **USB touch**, without sending input over Bluetooth. Connect an AI agent through MCP to let it see the screen and interact with your phone.
 
 **No jailbreak. No iPhone app to install. No Apple developer account.**
 
@@ -18,6 +18,7 @@ Mirror a real iPhone screen to your Mac over **USB**, then use your Mac’s mous
 
 - 📱 **Live screen mirroring** — View your iPhone screen in a native Mac window through a wired USB connection.
 - 🖱️ **Mouse and keyboard control** — Click, drag, type, and send shortcuts through Bluetooth LE HID. Your Mac acts as a Bluetooth input device.
+- 🔗 **USB touch (iOS 17+, experimental)** — Click, hold and drag, or scroll to swipe with your Mac’s mouse; USB keyboard input is also supported. Requires compatible Apple Silicon host frameworks, developer services, and a DDI. Input does not require Bluetooth pairing.
 - 🤖 **AI agent integration** — Give Codex and other MCP clients tools to take screenshots, tap, swipe, type, and inspect the result.
 - 🔌 **Multiple iPhones** — Open a separate window for each device and select phones by ID through MCP or the HTTP API.
 - 🔑 **Independent Apple Accounts** — Core mirroring and control do not require the Mac and iPhone to share an Apple Account or enable two-factor authentication.
@@ -29,16 +30,17 @@ For everyday phone control, app testing, live demos, and AI automation, iPhone U
 
 Use devices signed into different Apple Accounts, connect multiple test phones, and switch between your Mac and the phone’s own touchscreen while the phone stays unlocked.
 
-Unlike Apple’s [iPhone Mirroring](https://support.apple.com/en-us/120421), this project uses a USB cable for video and Bluetooth for input. Each phone needs USB trust, Bluetooth pairing, and AssistiveTouch enabled.
+Unlike Apple’s [iPhone Mirroring](https://support.apple.com/en-us/120421), this project uses a USB cable for video, with Bluetooth or experimental native USB touch for input. Bluetooth mode requires USB trust, Bluetooth pairing, and AssistiveTouch. See the additional USB requirements below.
 
 ## How It Works
 
 ```text
 iPhone screen ───── USB ────────────→ Mac window / screenshots
-iPhone input  ←─── Bluetooth LE HID ─ Mac mouse, keyboard, or automation
+iPhone input  ←─── Bluetooth LE HID ─ Mac mouse, keyboard, or automation (default)
+             ←─── Native USB touch ─ Same control entry points (iOS 17+, experimental)
 ```
 
-The Mac captures video through AVFoundation and exposes mouse and keyboard input through Bluetooth LE HID. The HTTP API and MCP tools use the same device control layer as the desktop windows. No software is installed on the iPhone.
+The Mac captures video through AVFoundation and sends input through Bluetooth LE HID or the native USB backend. Backend selection is per device; the HTTP API and MCP tools use the same control layer as the desktop windows. No iPhone app is required.
 
 ## Quick Start
 
@@ -46,9 +48,10 @@ The Mac captures video through AVFoundation and exposes mouse and keyboard input
 
 | Requirement | Details |
 | --- | --- |
-| Mac | macOS 14 or later, with Bluetooth LE support and Bluetooth enabled |
+| Mac | macOS 14 or later; Bluetooth mode requires Bluetooth LE support and Bluetooth enabled |
 | iPhone | Unlocked, connected with a data-capable USB cable |
-| Permissions | macOS camera and Bluetooth access; USB trust and AssistiveTouch on iPhone |
+| Permissions | macOS camera access and USB trust; Bluetooth mode also needs Bluetooth access, pairing, and AssistiveTouch |
+| USB touch (optional) | iOS 17+, compatible Apple Silicon host frameworks, Developer Mode, and a compatible DDI; not every system combination has been verified |
 
 ### Option 1: Install a release (recommended)
 
@@ -57,7 +60,7 @@ The Mac captures video through AVFoundation and exposes mouse and keyboard input
 1. Open [GitHub Releases](https://github.com/YueChen-C/iPhone-use/releases) and download `iPhoneUse-v<version>-macOS-universal.zip` from the chosen release's **Assets**. The same ZIP supports Apple Silicon and Intel Macs. The `Source code` downloads contain source files rather than the app.
 2. Unzip the archive and drag `iPhoneUse.app` into Applications (`/Applications`).
 3. Double-click the app to open it. Automated builds are ad-hoc signed and are not notarized. If macOS blocks the app, verify the download source and follow the prompts in **System Settings → Privacy & Security** to allow it.
-4. Follow [Connect and pair your iPhone](#connect-and-pair-your-iphone) below to complete USB trust, camera and Bluetooth permissions, and AssistiveTouch pairing. You can then use your Mac's mouse and keyboard to control the phone.
+4. Follow [Connect and pair your iPhone](#connect-and-pair-your-iphone) for default Bluetooth control, or [USB touch setup](#usb-touch) for a compatible iOS 17+ device.
 
 To verify the archive, download the ZIP and `SHA256SUMS.txt` from the same release into one folder and run this command there:
 
@@ -88,6 +91,18 @@ The script builds a Release executable, opens the control window, and starts the
 5. Wait for the screen and control connection to become ready, then use your Mac’s mouse and keyboard in the phone window.
 
 Keep the app running while using MCP or the API. By default, closing the last window exits the app and stops the service; enable **iPhone Use → Quiet Background Mode** (or launch with `--resident-quiet`) to keep the service running after closing windows and suppress automatic window pop-ups on launch or USB connection whenever no unminimized waiting window is open (an already-open unminimized waiting window transitions in place to connected device windows).
+
+<a id="usb-touch"></a>
+
+### USB touch (iOS 17+, experimental)
+
+1. Connect and trust this iPhone over USB. Keep it unlocked, awake, and in portrait. Enable Developer Mode as required and prepare a compatible Developer Disk Image (DDI) that provides the HID services.
+2. Select **USB Touch** in that phone window's input-backend menu. Once ready, use mouse clicks, press/drag/release, scroll-to-swipe, and keyboard input. HTTP/MCP actions use the same backend selected for that device.
+3. If the DDI is missing or the HID service is unavailable, the in-app overlay offers **Enable USB control…**. Clicking downloads about 18 MB to the app cache without a save-location prompt. **Downloading is not installation**: installation and recovery still require plan review. See [DDI setup and management](docs/USB_DDI_MANAGEMENT.md).
+
+**Devices below iOS 17 cannot switch to USB Touch**: the in-app notice explains the minimum version and keeps the previous backend. An unreadable iOS version is also rejected. iOS 17+ is a minimum requirement, not a guarantee for every Mac, DDI, or iOS combination. Current hardware acceptance covers iOS 26.5 with compatible Apple Silicon host frameworks; other combinations still need validation.
+
+USB input does not require Bluetooth pairing, but compatibility with AssistiveTouch turned off has not been verified. This is not a promise that AssistiveTouch is unnecessary. Bluetooth remains the default; unavailable USB input is never automatically forwarded to Bluetooth.
 
 ## AI Integration
 
@@ -185,7 +200,7 @@ For AX-only debugging, run `.build/debug/iphone-use --ax-server <full-device-id>
 - **Device state:** Keep the iPhone unlocked. Portrait orientation is the primary workflow; landscape and dynamic rotation are not guaranteed.
 - **Pointer accuracy:** Some devices need [pointer calibration](docs/user-guide.md#指针校准). Results vary with the device, iOS version, and pointer settings.
 - **Text input:** Direct typing supports ASCII through a US keyboard layout. Other text requires a configured iPhone input method or Apple Universal Clipboard; clipboard sharing follows Apple’s own requirements.
-- **Connection issues:** If video works but input does not, check Bluetooth pairing and AssistiveTouch. Use `/status` to inspect the connection, or consult [troubleshooting](docs/user-guide.md#常见问题与限制).
+- **Connection issues:** If video works but input does not, check pairing and AssistiveTouch in Bluetooth mode; in USB mode, check the iOS version, Developer Mode, DDI, and in-app guidance. Use `/status` to inspect the selected backend and readiness, or consult [troubleshooting](docs/user-guide.md#常见问题与限制).
 
 ## Documentation
 

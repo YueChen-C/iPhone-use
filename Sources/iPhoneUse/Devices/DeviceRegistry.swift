@@ -14,6 +14,7 @@ struct Device {
             "id": id, "name": screen.name, "bluetooth": host != nil, "lockState": lockState.rawValue,
         ]
         info["bluetoothState"] = bluetoothState.rawValue
+        info["input"] = USBInputController.shared.status(self)
         if let size = screen.size {
             info["width"] = Int(size.width)
             info["height"] = Int(size.height)
@@ -44,6 +45,7 @@ final class DeviceRegistry {
         let input: DeviceInput
         let screenID: String?
         let screenObject: ObjectIdentifier?
+        let routeGeneration: UUID?
     }
     private enum ReplacementRecovery {
         case notApplicable
@@ -51,6 +53,7 @@ final class DeviceRegistry {
         case recovered([String: UUID])
     }
     private var inputs: [UUID: CachedInput] = [:]
+    private var retiringInputs: [String: [DeviceInput]] = [:]
     private var matchPending = false
     private var usableScreenRetries: Set<String> = []
     private let matchQueue = DispatchQueue(label: "iphone-use.match")
@@ -92,6 +95,7 @@ final class DeviceRegistry {
     func start() {
         load()
         ScreenCaptureManager.shared.onScreensChanged = { [weak self] in
+            USBInputController.shared.captureDidChange()
             self?.matchQueue.async {
                 self?.syncBluetoothForCurrentScreens(resetExhausted: true)
             }
@@ -296,6 +300,9 @@ final class DeviceRegistry {
     /// never restart discovery after it has just cancelled background motion.
     func input(for device: Device) throws -> DeviceInput {
         let matched = try find(device.id)
+        guard USBInputController.shared.permitsBLE(matched.id, generation: nil) else {
+            throw DeviceError("Selected input backend is not ready for Bluetooth; no cross-backend fallback")
+        }
         if let host = matched.host {
             guard ScreenCaptureManager.shared.permitsPointerAssociation(for: matched.screen) else {
                 throw DeviceError(StringsAPI.current.screenIdentityUnverified(matched.screen.name))
@@ -316,6 +323,7 @@ final class DeviceRegistry {
             // session cannot replace a newer DeviceInput and split the input queues.
             let session = HIDPeripheral.shared.connectionSession(for: host)
             let screenID = screen?.id
+            let routeGeneration = screenID.map { USBInputController.shared.generation($0) }
             let orientation: RelativePointerScreenMatcher.Orientation? = lock.withLock {
                 guard let screen, let session else { return nil }
                 return pointerOrientations[
@@ -323,14 +331,20 @@ final class DeviceRegistry {
             }
             if let cached = inputs[host], !cached.input.isRetired,
                 cached.input.session == session, cached.screenID == screenID,
+                cached.routeGeneration == routeGeneration,
                 cached.screenObject == screen.map(ObjectIdentifier.init),
                 orientation == nil || cached.input.pointerOrientation == orientation
             {
                 return cached.input
             }
+            if let old = inputs[host], let id = old.screenID,
+               old.routeGeneration != routeGeneration {
+                retiringInputs[id, default: []].append(old.input)
+            }
             let input = makeInput(host: host, session: session, screen: screen)
             inputs[host] = CachedInput(
-                input: input, screenID: screenID, screenObject: screen.map(ObjectIdentifier.init))
+                input: input, screenID: screenID, screenObject: screen.map(ObjectIdentifier.init),
+                routeGeneration: routeGeneration)
             return input
         }
     }
@@ -353,6 +367,7 @@ final class DeviceRegistry {
         host: UUID, session: UUID?, screen: ScreenCaptureSession?
     ) -> DeviceInput {
         let screenID = screen?.id
+        let routeGeneration = screenID.map { USBInputController.shared.generation($0) }
         let calibration = loadCalibration(host: host, screen: screen)
         let rejected =
             screenID.flatMap { id in
@@ -389,7 +404,8 @@ final class DeviceRegistry {
             inputIsAllowed: { [weak screen] in
                 let manager = ScreenCaptureManager.shared
                 guard let screen else { return screenID == nil && manager.permitsPointerAssociation }
-                return manager.permitsPointerAssociation(for: screen)
+                return USBInputController.shared.permitsBLE(screen.id, generation: routeGeneration)
+                    && manager.permitsPointerAssociation(for: screen)
             })
         return input
     }
@@ -423,16 +439,32 @@ final class DeviceRegistry {
         input?.cancelBackgroundMotion()
     }
 
+    func releaseForBackendSwitch(_ device: Device) -> Bool {
+        let old = inputLock.withLock { () -> [DeviceInput] in
+            var old = retiringInputs[device.id] ?? []
+            for cached in inputs.values where cached.screenID == device.id {
+                if !old.contains(where: { $0 === cached.input }) { old.append(cached.input) }
+            }
+            retiringInputs[device.id] = old
+            return old
+        }
+        let unreleased = old.filter { !$0.releaseForBackendSwitch() }
+        inputLock.withLock { retiringInputs[device.id] = unreleased }
+        return unreleased.isEmpty
+    }
+
     /// Verify saved curves per Bluetooth session with bounded retries. Only repeatable observed
     /// mismatches may trigger replacement; observation failure preserves files.
     func automaticallyCalibrate(_ device: Device, retry: Bool = false, verifyOnly: Bool = false) {
-        guard device.lockState != .suspected, device.lockState != .paused,
+        guard USBInputController.shared.permitsBLE(device.id, generation: nil),
+            device.lockState != .suspected, device.lockState != .paused,
             RelativePointerCalibration.isDeviceUDID(device.id),
             ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen),
             let host = device.host, let size = device.screen.size,
             size.width <= 4096, size.height <= 4096
         else { return }
         let input = input(for: host, screen: device.screen)
+        let routeGeneration = USBInputController.shared.generation(device.id)
         guard
             verifyOnly || input.calibration?.matches(size) == true
                 || (input.calibration == nil && input.needsCalibration),
@@ -468,7 +500,8 @@ final class DeviceRegistry {
                 }
             }
             let isReady = {
-                ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen) && input.isCurrentSession
+                USBInputController.shared.permitsBLE(device.id, generation: routeGeneration)
+                    && ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen) && input.isCurrentSession
                     && HIDPeripheral.shared.isReady(report: .relativeMouse, host: host, session: session)
                     && self.lock.withLock { self.pairings[device.id] == host }
                     && ScreenCaptureManager.shared.all.contains { $0 === device.screen }
@@ -604,6 +637,10 @@ final class DeviceRegistry {
         HIDPeripheral.shared.reconnectKnownHosts(targets, resetExhausted: resetExhausted)
     }
 
+    /// USB-selected captures cannot be targets of background BLE motion probes.
+    private var bluetoothAssociationScreens: [ScreenCaptureSession] {
+        ScreenCaptureManager.shared.associationScreens.filter { USBInputController.shared.permitsBLE($0.id, generation: nil) }
+    }
     // MARK: Matching
 
     private func scheduleMatch(usableScreenID: String? = nil) {
@@ -639,7 +676,7 @@ final class DeviceRegistry {
         restartProbing: Bool = false, requireChangedTopology: Bool = false
     ) -> [String: UUID] {
         guard ScreenCaptureManager.shared.permitsPointerAssociation else { return [:] }
-        let screens = ScreenCaptureManager.shared.associationScreens
+        let screens = bluetoothAssociationScreens
         let hosts = HIDPeripheral.shared.connectedHosts
         let reconnectingHosts = restartProbing ? Set<UUID>() : HIDPeripheral.shared.reconnectingHosts
         if allowProbing {
@@ -794,7 +831,7 @@ final class DeviceRegistry {
     /// The finite retry schedule never polls continuously with pointer motion.
     private func scheduleProbingRetryIfNeeded() {
         guard probingMayContinue() else { return }
-        let screens = ScreenCaptureManager.shared.associationScreens
+        let screens = bluetoothAssociationScreens
         let hosts = HIDPeripheral.shared.connectedHosts
         let pairings = lock.withLock { self.pairings }
         let matchedHosts = Set(all().compactMap(\.host))
@@ -1024,7 +1061,7 @@ final class DeviceRegistry {
     private func recoverySnapshotIsCurrent(
         screens: [ScreenCaptureSession], hosts: [UUID], pairings: [String: UUID], sessions: [UUID: UUID]
     ) -> Bool {
-        let current = ScreenCaptureManager.shared.associationScreens
+        let current = bluetoothAssociationScreens
         return ScreenCaptureManager.shared.permitsPointerAssociation && probingMayContinue()
             && current.count == screens.count && zip(current, screens).allSatisfy { $0 === $1 }
             && Set(HIDPeripheral.shared.connectedHosts) == Set(hosts)
@@ -1037,6 +1074,7 @@ final class DeviceRegistry {
         calibration: PairingProbeCalibration, expectedSession: UUID,
         input sharedInput: DeviceInput? = nil
     ) -> DevicePairingRecovery.ProbeResult {
+        let routeGeneration = USBInputController.shared.generation(screen.id)
         let selectedCalibration: RelativePointerCalibration?
         let required: Bool
         switch calibration {
@@ -1056,7 +1094,8 @@ final class DeviceRegistry {
                 host: host, session: expectedSession, calibration: selectedCalibration, calibrationRequired: required,
                 inputIsAllowed: { [weak screen] in
                     guard let screen else { return false }
-                    return ScreenCaptureManager.shared.permitsPointerAssociation(for: screen)
+                    return USBInputController.shared.permitsBLE(screen.id, generation: routeGeneration)
+                        && ScreenCaptureManager.shared.permitsPointerAssociation(for: screen)
                 })
         guard input.host == host, input.session == expectedSession else { return .unavailable }
         let evidence = motionEvidence(input, verifyAbsolute: selectedCalibration == nil)
@@ -1070,10 +1109,11 @@ final class DeviceRegistry {
     private func probe(_ host: UUID, among screens: [ScreenCaptureSession]) -> ScreenCaptureSession? {
         let knownID = lock.withLock { pairings.first { $0.value == host }?.key }
         let input: DeviceInput
-        if let screen = ScreenCaptureManager.shared.associationScreens.first(where: { $0.id == knownID }) {
+        if let screen = bluetoothAssociationScreens.first(where: { $0.id == knownID }) {
             input = self.input(for: host, screen: screen)
         } else {
-            let captureSnapshot = ScreenCaptureManager.shared.associationScreens
+            let captureSnapshot = bluetoothAssociationScreens
+            let routes = captureSnapshot.map { ($0.id, USBInputController.shared.generation($0.id)) }
             let probeCalibration = RelativePointerCalibration.probeInputCalibration(
                 host: host, screenID: screens.count == 1 ? screens[0].id : nil)
             input = DeviceInput(
@@ -1083,7 +1123,8 @@ final class DeviceRegistry {
                 inputIsAllowed: {
                     let manager = ScreenCaptureManager.shared
                     return manager.permitsPointerAssociation
-                        && manager.associationScreens.count == captureSnapshot.count
+                        && routes.allSatisfy { USBInputController.shared.permitsBLE($0.0, generation: $0.1) }
+                        && self.bluetoothAssociationScreens.count == captureSnapshot.count
                         && captureSnapshot.allSatisfy { manager.permitsPointerAssociation(for: $0) }
                 })
         }
@@ -1110,7 +1151,7 @@ final class DeviceRegistry {
         var evidence = empty
         // Even a failed or cancelled probe consumes this round's attempt.
         probeEvidence[input.host] = evidence
-        let screens = ScreenCaptureManager.shared.associationScreens
+        let screens = bluetoothAssociationScreens
         guard !screens.isEmpty else { return evidence }
         let host = input.host
         let session = input.session
@@ -1325,7 +1366,7 @@ final class DeviceRegistry {
         expectingPairings expectedPairings: [String: UUID]? = nil, motionVerified: Bool = true
     ) -> Bool {
         guard !found.isEmpty else { return true }
-        let screens = ScreenCaptureManager.shared.associationScreens
+        let screens = bluetoothAssociationScreens
         let sessions = Dictionary(
             uniqueKeysWithValues: HIDPeripheral.shared.hostDetails.compactMap { detail in
                 detail.session.map { (detail.host, $0) }

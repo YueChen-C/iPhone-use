@@ -29,11 +29,20 @@ final class ControlConnectionOverlay: NSView {
     private static var controllerNameLoaded = false
 
     private let title = NSTextField(labelWithString: StringsUI.current.overlayNotConnectedTitle)
+    private let icon = NSImageView()
     private let message = NSTextField(wrappingLabelWithString: "")
     private var hasConnected = false
     private var lastStatus: ControlConnectionStatus = .disconnected
+    private var usbPresentation: ControlUSBPresentation?
+    private var backendSelectionFailure: String?
+    var onNoticeDismissed: (() -> Void)?
     private var instructionsField: NSTextField?
     private var helpField: NSTextField?
+    var onEnableUSB: (() -> Void)?
+    var onCancelUSBSetup: (() -> Void)?
+    private var setup: USBSetupPresentation?
+    private let setupButton = NSButton(title: "", target: nil, action: nil)
+    private let setupProgress = NSProgressIndicator()
 
     private var cardView: NSView?
     private let reconnectButton = NSButton(title: "", target: nil, action: nil)
@@ -75,10 +84,9 @@ final class ControlConnectionOverlay: NSView {
     }
 
     private func makeIconAndConfigureLabels() -> NSImageView {
-        let icon = NSImageView(
-            image: NSImage(
+        icon.image = NSImage(
                 systemSymbolName: "antenna.radiowaves.left.and.right.slash",
-                accessibilityDescription: nil) ?? NSImage())
+                accessibilityDescription: nil)
         icon.contentTintColor = .systemOrange
         icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 28, weight: .medium)
         title.font = .systemFont(ofSize: 19, weight: .semibold)
@@ -142,8 +150,19 @@ final class ControlConnectionOverlay: NSView {
         viewOnlyButton.target = self
         viewOnlyButton.action = #selector(onViewOnlyClicked)
 
-        let stack = NSStackView(views: [viewOnlyButton, reconnectButton])
+        setupButton.title = StringsUSBSetup.current.enable
+        setupButton.bezelStyle = .rounded
+        setupButton.target = self
+        setupButton.action = #selector(onEnableUSBClicked)
+        setupButton.isHidden = true
+        setupProgress.style = .bar
+        setupProgress.minValue = 0; setupProgress.maxValue = 1
+        setupProgress.isHidden = true
+
+        let stack = NSStackView()
         stack.orientation = .horizontal
+        // Keep a lone acknowledgement centered when the reconnect action hides.
+        stack.setViews([viewOnlyButton, reconnectButton], in: .center)
         stack.spacing = 12
         stack.alignment = .centerY
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -153,7 +172,8 @@ final class ControlConnectionOverlay: NSView {
     private func makeMessageStack(
         card: NSView, icon: NSImageView, instructions: NSTextField, help: NSTextField, buttons: NSStackView
     ) -> NSStackView {
-        let stack = NSStackView(views: [icon, title, message, instructions, help, buttons])
+        // Keep the longer setup action on its own row in narrow phone windows.
+        let stack = NSStackView(views: [icon, title, message, instructions, help, setupProgress, setupButton, buttons])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 12
@@ -218,6 +238,7 @@ final class ControlConnectionOverlay: NSView {
             message.widthAnchor.constraint(equalTo: stack.widthAnchor),
             instructions.widthAnchor.constraint(equalTo: stack.widthAnchor),
             help.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            setupProgress.widthAnchor.constraint(equalTo: stack.widthAnchor),
             buttons.heightAnchor.constraint(greaterThanOrEqualToConstant: 28),
         ])
     }
@@ -231,7 +252,23 @@ final class ControlConnectionOverlay: NSView {
     }
 
     @objc private func onViewOnlyClicked() {
+        if backendSelectionFailure != nil {
+            showBackendSelectionFailure(nil)
+            onNoticeDismissed?()
+            return
+        }
         setDismissed(true)
+    }
+
+    @objc private func onEnableUSBClicked() {
+        guard usbPresentation?.offersUSBSetup == true else { return }
+        if setup?.isWorking == true { onCancelUSBSetup?(); return }
+        onEnableUSB?()
+    }
+
+    func updateSetup(_ state: USBSetupPresentation?) {
+        setup = state
+        update(lastStatus)
     }
 
     @objc private func onShowGuidanceClicked() {
@@ -248,12 +285,32 @@ final class ControlConnectionOverlay: NSView {
 
     func update(_ status: ControlConnectionStatus) {
         lastStatus = status
+        if status == .waitingForDevice { backendSelectionFailure = nil }
+        if let backendSelectionFailure {
+            updateSelectionFailureCard(backendSelectionFailure)
+            return
+        }
+        if let usbPresentation {
+            updateUSBCard(usbPresentation)
+            return
+        }
         if status == .connected {
             hasConnected = true
             setDismissed(false)
         }
         isHidden = !status.showsOverlay
         let table = StringsUI.current
+        setupButton.isHidden = true
+        setupProgress.isHidden = true
+        setupProgress.stopAnimation(nil)
+        viewOnlyButton.isEnabled = true
+        setAccessibilityLabel(table.overlayAccessibility)
+        icon.image = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right.slash", accessibilityDescription: nil)
+        message.toolTip = nil
+        helpField?.stringValue = table.overlayHelp
+        viewOnlyButton.title = table.overlayButtonViewOnly
+        pillLabel.stringValue = table.overlayPillTitle
+        pillButton.title = table.overlayPillShowGuidance
         instructionsField?.isHidden = status == .unmatched
         helpField?.isHidden = status == .unmatched
 
@@ -288,6 +345,83 @@ final class ControlConnectionOverlay: NSView {
         case .verifyingScreen, .connected:
             break
         }
+    }
+
+    func updateUSB(_ presentation: ControlUSBPresentation?) {
+        let changedBackend = (usbPresentation == nil) != (presentation == nil)
+        if changedBackend { setup = nil }
+        usbPresentation = presentation
+        if changedBackend { setDismissed(false) }
+        update(lastStatus)
+    }
+
+    /// Reuse the app's connection card, without selecting USB or offering DDI
+    /// setup for an incompatible device. Polling must not erase the notice.
+    func showBackendSelectionFailure(_ message: String?) {
+        backendSelectionFailure = message
+        setDismissed(false)
+        update(lastStatus)
+    }
+
+    private func updateSelectionFailureCard(_ detail: String) {
+        let table = StringsUSBControl.current
+        isHidden = false
+        setAccessibilityLabel(table.title)
+        icon.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
+        title.stringValue = table.title
+        message.stringValue = detail
+        message.toolTip = detail
+        instructionsField?.isHidden = true
+        helpField?.isHidden = true
+        reconnectButton.isHidden = true
+        setupButton.isHidden = true
+        setupProgress.isHidden = true
+        setupProgress.stopAnimation(nil)
+        viewOnlyButton.title = table.acknowledge
+        viewOnlyButton.isHidden = false
+        viewOnlyButton.isEnabled = true
+        cardView?.isHidden = false
+        pillView.isHidden = true
+    }
+
+    private func updateUSBCard(_ presentation: ControlUSBPresentation) {
+        let table = StringsUSBControl.current
+        setAccessibilityLabel(table.title)
+        icon.image = NSImage(systemSymbolName: "cable.connector", accessibilityDescription: nil)
+        isHidden = !presentation.showsOverlay
+        if !presentation.showsOverlay || !presentation.hasScreen { setDismissed(false) }
+        instructionsField?.isHidden = true
+        helpField?.isHidden = false
+        reconnectButton.isHidden = true // Never route USB recovery into Bluetooth reconnect.
+        viewOnlyButton.isHidden = !presentation.hasScreen
+        title.stringValue = table.title
+        message.stringValue = table.status(presentation)
+        message.toolTip = presentation.detail.isEmpty ? nil : presentation.detail
+        helpField?.stringValue = table.guidance(presentation.recovery)
+        if presentation.offersUSBSetup {
+            helpField?.stringValue += "\n\n" + StringsUSBSetup.current.consent
+        }
+        let working = setup?.isWorking == true
+        setupButton.title = working ? StringsUSBSetup.current.cancel
+            : (setup == .prepared ? StringsUSBSetup.current.review : StringsUSBSetup.current.enable)
+        setupButton.isHidden = !presentation.offersUSBSetup
+        setupButton.isEnabled = true
+        setupProgress.isHidden = !working
+        viewOnlyButton.isEnabled = !working
+        if let setup, presentation.offersUSBSetup {
+            helpField?.stringValue = StringsUSBSetup.current.progress(setup)
+            if setup == .failed || setup == .cancelled {
+                helpField?.stringValue += "\n\n" + StringsUSBSetup.current.consent
+            }
+            setupProgress.isIndeterminate = setup.fraction == nil
+            setupProgress.doubleValue = setup.fraction ?? 0
+            if working { setupProgress.startAnimation(nil) } else { setupProgress.stopAnimation(nil) }
+        }
+        viewOnlyButton.title = table.viewOnly
+        pillLabel.stringValue = table.pill
+        pillButton.title = table.showGuidance
+        cardView?.isHidden = isDismissed
+        pillView.isHidden = !isDismissed
     }
 
     /// Rebuilds the static card text and replays the last status after a

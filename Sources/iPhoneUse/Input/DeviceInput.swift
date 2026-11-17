@@ -32,6 +32,7 @@ final class DeviceInput {
     /// Transport readiness is independent of pointer calibration. A missing or
     /// mismatched calibration must not be presented as a Bluetooth disconnect.
     var isBluetoothReady: Bool {
+        guard !isRetired else { return false }
         let reports: [ReportID] = [.keyboard] + pointerReports + [.consumer]
         return reports.allSatisfy { reportReadiness($0, host, session) }
     }
@@ -764,6 +765,23 @@ extension DeviceInput {
             guard self.buttons != 0 else { return }
             self.button(down: false)
         }
+    }
+
+    /// Called only after the route generation is invalidated. Drain older work
+    /// before enabling another transport; timed-out retirement fails closed.
+    func releaseForBackendSwitch() -> Bool {
+        discardPendingMotion()
+        let completed = DispatchSemaphore(value: 0)
+        queue.async {
+            self.windowDragging = false
+            if self.buttons != 0 { self.button(down: false) }
+            self.send(.keyboard, [UInt8](repeating: 0, count: 8))
+            self.send(.consumer, [0, 0])
+            self.lifecycleLock.withLock { self.retired = true }
+            completed.signal()
+        }
+        guard completed.wait(timeout: .now() + 3) == .success else { return false }
+        return hid.waitForInputDrain(host: host, session: session)
     }
 
     /// A report subscription can disappear while a calibrated movement is being

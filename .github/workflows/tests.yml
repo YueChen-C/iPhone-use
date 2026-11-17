@@ -38,6 +38,12 @@ jobs:
       - name: Run Swift tests
         run: swift test
 
+      - name: Check native DDI process recovery
+        run: scripts/check-ddi-recovery.sh
+
+      - name: Check native input backend routing
+        run: scripts/check-input-routing.sh
+
       # swift test builds the debug executable used by the MCP integration tests.
       - name: Run Python tests
         env:

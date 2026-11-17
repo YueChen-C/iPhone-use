@@ -64,18 +64,7 @@ enum USBIdentityScreenshot {
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = diagnostic
-        let finished = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in finished.signal() }
-        do { try process.run() } catch { return nil }
-        guard finished.wait(timeout: .now() + timeout) == .success else {
-            // Terminate only this worker, never camera assistants or other apps.
-            if process.isRunning { process.terminate() }
-            if finished.wait(timeout: .now() + 1) == .timedOut {
-                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-                _ = finished.wait(timeout: .now() + 1)
-            }
-            return nil
-        }
+        guard (try? process.run(timeout: timeout)) == true else { return nil }
         guard process.terminationReason == .exit else { return nil }
         return process.terminationStatus
     }
@@ -243,5 +232,22 @@ private final class NativeUSBDeviceServices {
                 guard let array = value as? [Any] else { throw Failure.invalidReply }
                 return array
             })
+    }
+}
+
+extension Process {
+    /// Deadline for a directly owned child only; never terminates other sessions.
+    /// Launch errors, timeout and signal exit remain distinct to each caller.
+    func run(timeout: TimeInterval) throws -> Bool {
+        let finished = DispatchSemaphore(value: 0)
+        terminationHandler = { _ in finished.signal() }
+        try run()
+        if finished.wait(timeout: .now() + timeout) == .success { return true }
+        if isRunning { terminate() }
+        if finished.wait(timeout: .now() + 1) == .timedOut {
+            if isRunning { kill(processIdentifier, SIGKILL) }
+            _ = finished.wait(timeout: .now() + 1)
+        }
+        return false
     }
 }

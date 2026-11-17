@@ -8,7 +8,7 @@
 ![Swift 6.0+](https://img.shields.io/badge/Swift-6.0%2B-F05138?logo=swift&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-通过 **USB** 将真实 iPhone 的画面实时显示在 Mac 上，再通过 **蓝牙** 使用 Mac 的鼠标和键盘操作手机。接入 MCP 后，AI Agent 也能查看屏幕、执行操作并检查结果。
+通过 **USB** 将真实 iPhone 的画面实时显示在 Mac 上，默认通过 **蓝牙** 使用 Mac 的鼠标和键盘操作手机。**iOS 17+** 还可在兼容主机上选择原生 **USB 触控**，无需通过蓝牙发送输入。接入 MCP 后，AI Agent 也能查看屏幕、执行操作并检查结果。
 
 https://github.com/user-attachments/assets/278a8808-1211-4155-b481-5f721c5ca62e
 
@@ -26,6 +26,7 @@ https://github.com/user-attachments/assets/e4aa9473-3236-4573-9841-bfbf83e248e1
 
 - 📱 **实时投屏** — 通过 USB 有线连接，在 Mac 原生窗口中查看 iPhone 画面。
 - 🖱️ **鼠标与键盘控制** — 通过 Bluetooth LE HID 点击、拖动、输入文字和发送快捷键，让 Mac 充当手机的蓝牙输入设备。
+- 🔗 **USB 触控（iOS 17+，实验性）** — 用 Mac 鼠标点击、按住拖动和滚轮滑动，也支持 USB 键盘输入；需兼容的 Apple Silicon 主机、开发者服务与 DDI，输入不依赖蓝牙配对。
 - 🤖 **AI Agent 集成** — 为 Codex 等 MCP 客户端提供截图、点击、滑动和输入工具，让 Agent 操作手机并检查结果。
 - 🌏 **中英文界面** — 主菜单一键切换中文 / English，窗口、浏览器预览页与 MCP 描述即时跟随，默认跟随系统语言。
 - 🔌 **多台 iPhone** — 每台手机拥有独立窗口，MCP 和 HTTP API 均可通过设备 ID 选择目标手机。
@@ -38,16 +39,17 @@ https://github.com/user-attachments/assets/e4aa9473-3236-4573-9841-bfbf83e248e1
 
 你可以连接登录不同 Apple 账户的手机，同时使用多台测试设备，也可以让手机保持解锁，在 Mac 操作与手机触屏操作之间自由切换。
 
-与 Apple 的 [iPhone 镜像](https://support.apple.com/zh-cn/120421)不同，本项目通过 USB 传输画面，通过蓝牙传输输入。每台手机都需要完成 USB 信任、蓝牙配对，并开启辅助触控。
+与 Apple 的 [iPhone 镜像](https://support.apple.com/zh-cn/120421)不同，本项目通过 USB 传输画面，输入可选择蓝牙或实验性的原生 USB 触控。蓝牙模式需要完成 USB 信任、蓝牙配对，并开启辅助触控；USB 模式的额外条件见下方说明。
 
 ## 工作原理
 
 ```text
 iPhone 画面 ───── USB ─────────────→ Mac 窗口 / 截图
-iPhone 输入 ←──── Bluetooth LE HID ─ Mac 鼠标、键盘或自动化指令
+iPhone 输入 ←──── Bluetooth LE HID ─ Mac 鼠标、键盘或自动化指令（默认）
+           ←──── 原生 USB 触控 ──── 同一套控制入口（iOS 17+，实验性）
 ```
 
-Mac 使用 AVFoundation 采集 USB 画面，通过 Bluetooth LE HID 提供鼠标和键盘输入。HTTP API、MCP 工具和桌面窗口共用设备控制逻辑，无需在 iPhone 上安装软件。
+Mac 使用 AVFoundation 采集 USB 画面，通过 Bluetooth LE HID 或原生 USB 后端提供输入。每台手机独立选择后端，HTTP API、MCP 工具和桌面窗口共用设备控制逻辑，无需在 iPhone 上安装软件。
 
 ## 快速开始
 
@@ -55,9 +57,10 @@ Mac 使用 AVFoundation 采集 USB 画面，通过 Bluetooth LE HID 提供鼠标
 
 | 项目 | 要求 |
 | --- | --- |
-| Mac | macOS 14 或更高版本，支持并开启 Bluetooth LE |
+| Mac | macOS 14 或更高版本；蓝牙模式需支持并开启 Bluetooth LE |
 | iPhone | 保持解锁，使用可传输数据的 USB 线连接 |
-| 权限与设置 | Mac 授予相机和蓝牙权限；iPhone 信任此 Mac 并开启辅助触控 |
+| 权限与设置 | Mac 授予相机权限、iPhone 信任此 Mac；蓝牙模式另需蓝牙权限、配对与辅助触控 |
+| USB 触控（可选） | iOS 17+、兼容的 Apple Silicon 主机框架、开发者模式与兼容 DDI；并非所有系统组合均已验证 |
 
 ### 方式一：下载 Release 安装包（推荐）
 
@@ -66,7 +69,7 @@ Mac 使用 AVFoundation 采集 USB 画面，通过 Bluetooth LE HID 提供鼠标
 1. 打开 [GitHub Releases](https://github.com/YueChen-C/iPhone-use/releases)，在目标版本的 **Assets** 中下载 `iPhoneUse-v<版本号>-macOS-universal.zip`。同一个 ZIP 支持 Apple Silicon 和 Intel Mac；`Source code` 是源码归档，不是应用安装包。
 2. 解压 ZIP，将 `iPhoneUse.app` 拖入“应用程序”（`/Applications`）。
 3. 双击打开应用。当前自动构建使用临时签名，未经过 Apple 公证；如 macOS 阻止打开，确认下载来源后，按“系统设置 → 隐私与安全性”的提示允许打开。
-4. 按下方[连接并配对 iPhone](#连接并配对-iphone)完成 USB 信任、相机与蓝牙授权、辅助触控配对，即可使用鼠标和键盘操作手机。
+4. 按下方[连接并配对 iPhone](#连接并配对-iphone)使用默认蓝牙控制，或按 [USB 触控说明](#usb-touch)配置兼容的 iOS 17+ 设备。
 
 如需校验安装包，将该版本的 ZIP 和 `SHA256SUMS.txt` 下载到同一目录，在该目录运行：
 
@@ -97,6 +100,18 @@ cd iPhone-use
 5. 等待画面与控制连接就绪，即可在手机窗口内使用 Mac 的鼠标和键盘。
 
 使用 MCP 或 API 时，请保持主程序运行。默认模式下，关闭最后一个窗口会退出程序并停止服务；如希望关闭窗口后继续保留后台服务，且在无等待窗口时启动或插线不自动弹窗（已打开且未最小化的等待窗口会在接入手机时就地切换为设备窗口），可在菜单 **iPhone Use → 后台静默常驻** 开启（或使用 `--resident-quiet` 启动）。
+
+<a id="usb-touch"></a>
+
+### USB 触控（iOS 17+，实验性）
+
+1. 通过 USB 连接并信任这台 iPhone，保持解锁、亮屏和竖屏。按系统要求开启开发者模式，并准备提供 HID 服务的兼容开发者镜像（DDI）。
+2. 在对应手机窗口的输入后端下拉框选择 **USB Touch**。就绪后，可使用鼠标点击、按住拖动后释放、滚轮滑动，以及键盘输入；HTTP/MCP 操作也使用该设备所选的后端。
+3. 缺少兼容 DDI 或 HID 服务不可用时，应用内提示层会提供 **开启 USB 操控…**。点击即可下载约 18 MB 镜像到应用缓存，无需选择保存位置；**下载不等于安装**，后续仍需核对安装与恢复计划，详见 [DDI 设置与管理](docs/USB_DDI_MANAGEMENT.md)。
+
+**iOS 17 以下不能切换到 USB Touch**：应用内会提示最低版本并保留原后端；无法读取系统版本时也不会放行。iOS 17+ 是最低版本要求，不代表任意 Mac、DDI 或 iOS 版本组合均可用。当前真机验收覆盖 iOS 26.5 与兼容的 Apple Silicon 主机，其他组合仍需验证。
+
+USB 输入不依赖蓝牙配对，但关闭辅助触控后的兼容性尚未验收；这不是“无需辅助触控”的承诺。蓝牙仍为默认模式，USB 不可用时不会自动将操作转发到蓝牙。
 
 ## 接入 AI Agent
 
@@ -205,7 +220,7 @@ MCP 参数示例：`get_ax_tree({"device":"<完整设备ID>","include_offscreen"
 - **设备状态**：iPhone 需要保持解锁；当前主要支持竖屏流程，未保证横屏与动态旋转行为。
 - **指针精度**：部分设备需要[指针校准](docs/user-guide.md#指针校准)，定位效果会受机型、iOS 版本和指针设置影响。
 - **文字输入**：直接输入使用 US 键盘布局，仅支持 ASCII。其他文字需要借助手机已配置的输入法或 Apple 通用剪贴板；剪贴板共享仍需满足 Apple 的相关条件。
-- **连接排查**：有画面但不能操作时，先检查蓝牙配对和辅助触控，再通过 `/status` 查看连接状态，或阅读[故障排查](docs/user-guide.md#常见问题与限制)。
+- **连接排查**：有画面但不能操作时，蓝牙模式检查配对和辅助触控；USB 模式检查 iOS 版本、开发者模式、DDI 与应用内提示。通过 `/status` 查看所选后端和就绪状态，或阅读[故障排查](docs/user-guide.md#常见问题与限制)。
 
 ## 文档
 

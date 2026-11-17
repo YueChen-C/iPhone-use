@@ -16,6 +16,9 @@ enum MCPToolCatalog {
         let maxEdge: [String: Any] = ["type": "integer", "minimum": 1, "default": MCPServer.longEdge]
         return [
             tool("list_devices", table.toolListDevices, [:], readOnly: true),
+            tool("set_input_backend", language == .zh ? "显式选择此设备的蓝牙或USB触控后端；USB失败不自动回退。"
+                : "Explicitly select Bluetooth or native USB touch for one device; no automatic fallback.",
+                ["device": device, "backend": ["type": "string", "enum": ["ble", "usb"]]], required: ["backend"]),
             tool(
                 "screenshot", table.toolScreenshot, ["device": device, "include_image": includeImage], readOnly: true),
             tool("get_ax_tree", language == .zh
@@ -102,11 +105,14 @@ enum MCPToolCatalog {
                     "device": device, "include_image": ["type": "boolean"],
                 ]),
             tool("home", table.toolHome, ["device": device]),
+            tool("power", language == .zh ? "电源/锁屏短按一次；效果取决于设备状态，不自动重试。" : "Short-press Power/Lock once; state-dependent, never automatically retry.", ["device": device]),
+            tool("volume_up", language == .zh ? "短按音量加一次。" : "Short-press Volume Up once.", ["device": device]),
+            tool("volume_down", language == .zh ? "短按音量减一次。" : "Short-press Volume Down once.", ["device": device]),
             tool(
                 "act",
                 language == .zh
-                    ? "顺序执行点击、文字点击、滑动、输入、按键、主屏幕、延时与等待文字；失败立即停止。"
-                    : "Execute ordered tap, tap_text, swipe, type, key, home, delay and wait_text steps; stop on failure.",
+                    ? "顺序执行点击、文字点击、滑动、输入、按键、主屏幕、电源短按、音量、延时与等待文字；失败立即停止。"
+                    : "Execute ordered tap, tap_text, swipe, type, key, home, power, volume_up, volume_down, delay and wait_text steps; stop on failure.",
                 [
                     "steps": actSteps,
                     "device": device,
@@ -154,7 +160,7 @@ enum MCPToolCatalog {
                         ], ["points"]),
                     step("type", typing, ["text"]),
                     step("key", ["key": text, "modifiers": ["type": "array", "items": text]], ["key"]),
-                    step("home", [:]),
+                    step("home", [:]), step("power", [:]), step("volume_up", [:]), step("volume_down", [:]),
                     step("delay", ["seconds": ["type": "number", "minimum": 0, "maximum": 6]], ["seconds"]),
                     step("wait_text", waiting, ["text"]),
                 ]
@@ -203,6 +209,11 @@ struct MCPToolRequest {
     ) throws -> MCPToolRequest? {
         let device = (arguments["device"] as? String) ?? (arguments["device_id"] as? String)
         switch name {
+        case "set_input_backend":
+            guard let backend = arguments["backend"] as? String, InputBackendKind(rawValue: backend) != nil else {
+                throw DeviceError("backend must be ble or usb")
+            }
+            return MCPToolRequest(path: "/input/backend", body: withDevice(["backend": backend], device))
         case "act":
             let batch = try ActRequest(arguments)
             let steps = try batch.steps.map { step -> [String: Any] in
@@ -279,8 +290,8 @@ struct MCPToolRequest {
             return MCPToolRequest(
                 path: "/key",
                 body: withDevice(["key": arguments["key"] ?? "", "modifiers": arguments["modifiers"] ?? []], device))
-        case "home":
-            return MCPToolRequest(path: "/home", body: withDevice([:], device))
+        case "home", "power", "volume_up", "volume_down":
+            return MCPToolRequest(path: "/" + name, body: withDevice([:], device))
         default:
             return nil
         }

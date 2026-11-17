@@ -16,11 +16,13 @@ enum ControlAPI {
         case key = "/key"
         case home = "/home"
         case power = "/power"
+        case volumeUp = "/volume_up"
+        case volumeDown = "/volume_down"
 
         var requiresPointer: Bool {
             switch self {
             case .tap, .swipe, .move: true
-            case .nudge, .type, .key, .home, .power: false
+            case .nudge, .type, .key, .home, .power, .volumeUp, .volumeDown: false
             }
         }
     }
@@ -57,6 +59,13 @@ enum ControlAPI {
                 return status()
             case ("GET", "/devices"):
                 return deviceList()
+            case ("POST", "/input/backend"):
+                guard let raw = body["backend"] as? String, let backend = InputBackendKind(rawValue: raw) else {
+                    return .error("backend must be ble or usb")
+                }
+                let device = try DeviceRegistry.shared.find(deviceQuery)
+                try USBInputController.shared.select(backend, device: device)
+                return .json(["ok": true, "device": device.id, "input": USBInputController.shared.status(device)])
             case ("GET", "/ax_tree"), ("POST", "/ax_tree"):
                 return AXTreeEndpoint.response(request,
                     resolve: { try DeviceRegistry.shared.find($0).id }, capture: axCapture)
@@ -115,6 +124,19 @@ enum ControlAPI {
                 }
                 return try perform(action, body: body, deviceQuery: deviceQuery)
             }
+        } catch let error as TypeTextRequest.USBInputModeUnconfirmed {
+            return .json(["error": error.description, "code": "input_mode_unconfirmed", "backend": "usb",
+                          "reason": error.reason.rawValue, "textDispatched": false, "replayAllowed": false], status: 409)
+        } catch let error as TypeTextRequest.USBCandidateUnconfirmed {
+            return .json(["error": error.description, "code": "input_candidate_unconfirmed", "backend": "usb",
+                          "reason": "candidate_unconfirmed", "textDispatched": true, "mayHaveExecuted": true,
+                          "replayAllowed": false], status: 409)
+        } catch let error as TypeTextRequest.USBObservationBudgetExceeded {
+            return .json(["error": error.description, "code": "input_observation_timeout", "backend": "usb",
+                          "reason": "observation_budget_exceeded", "textDispatched": error.textDispatched,
+                          "mayHaveExecuted": error.inputDispatched, "replayAllowed": false], status: 409)
+        } catch let error as USBInputFailure {
+            return .json(error.json, status: error.httpStatus)
         } catch DeviceInput.InputError.pointerBusy {
             return .error("\(DeviceInput.InputError.pointerBusy)", status: 409)
         } catch {
@@ -141,7 +163,7 @@ enum ControlAPI {
         guard ProcessInfo.processInfo.systemUptime < deadline else { return }
         let screenPaths: Set<String> = ["/devices", "/status", "/", "/screenshot", "/ocr"]
         let controlPaths: Set<String> = [
-            "/move", "/tap", "/tap_text", "/swipe", "/type", "/key", "/home", "/power", "/nudge", "/act",
+            "/move", "/tap", "/tap_text", "/swipe", "/type", "/key", "/home", "/power", "/volume_up", "/volume_down", "/nudge", "/act",
         ]
         guard screenPaths.contains(request.path) || controlPaths.contains(request.path) else { return }
         waitUntilReady(deadline: deadline) {
@@ -150,6 +172,9 @@ enum ControlAPI {
                     $0.id == target.screen.id && $0.size != nil
                 }
                 guard controlPaths.contains(request.path) else { return frameReady }
+                if USBInputController.shared.selected(target.id) == .usb {
+                    return frameReady && USBInputController.shared.input(target)?.isReady == true
+                }
                 return frameReady && target.host != nil
                     && (try? DeviceRegistry.shared.input(for: target).isPointerReady) == true
             }
@@ -203,7 +228,8 @@ enum ControlAPI {
             return info
         }
         return .json([
-            "bluetooth": HIDPeripheral.shared.state,
+            "bluetooth": ProcessInfo.processInfo.environment["IPHONE_USE_DISABLE_BLUETOOTH"] == "1"
+                ? "disabled" : HIDPeripheral.shared.state,
             "bluetoothHosts": hosts,
             "capture": captureStatus(),
             "devices": DeviceRegistry.shared.status(),
@@ -301,6 +327,10 @@ enum ControlAPI {
 
     private static func tapTextPoint(_ id: String, _ x: Double, _ y: Double, _ hold: Double) throws {
         let device = try DeviceRegistry.shared.find(id)
+        if USBInputController.shared.selected(device.id) == .usb {
+            try usbInput(device).gesture("tap", points: [.init(x: x, y: y)], duration: hold)
+            return
+        }
         let input = try DeviceRegistry.shared.input(for: device)
         guard input.isPointerReady else {
             input.invalidatePointerEstimate(preservingBackgroundMotion: true)
@@ -314,6 +344,43 @@ enum ControlAPI {
         _ action: Action, body: [String: Any], deviceQuery: String?
     ) throws -> HTTPResponse {
         let device = try DeviceRegistry.shared.find(deviceQuery)
+        if USBInputController.shared.selected(device.id) == .usb {
+            let input = try usbInput(device)
+            guard input.isReady else { throw USBInputFailure(.notReady, "USB input not ready; no Bluetooth fallback") }
+            switch action {
+            case .tap:
+                let (x, y) = try USBRequestCoordinates.point(
+                    body, "x", "y", screenSize: device.screen.size, screenName: device.screen.name)
+                try input.gesture("tap", points: [.init(x: x, y: y)], duration: USBRequestCoordinates.hold(body))
+            case .swipe:
+                let swipe = try SwipeRequest(body, screenSize: device.screen.size,
+                                             screenName: device.screen.name, strictUSB: true)
+                try input.gesture("swipe", points: swipe.points.map { .init(x: $0.0, y: $0.1) }, duration: swipe.duration)
+            case .type, .key:
+                guard input.isKeyboardReady else {
+                    throw USBInputFailure(.unsupported, "Keyboard unavailable on selected USB session; no Bluetooth fallback")
+                }
+                if action == .type {
+                    let request = try TypeTextRequest(body, language: AppLanguageStore.shared.language)
+                    try input.type(request, ocr: {
+                        guard let frame = device.screen.snapshotObservation(png: false, maxEdge: 1600) else { return nil }
+                        return USBKeyboardModeOCR.observe(frame.data, device: device.id, receivedAt: frame.receivedAt,
+                                                          includeCandidate: request.ensureChineseIME)
+                    })
+                } else {
+                    guard let key = body["key"] as? String else { return .error(StringsAPI.current.keyRequired) }
+                    try input.key(key, modifiers: (body["modifiers"] as? [String]) ?? [])
+                }
+            case .home, .power, .volumeUp, .volumeDown:
+                guard let button = USBHardwareButton(rawValue: String(action.rawValue.dropFirst())) else {
+                    throw USBInputFailure(.unsupported, "Unknown USB button")
+                }
+                try input.button(button)
+            default:
+                throw USBInputFailure(.unsupported, "Operation unsupported by selected USB touch backend")
+            }
+            return .json(["ok": true, "device": device.id, "backend": "usb", "uiVerified": false])
+        }
         // Reject unverified coordinates before cancellation so retrying clients
         // cannot repeatedly interrupt the calibration needed to serve them.
         // Ready gestures and keyboard/raw input still preempt background work.
@@ -358,6 +425,8 @@ enum ControlAPI {
             // Consumer Power is a short, state-dependent key press. Never
             // retry it automatically or claim that an accepted report locked iOS.
             input.consumer(0x0030)
+        case .volumeUp: input.consumer(0x00E9)
+        case .volumeDown: input.consumer(0x00EA)
         }
         return .json(["ok": true, "device": device.id])
     }
@@ -368,6 +437,13 @@ enum ControlAPI {
         try RequestCoordinates.point(
             body, xKey, yKey, screenSize: device.screen.size, screenName: device.screen.name)
     }
+
+    private static func usbInput(_ device: Device) throws -> USBDeviceInput {
+        guard let input = USBInputController.shared.input(device) else {
+            throw USBInputFailure(.notReady, "USB session unavailable; select USB explicitly to prepare")
+        }
+        return input
+    }
 }
 
 /// Validates the entire path before input begins. Every point uses the same
@@ -376,7 +452,7 @@ struct SwipeRequest {
     let points: [(Double, Double)]
     let duration: TimeInterval
 
-    init(_ body: [String: Any], screenSize: CGSize?, screenName: String) throws {
+    init(_ body: [String: Any], screenSize: CGSize?, screenName: String, strictUSB: Bool = false) throws {
         let table = StringsAPI.current
         guard let rawPoints = body["points"] as? [[String: Any]], rawPoints.count >= 2 else {
             throw DeviceError(table.swipePointsMin)
@@ -416,8 +492,9 @@ struct SwipeRequest {
         points = try coordinates.map { x, y in
             coordinateBody["x"] = x
             coordinateBody["y"] = y
-            let point = try RequestCoordinates.point(
-                coordinateBody, "x", "y", screenSize: screenSize, screenName: screenName)
+            let point = try strictUSB
+                ? USBRequestCoordinates.point(coordinateBody, "x", "y", screenSize: screenSize, screenName: screenName)
+                : RequestCoordinates.point(coordinateBody, "x", "y", screenSize: screenSize, screenName: screenName)
             guard point.0.isFinite, point.1.isFinite else {
                 throw DeviceError(table.swipeInvalidDimensions)
             }
@@ -551,7 +628,7 @@ struct ActRequest {
         var waitBudget = 0.0
         for step in steps {
             guard let type = step["type"] as? String,
-                ["tap", "tap_text", "swipe", "type", "key", "home", "delay", "wait_text"].contains(type),
+                ["tap", "tap_text", "swipe", "type", "key", "home", "power", "volume_up", "volume_down", "delay", "wait_text"].contains(type),
                 step["device"] == nil, step["device_id"] == nil
             else { throw DeviceError("Invalid act step or nested device selector") }
             _ = try OCRRequest.maxEdge(step)
@@ -605,6 +682,7 @@ struct ActRequest {
         now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         execute: (String, [String: Any], String?) throws -> HTTPResponse
     ) throws -> HTTPResponse {
+        var priorInputDispatched = false
         for (index, step) in steps.enumerated() {
             do {
                 let type = step["type"] as! String
@@ -629,13 +707,18 @@ struct ActRequest {
                     if response.status != 200 {
                         let body = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any]
                         let message = body?["error"] as? String ?? String(decoding: response.body, as: UTF8.self)
-                        return .json(
-                            [
-                                "ok": false, "failed_step": index + 1, "completed": index,
-                                "error": message,
-                            ], status: response.status)
+                        var failure: [String: Any] = [
+                            "ok": false, "failed_step": index + 1, "completed": index, "error": message,
+                        ]
+                        failure.merge(USBInputFailure.metadata(from: body ?? [:], priorInput: priorInputDispatched)) { _, new in new }
+                        return .json(failure, status: response.status)
                     }
+                    priorInputDispatched = true
                 }
+            } catch let error as USBInputFailure {
+                var failure = error.includingPriorInput(priorInputDispatched).json
+                failure.merge(["ok": false, "failed_step": index + 1, "completed": index]) { _, new in new }
+                return .json(failure, status: error.httpStatus)
             } catch {
                 return .json(
                     ["ok": false, "failed_step": index + 1, "completed": index, "error": "\(error)"], status: 400)
