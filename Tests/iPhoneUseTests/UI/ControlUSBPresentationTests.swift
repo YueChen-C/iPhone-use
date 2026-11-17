@@ -77,6 +77,62 @@ final class ControlUSBPresentationTests: XCTestCase {
 
     private func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
 
+    func testSetupOfferRequiresMissingDDIOrTypedServiceEvidenceAndCurrentScreen() {
+        XCTAssertTrue(presentation(.requiresDDI).offersUSBSetup)
+        for reason in [USBPreparationFailure.Reason.serviceUnavailable, .touchscreenUnavailable] {
+            XCTAssertTrue(presentation(.failed, reason: reason).offersUSBSetup)
+            XCTAssertFalse(presentation(.failed, reason: reason, hasScreen: false).offersUSBSetup)
+        }
+        for state in InputBackendReadiness.allCases where state != .requiresDDI {
+            XCTAssertFalse(presentation(state, ready: state == .ready, detail: "DDI service unavailable").offersUSBSetup)
+        }
+        XCTAssertFalse(presentation(.failed, reason: .displayUnavailable).offersUSBSetup)
+        XCTAssertFalse(presentation(.unsupportedHost, reason: .serviceUnavailable).offersUSBSetup)
+        XCTAssertFalse(presentation(.requiresDDI, hasScreen: false).offersUSBSetup)
+    }
+
+    func testOverlaySetupProgressCancellationRetryAndReviewNeverReconnectBluetooth() throws {
+        let old = AppLanguageStore.shared.language
+        defer { AppLanguageStore.shared.set(old) }
+        AppLanguageStore.shared.set(.en)
+        let overlay = ControlConnectionOverlay(frame: NSRect(x: 0, y: 0, width: 400, height: 800))
+        overlay.updateUSB(presentation(.requiresDDI))
+        let views = descendants(overlay)
+        let buttons = views.compactMap { $0 as? NSButton }
+        let setup = try XCTUnwrap(buttons.first { $0.title == StringsUSBSetup.en.enable })
+        let viewOnly = try XCTUnwrap(buttons.first { $0.title == StringsUSBControl.en.viewOnly })
+        let bar = try XCTUnwrap(views.compactMap { $0 as? NSProgressIndicator }.first)
+        var enables = 0, cancels = 0
+        overlay.onEnableUSB = { enables += 1 }
+        overlay.onCancelUSBSetup = { cancels += 1 }
+        XCTAssertTrue(try XCTUnwrap(buttons.first { $0.title == StringsUI.en.overlayButtonReconnect }).isHidden)
+        XCTAssertFalse(setup.isHiddenOrHasHiddenAncestor)
+        XCTAssertTrue(views.compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue.contains(StringsUSBSetup.en.consent) && !$0.isHiddenOrHasHiddenAncestor
+        })
+        setup.performClick(nil)
+        XCTAssertEqual(enables, 1)
+        overlay.updateSetup(.inspecting)
+        XCTAssertFalse(bar.isHidden); XCTAssertTrue(bar.isIndeterminate)
+        XCTAssertFalse(viewOnly.isEnabled)
+        XCTAssertEqual(setup.title, StringsUSBSetup.en.cancel)
+        setup.performClick(nil)
+        XCTAssertEqual(cancels, 1)
+        overlay.updateSetup(.downloading(5, 10))
+        XCTAssertFalse(bar.isIndeterminate); XCTAssertEqual(bar.doubleValue, 0.5)
+        overlay.updateSetup(.failed)
+        XCTAssertTrue(bar.isHidden); XCTAssertTrue(viewOnly.isEnabled)
+        XCTAssertEqual(setup.title, StringsUSBSetup.en.enable)
+        overlay.updateSetup(.prepared)
+        XCTAssertEqual(setup.title, StringsUSBSetup.en.review)
+        setup.performClick(nil)
+        XCTAssertEqual(enables, 2)
+        AppLanguageStore.shared.set(.zh); overlay.refreshLocalization()
+        XCTAssertEqual(setup.title, StringsUSBSetup.zh.review)
+        overlay.updateUSB(nil)
+        XCTAssertTrue(setup.isHidden); XCTAssertTrue(bar.isHidden); XCTAssertTrue(viewOnly.isEnabled)
+    }
+
     func testUSBFaultShowsExistingOverlayWithoutBluetoothReconnectOrPairing() throws {
         let old = AppLanguageStore.shared.language
         defer { AppLanguageStore.shared.set(old) }
@@ -112,7 +168,7 @@ final class ControlUSBPresentationTests: XCTestCase {
         overlay.refreshLocalization()
         XCTAssertTrue(overlay.isDismissed)
         let fields = descendants(overlay).compactMap { $0 as? NSTextField }
-        XCTAssertTrue(fields.contains { $0.stringValue == StringsUSBControl.zh.guidance(.services) })
+        XCTAssertTrue(fields.contains { $0.stringValue.contains(StringsUSBControl.zh.guidance(.services)) })
         overlay.updateUSB(nil)
         XCTAssertFalse(overlay.isDismissed)
         XCTAssertFalse(overlay.isHidden)

@@ -36,6 +36,11 @@ final class ControlConnectionOverlay: NSView {
     private var usbPresentation: ControlUSBPresentation?
     private var instructionsField: NSTextField?
     private var helpField: NSTextField?
+    var onEnableUSB: (() -> Void)?
+    var onCancelUSBSetup: (() -> Void)?
+    private var setup: USBSetupPresentation?
+    private let setupButton = NSButton(title: "", target: nil, action: nil)
+    private let setupProgress = NSProgressIndicator()
 
     private var cardView: NSView?
     private let reconnectButton = NSButton(title: "", target: nil, action: nil)
@@ -143,6 +148,15 @@ final class ControlConnectionOverlay: NSView {
         viewOnlyButton.target = self
         viewOnlyButton.action = #selector(onViewOnlyClicked)
 
+        setupButton.title = StringsUSBSetup.current.enable
+        setupButton.bezelStyle = .rounded
+        setupButton.target = self
+        setupButton.action = #selector(onEnableUSBClicked)
+        setupButton.isHidden = true
+        setupProgress.style = .bar
+        setupProgress.minValue = 0; setupProgress.maxValue = 1
+        setupProgress.isHidden = true
+
         let stack = NSStackView(views: [viewOnlyButton, reconnectButton])
         stack.orientation = .horizontal
         stack.spacing = 12
@@ -154,7 +168,8 @@ final class ControlConnectionOverlay: NSView {
     private func makeMessageStack(
         card: NSView, icon: NSImageView, instructions: NSTextField, help: NSTextField, buttons: NSStackView
     ) -> NSStackView {
-        let stack = NSStackView(views: [icon, title, message, instructions, help, buttons])
+        // Keep the longer setup action on its own row in narrow phone windows.
+        let stack = NSStackView(views: [icon, title, message, instructions, help, setupProgress, setupButton, buttons])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 12
@@ -219,6 +234,7 @@ final class ControlConnectionOverlay: NSView {
             message.widthAnchor.constraint(equalTo: stack.widthAnchor),
             instructions.widthAnchor.constraint(equalTo: stack.widthAnchor),
             help.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            setupProgress.widthAnchor.constraint(equalTo: stack.widthAnchor),
             buttons.heightAnchor.constraint(greaterThanOrEqualToConstant: 28),
         ])
     }
@@ -233,6 +249,17 @@ final class ControlConnectionOverlay: NSView {
 
     @objc private func onViewOnlyClicked() {
         setDismissed(true)
+    }
+
+    @objc private func onEnableUSBClicked() {
+        guard usbPresentation?.offersUSBSetup == true else { return }
+        if setup?.isWorking == true { onCancelUSBSetup?(); return }
+        onEnableUSB?()
+    }
+
+    func updateSetup(_ state: USBSetupPresentation?) {
+        setup = state
+        update(lastStatus)
     }
 
     @objc private func onShowGuidanceClicked() {
@@ -259,6 +286,10 @@ final class ControlConnectionOverlay: NSView {
         }
         isHidden = !status.showsOverlay
         let table = StringsUI.current
+        setupButton.isHidden = true
+        setupProgress.isHidden = true
+        setupProgress.stopAnimation(nil)
+        viewOnlyButton.isEnabled = true
         setAccessibilityLabel(table.overlayAccessibility)
         icon.image = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right.slash", accessibilityDescription: nil)
         message.toolTip = nil
@@ -304,6 +335,7 @@ final class ControlConnectionOverlay: NSView {
 
     func updateUSB(_ presentation: ControlUSBPresentation?) {
         let changedBackend = (usbPresentation == nil) != (presentation == nil)
+        if changedBackend { setup = nil }
         usbPresentation = presentation
         if changedBackend { setDismissed(false) }
         update(lastStatus)
@@ -323,6 +355,25 @@ final class ControlConnectionOverlay: NSView {
         message.stringValue = table.status(presentation)
         message.toolTip = presentation.detail.isEmpty ? nil : presentation.detail
         helpField?.stringValue = table.guidance(presentation.recovery)
+        if presentation.offersUSBSetup {
+            helpField?.stringValue += "\n\n" + StringsUSBSetup.current.consent
+        }
+        let working = setup?.isWorking == true
+        setupButton.title = working ? StringsUSBSetup.current.cancel
+            : (setup == .prepared ? StringsUSBSetup.current.review : StringsUSBSetup.current.enable)
+        setupButton.isHidden = !presentation.offersUSBSetup
+        setupButton.isEnabled = true
+        setupProgress.isHidden = !working
+        viewOnlyButton.isEnabled = !working
+        if let setup, presentation.offersUSBSetup {
+            helpField?.stringValue = StringsUSBSetup.current.progress(setup)
+            if setup == .failed || setup == .cancelled {
+                helpField?.stringValue += "\n\n" + StringsUSBSetup.current.consent
+            }
+            setupProgress.isIndeterminate = setup.fraction == nil
+            setupProgress.doubleValue = setup.fraction ?? 0
+            if working { setupProgress.startAnimation(nil) } else { setupProgress.stopAnimation(nil) }
+        }
         viewOnlyButton.title = table.viewOnly
         pillLabel.stringValue = table.pill
         pillButton.title = table.showGuidance

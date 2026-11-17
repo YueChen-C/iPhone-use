@@ -276,6 +276,10 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     private let content: ControlWindowContent
     private var lastKnownDevice: Device?
     private var languageObserver: NSObjectProtocol?
+    private var setupDownload: DDIDownload?
+    private var setupGeneration = UUID()
+    private var preparedDDI: DDIDownload.Prepared?
+    private var ddiReview: DDIReviewWindowController?
     var onClose: (() -> Void)?
     var onDeminiaturize: (() -> Void)?
 
@@ -303,15 +307,20 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         sidebar.onAction = { [weak controlView] shortcut in
             controlView?.performShortcut(shortcut)
         }
-        sidebar.onBackendChange = { [weak controlView] backend in controlView?.selectBackend(backend) }
+        sidebar.onBackendChange = { [weak self] backend in
+            self?.cancelUSBSetup(); self?.controlView.selectBackend(backend)
+        }
+        content.onEnableUSB = { [weak self] in self?.beginUSBSetup() }
+        content.onCancelUSBSetup = { [weak self] in self?.cancelUSBSetup() }
         controlView.onShortcutStateChanged = { [weak sidebar] available, status in
             sidebar?.update(available: available, status: status)
         }
         controlView.onConnectionStateChanged = { [weak content] status in
             content?.updateConnectionState(status)
         }
-        controlView.onUSBPresentationChanged = { [weak content] presentation in
-            content?.updateUSBPresentation(presentation)
+        controlView.onUSBPresentationChanged = { [weak self] presentation in
+            if presentation?.offersUSBSetup != true { self?.cancelUSBSetup() }
+            self?.content.updateUSBPresentation(presentation)
         }
         controlView.onLockStateChanged = { [weak content] state in
             content?.updateLockState(state)
@@ -325,6 +334,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func updateDevice(_ device: Device?) {
+        if lastKnownDevice?.screen !== device?.screen { cancelUSBSetup() }
         lastKnownDevice = device.flatMap { $0.id == deviceID ? $0 : nil }
         applyWindowStrings()
         sidebar.updateBackend(controlView.selectedBackend)
@@ -353,7 +363,67 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         content.refreshLocalization()
     }
 
-    func stop() { controlView.stop() }
+    func stop() { cancelUSBSetup(); controlView.stop() }
+
+    private func cancelUSBSetup() {
+        setupGeneration = UUID()
+        guard setupDownload != nil else { return }
+        setupDownload?.cancel(); setupDownload = nil
+        content.updateUSBSetup(.cancelled)
+    }
+
+    private func reviewPreparedDDI(_ prepared: DDIDownload.Prepared, physicalID: String) {
+        if ddiReview == nil { ddiReview = DDIReviewWindowController(language: AppLanguageStore.shared.language) }
+        ddiReview?.useDownloadedCandidate(prepared, physicalID: physicalID)
+        ddiReview?.showWindow(nil); ddiReview?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func beginUSBSetup() {
+        guard setupDownload == nil, let device = lastKnownDevice, device.id == deviceID,
+              controlView.selectedBackend == .usb,
+              ControlUSBPresentation(snapshot: USBInputController.shared.status(device), inputReady: false,
+                                     hasScreen: true).offersUSBSetup else { return }
+        if let preparedDDI { reviewPreparedDDI(preparedDDI, physicalID: device.id); return }
+        let generation = UUID(); setupGeneration = generation
+        downloadDDI(for: device, generation: generation)
+    }
+
+    private func downloadDDI(for device: Device, generation: UUID) {
+        guard let executable = Bundle.main.executableURL else { return }
+        let download = DDIDownload(); setupDownload = download
+        content.updateUSBSetup(.inspecting)
+        let update: (USBSetupPresentation) -> Void = { [weak self] state in
+            DispatchQueue.main.async {
+                guard let self, self.setupGeneration == generation else { return }
+                self.content.updateUSBSetup(state)
+            }
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let outcome = Result { () throws -> DDIDownload.Prepared in
+                let inspected = try DDIReviewClient(executable: executable).run(.inspect(device.id))
+                guard let object = try JSONSerialization.jsonObject(with: Data(inspected.json.utf8)) as? [String: Any],
+                      let product = object["productType"] as? String else {
+                    throw DDIManagementError("Device inspection did not return a product type")
+                }
+                return try download.prepareCached(productType: product, progress: update)
+            }
+            DispatchQueue.main.async {
+                guard let self, self.setupGeneration == generation else { return }
+                self.setupDownload = nil
+                guard self.lastKnownDevice?.screen === device.screen, self.controlView.selectedBackend == .usb else { return }
+                switch outcome {
+                case .success(let prepared):
+                    self.preparedDDI = prepared
+                    self.content.updateUSBSetup(.prepared)
+                case .failure(let error):
+                    // Do not show server URLs, device identifiers or technical
+                    // source/fallback details in the user-facing progress text.
+                    log("DDI preparation failed: \(error)")
+                    self.content.updateUSBSetup(error is CancellationError ? .cancelled : .failed)
+                }
+            }
+        }
+    }
 
     func windowDidResignKey(_ notification: Notification) {
         controlView.cancelInteraction()
@@ -387,6 +457,15 @@ private final class ControlWindowContent: NSView {
     private let phoneView: NSView
     private let connectionOverlay = ControlConnectionOverlay(frame: .zero)
     private let lockNotice = ControlLockNotice(frame: .zero)
+    var onEnableUSB: (() -> Void)? {
+        get { connectionOverlay.onEnableUSB }
+        set { connectionOverlay.onEnableUSB = newValue }
+    }
+    var onCancelUSBSetup: (() -> Void)? {
+        get { connectionOverlay.onCancelUSBSetup }
+        set { connectionOverlay.onCancelUSBSetup = newValue }
+    }
+    func updateUSBSetup(_ state: USBSetupPresentation) { connectionOverlay.updateSetup(state) }
 
     init(phoneView: NSView, sidebar: ControlSidebar) {
         self.phoneView = phoneView

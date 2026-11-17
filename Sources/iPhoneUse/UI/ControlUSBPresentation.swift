@@ -30,6 +30,11 @@ struct ControlUSBPresentation: Equatable {
     }
 
     var showsOverlay: Bool { state != .ready }
+    // Service absence is an offer to inspect/setup, never a diagnosis or grant
+    // to replace an image. Trust/identity/host/display errors keep their own gates.
+    var offersUSBSetup: Bool {
+        hasScreen && (state == .requiresDDI || recovery == .services)
+    }
     var recovery: Recovery {
         if !hasScreen { return .connect }
         if reason == .displayUnavailable { return .display }

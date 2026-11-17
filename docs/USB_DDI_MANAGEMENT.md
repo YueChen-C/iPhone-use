@@ -1,8 +1,42 @@
 # Native DDI management (experimental)
 
 DDI lifecycle management is separate from touch. Neither input preparation nor
-HTTP/MCP touch requests invoke this CLI. The app does not download, redistribute,
-or bundle Apple images, run Python, or invoke a third-party mounting tool.
+HTTP/MCP touch requests invoke this CLI. The app does not bundle Apple images,
+run Python, or invoke a third-party mounting tool.
+
+## USB setup from the phone overlay
+
+When USB is explicitly selected and the original screen is present, a missing
+DDI or typed unavailable HID-service/surface state offers **Enable USB control…**.
+An unavailable service alone does not diagnose a DDI problem. Trust, identity,
+host, display and other failures retain their separate instructions.
+
+The text beside the button explains the approximately 18 MB download,
+free-space/network requirements and possible replacement of the developer image.
+Clicking starts preparation immediately, without a confirmation sheet or save
+dialog. Downloads live in `~/Library/Caches/iPhoneUse/DDI/`; a cached revision is
+reused only after checking its embedded pins and product-specific preflight.
+Invalid entries are replaced without touching unrelated cache files. It does not
+upgrade iOS or automatically change Developer Mode.
+The existing overlay shows device inspection, transferred bytes/percentage,
+verification, cancellation, failure and **downloaded, not installed** completion.
+Source routing is intentionally not exposed in these user-facing messages.
+
+Native URLSession first tries the pinned Gitee `DDI-27B52` release attachment,
+then the exact upstream GitHub revision's raw payload files if necessary. Both
+paths verify independent embedded SHA256 pins and perform product-specific DDI
+preflight. Raw fallback uses local companion version metadata. No credentials
+are required. The release tag must not be resolved to a repository source ZIP.
+Cancellation, closing/disconnecting the window or explicit backend changes
+invalidate callbacks and never start a fallback, mount or input replay.
+
+**Continue installation setup…** pre-fills the existing Plan & Review window's
+exact device, candidate and receipt. It does not install automatically: supply
+the actual current-image baseline, review a plan, cleanly stop all input owners,
+and separately confirm offline installation. This release does not yet provide
+one-click installation or automatically back up an unknown mounted image.
+Download success is not device compatibility, authenticated Apple provenance,
+permission to redistribute images, or proof that USB control is ready.
 
 ## Desktop plan and review
 
