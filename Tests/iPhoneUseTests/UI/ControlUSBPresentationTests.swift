@@ -77,6 +77,55 @@ final class ControlUSBPresentationTests: XCTestCase {
 
     private func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
 
+    func testVersionRefusalUsesExistingCardSurvivesPollingAndAcknowledgesWithoutUSBSetup() throws {
+        let old = AppLanguageStore.shared.language
+        defer { AppLanguageStore.shared.set(old) }
+        AppLanguageStore.shared.set(.en)
+        let overlay = ControlConnectionOverlay(frame: NSRect(x: 0, y: 0, width: 400, height: 800))
+        overlay.update(.connected)
+        XCTAssertTrue(overlay.isHidden)
+        let message = StringsUSBControl.en.requiresiOS17("15.4")
+        overlay.showBackendSelectionFailure(message)
+        for _ in 0..<3 { overlay.update(.connected); overlay.updateUSB(nil) }
+        XCTAssertFalse(overlay.isHidden)
+        XCTAssertFalse(overlay.isDismissed)
+        let views = descendants(overlay)
+        XCTAssertTrue(views.compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue == message && !$0.isHiddenOrHasHiddenAncestor
+        })
+        let buttons = views.compactMap { $0 as? NSButton }.filter { !$0.isHiddenOrHasHiddenAncestor }
+        XCTAssertEqual(buttons.map(\.title), [StringsUSBControl.en.acknowledge])
+        XCTAssertNotNil(overlay.hitTest(NSPoint(x: 10, y: 10)))
+        var dismissed = false
+        overlay.onNoticeDismissed = { dismissed = true }
+        AppLanguageStore.shared.set(.zh); overlay.refreshLocalization()
+        let acknowledge = try XCTUnwrap(buttons.first)
+        XCTAssertEqual(acknowledge.title, StringsUSBControl.zh.acknowledge)
+        let buttonRow = try XCTUnwrap(acknowledge.superview as? NSStackView)
+        XCTAssertTrue(buttonRow.views(in: .center).contains(acknowledge))
+        acknowledge.performClick(nil)
+        XCTAssertTrue(dismissed)
+        XCTAssertTrue(overlay.isHidden)
+        XCTAssertFalse(overlay.isDismissed)
+    }
+
+    func testRefusalDismissalRestoresConnectionGuidanceAndDisconnectClearsNotice() throws {
+        let overlay = ControlConnectionOverlay(frame: NSRect(x: 0, y: 0, width: 400, height: 800))
+        overlay.update(.disconnected)
+        overlay.setDismissed(true)
+        overlay.showBackendSelectionFailure("Unsupported iOS")
+        XCTAssertFalse(overlay.isDismissed)
+        overlay.showBackendSelectionFailure(nil)
+        XCTAssertFalse(overlay.isHidden)
+        XCTAssertTrue(descendants(overlay).compactMap { $0 as? NSButton }.contains {
+            $0.title == StringsUI.current.overlayButtonReconnect && !$0.isHiddenOrHasHiddenAncestor
+        })
+        overlay.showBackendSelectionFailure("Unsupported iOS")
+        overlay.update(.waitingForDevice)
+        overlay.update(.connected)
+        XCTAssertTrue(overlay.isHidden)
+    }
+
     func testSetupOfferRequiresMissingDDIOrTypedServiceEvidenceAndCurrentScreen() {
         XCTAssertTrue(presentation(.requiresDDI).offersUSBSetup)
         for reason in [USBPreparationFailure.Reason.serviceUnavailable, .touchscreenUnavailable] {

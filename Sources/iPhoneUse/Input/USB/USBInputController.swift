@@ -9,19 +9,29 @@ final class USBInputController {
     private var entries: [String: USBDeviceInput] = [:]
     private var retiring: [String: [USBDeviceInput]] = [:]
     private var selections: [String: InputBackendSelection] = [:]
+    private var selectionRequests: [String: UUID] = [:]
+    private var refreshing: Set<String> = []
     private let transitionWork = DispatchGroup()
     private var stopped = false
     private var shutdownWork: DispatchGroup?
     private var shutdownReleased = false
+    private let requireUSB: (String) throws -> Void
 
-    func selectAtLaunch(physicalID: String) {
+    init(requireUSB: @escaping (String) throws -> Void = USBBackendCompatibility.require) {
+        self.requireUSB = requireUSB
+    }
+
+    func selectAtLaunch(physicalID: String) throws {
+        let ticket = try checkSelection(.usb, id: physicalID)
         // Capture refresh will prepare USB after identity becomes verified.
-        lock.withLock {
-            guard !stopped else { return }
+        let accepted = lock.withLock { () -> Bool in
+            guard !stopped, selectionRequests[physicalID] == ticket else { return false }
             var state = InputBackendSelection()
             let id = state.begin(.usb); state.finish(id, released: true)
             selections[physicalID] = state
+            return true
         }
+        guard accepted else { throw USBInputFailure(.staleSession, "USB selection cancelled or superseded; no replay") }
     }
     func selected(_ id: String) -> InputBackendKind { lock.withLock { selections[id]?.backend ?? .ble } }
     func generation(_ id: String) -> UUID { lock.withLock {
@@ -38,9 +48,35 @@ final class USBInputController {
             return input
         }
     }
-    func select(_ backend: InputBackendKind, device: Device) {
+    private func checkSelection(_ backend: InputBackendKind, id: String,
+                                request: USBBackendSelectionRequest? = nil, expectedGeneration: UUID? = nil) throws -> UUID {
+        let ticket = UUID()
+        let checking = lock.withLock { () -> Bool in
+            guard !stopped, request?.isCancelled != true,
+                  expectedGeneration == nil || selections[id]?.generation == expectedGeneration else { return false }
+            selectionRequests[id] = ticket
+            return true
+        }
+        guard checking else { throw USBInputFailure(.staleSession, "USB selection cancelled or superseded; no replay") }
+        if backend == .usb {
+            do { try requireUSB(id) }
+            catch let error as USBBackendCompatibility.Failure {
+                let code: USBInputFailure.Code
+                if case .unsupported = error { code = .unsupported } else { code = .notReady }
+                throw USBInputFailure(code, error.description)
+            }
+        }
+        return ticket
+    }
+    func select(_ backend: InputBackendKind, device: Device,
+                request: USBBackendSelectionRequest? = nil, expectedGeneration: UUID? = nil) throws {
+        let ticket = try checkSelection(backend, id: device.id, request: request, expectedGeneration: expectedGeneration)
+        guard ScreenCaptureManager.shared.isCurrent(device.screen) else {
+            throw USBInputFailure(.staleSession, StringsUSBControl.current.versionUnavailable)
+        }
         let admitted = lock.withLock { () -> (UUID, USBDeviceInput?, DispatchQueue)? in
-            guard !stopped else { return nil }
+            guard !stopped, request?.isCancelled != true, selectionRequests[device.id] == ticket,
+                  expectedGeneration == nil || selections[device.id]?.generation == expectedGeneration else { return nil }
             var state = selections[device.id] ?? InputBackendSelection()
             let generation = state.begin(backend); selections[device.id] = state
             let previous = entries.removeValue(forKey: device.id)
@@ -52,7 +88,9 @@ final class USBInputController {
             transitionWork.enter()
             return (generation, previous, queue)
         }
-        guard let (generation, previous, transitionQueue) = admitted else { return }
+        guard let (generation, previous, transitionQueue) = admitted else {
+            throw USBInputFailure(.staleSession, "USB selection cancelled or superseded; no replay")
+        }
         previous?.retire() // EOF interrupts a synchronous worker gesture too.
         DeviceRegistry.shared.cancelBackgroundMotion(for: device)
         transitionQueue.async { [self] in
@@ -82,7 +120,30 @@ final class USBInputController {
         let allowed = lock.withLock { !stopped && selections[device.id]?.permits(.usb) == true }
         guard allowed else { return }
         if let entry = input(device) { entry.validateCapture(); return }
-        select(.usb, device: device)
+        // Launch selection also needs preflight, without blocking a 30Hz UI tick
+        // or launching duplicate inspections before the first one completes.
+        let generation = lock.withLock { () -> UUID? in
+            guard !stopped, selections[device.id]?.permits(.usb) == true,
+                  refreshing.insert(device.id).inserted else { return nil }
+            return selections[device.id]?.generation
+        }
+        guard let generation else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            defer { _ = lock.withLock { refreshing.remove(device.id) } }
+            do { try select(.usb, device: device, expectedGeneration: generation) }
+            catch {
+                lock.withLock {
+                    // A rejected launch preference must not strand BLE. Do not
+                    // change an explicit selection made while inspection ran.
+                    if !stopped, selections[device.id]?.generation == generation, entries[device.id] == nil {
+                        var state = selections[device.id]!
+                        let generation = state.begin(.ble); state.finish(generation, released: true)
+                        selections[device.id] = state
+                    }
+                }
+                log("USB selection refused: \(error)")
+            }
+        }
     }
     /// Capture removal/remapping/revoked identity must retire input even when
     /// no control window is polling. Keep each entry owned until explicit

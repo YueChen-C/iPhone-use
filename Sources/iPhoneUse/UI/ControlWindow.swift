@@ -308,7 +308,15 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
             controlView?.performShortcut(shortcut)
         }
         sidebar.onBackendChange = { [weak self] backend in
+            self?.content.showBackendSelectionFailure(nil)
             self?.cancelUSBSetup(); self?.controlView.selectBackend(backend)
+            // Keep showing the actual route while the native check is pending.
+            if let self { self.sidebar.updateBackend(self.controlView.selectedBackend) }
+        }
+        controlView.onBackendSelectionFailed = { [weak self] message in
+            guard let self else { return }
+            self.sidebar.updateBackend(self.controlView.selectedBackend)
+            self.content.showBackendSelectionFailure(message)
         }
         content.onEnableUSB = { [weak self] in self?.beginUSBSetup() }
         content.onCancelUSBSetup = { [weak self] in self?.cancelUSBSetup() }
@@ -334,7 +342,9 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func updateDevice(_ device: Device?) {
-        if lastKnownDevice?.screen !== device?.screen { cancelUSBSetup() }
+        if lastKnownDevice?.screen !== device?.screen {
+            cancelUSBSetup(); content.showBackendSelectionFailure(nil)
+        }
         lastKnownDevice = device.flatMap { $0.id == deviceID ? $0 : nil }
         applyWindowStrings()
         sidebar.updateBackend(controlView.selectedBackend)
@@ -454,7 +464,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
 /// Keeps the phone geometry separate from the sidebar and places the connection
 /// overlay above both so disconnected input cannot reach either control surface.
 private final class ControlWindowContent: NSView {
-    private let phoneView: NSView
+    private let phoneView: PhoneControlView
     private let connectionOverlay = ControlConnectionOverlay(frame: .zero)
     private let lockNotice = ControlLockNotice(frame: .zero)
     var onEnableUSB: (() -> Void)? {
@@ -467,9 +477,20 @@ private final class ControlWindowContent: NSView {
     }
     func updateUSBSetup(_ state: USBSetupPresentation) { connectionOverlay.updateSetup(state) }
 
-    init(phoneView: NSView, sidebar: ControlSidebar) {
+    func showBackendSelectionFailure(_ message: String?) {
+        phoneView.isBackendNoticeVisible = message != nil
+        connectionOverlay.showBackendSelectionFailure(message)
+        window?.makeFirstResponder(connectionOverlay.isHidden ? phoneView : connectionOverlay)
+    }
+
+    init(phoneView: PhoneControlView, sidebar: ControlSidebar) {
         self.phoneView = phoneView
         super.init(frame: NSRect(x: 0, y: 0, width: 390 + ControlSidebar.width, height: 700))
+        connectionOverlay.onNoticeDismissed = { [weak self] in
+            guard let self else { return }
+            self.phoneView.isBackendNoticeVisible = false
+            self.window?.makeFirstResponder(self.connectionOverlay.isHidden ? self.phoneView : self.connectionOverlay)
+        }
         phoneView.translatesAutoresizingMaskIntoConstraints = false
         sidebar.translatesAutoresizingMaskIntoConstraints = false
         addSubview(phoneView)
@@ -502,6 +523,7 @@ private final class ControlWindowContent: NSView {
     }
 
     func updateConnectionState(_ status: ControlConnectionStatus) {
+        if status == .waitingForDevice { phoneView.isBackendNoticeVisible = false }
         connectionOverlay.update(status)
         window?.makeFirstResponder(connectionOverlay.isHidden ? phoneView : connectionOverlay)
     }

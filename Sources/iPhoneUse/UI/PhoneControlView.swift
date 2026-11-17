@@ -16,14 +16,30 @@ final class PhoneControlView: NSView {
     var selectedBackend: InputBackendKind {
         binding.deviceID.map { USBInputController.shared.selected($0) } ?? .ble
     }
+    private var backendRequest: USBBackendSelectionRequest?
+    var onBackendSelectionFailed: ((String) -> Void)?
+    var isBackendNoticeVisible = false {
+        didSet { if isBackendNoticeVisible { cancelInteraction() } }
+    }
     func selectBackend(_ backend: InputBackendKind) {
         cancelInteraction()
         activeShortcut = nil
         shortcutFeedback = nil
         guard let device else { return }
-        USBInputController.shared.select(backend, device: device)
-        input = nil; usbInput = nil
-        refreshDevice()
+        backendRequest?.cancel()
+        let request = USBBackendSelectionRequest(); backendRequest = request
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let outcome = Result { try USBInputController.shared.select(backend, device: device, request: request) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.backendRequest === request, !request.isCancelled, self.binding.isRunning,
+                      self.device?.screen === device.screen else { return }
+                switch outcome {
+                case .success: self.input = nil; self.usbInput = nil
+                case .failure(let error): self.onBackendSelectionFailed?(String(describing: error))
+                }
+                self.refreshDevice()
+            }
+        }
     }
     private var dragging = false
     private var mousePosition = ControlMousePosition()
@@ -42,7 +58,7 @@ final class PhoneControlView: NSView {
     var onLockStateChanged: ((DeviceLockState) -> Void)?
 
     private var canSendWindowInput: Bool {
-        binding.acceptsEvents(isKeyWindow: window?.isKeyWindow == true)
+        !isBackendNoticeVisible && binding.acceptsEvents(isKeyWindow: window?.isKeyWindow == true)
             && connectionStatus == .connected
             && (usbSelected ? usbInput?.isKeyboardReady == true : input?.isBluetoothReady == true)
     }
@@ -50,7 +66,7 @@ final class PhoneControlView: NSView {
     /// Pointer input is not tied to key-window focus: the window under the
     /// mouse steers its own phone. Keyboard input keeps the focus gate above.
     private var canSendPointerInput: Bool {
-        binding.isDeviceBound
+        !isBackendNoticeVisible && binding.isDeviceBound
             && connectionStatus == .connected
             && (usbSelected ? usbInput?.isReady == true : input?.isBluetoothReady == true)
     }
@@ -90,6 +106,7 @@ final class PhoneControlView: NSView {
     }
 
     func stop() {
+        backendRequest?.cancel(); backendRequest = nil
         HIDPeripheral.shared.endWindowDemand(bluetoothDemandToken)
         timer?.invalidate()
         timer = nil
@@ -108,6 +125,7 @@ final class PhoneControlView: NSView {
     }
 
     deinit {
+        backendRequest?.cancel()
         HIDPeripheral.shared.endWindowDemand(bluetoothDemandToken)
         timer?.invalidate()
     }
@@ -396,6 +414,7 @@ final class PhoneControlView: NSView {
         } else {
             status = device == nil ? table.statusWaitingDevice : table.statusWaitingBluetooth
         }
+        if isBackendNoticeVisible { available = [] }
         guard lastShortcutState?.available != available || lastShortcutState?.status != status else { return }
         lastShortcutState = (available, status)
         onShortcutStateChanged?(available, status)
@@ -421,6 +440,10 @@ final class PhoneControlView: NSView {
             ControlDeviceBinding.Connection(
                 deviceID: device.id, captureID: ObjectIdentifier(device.screen), host: usbSelected ? nil : device.host,
                 session: usbSelected ? nil : device.host.flatMap { HIDPeripheral.shared.connectionSession(for: $0) })
+        }
+        // BLE rematching must not discard a version notice for the same phone.
+        if device?.screen !== current?.screen {
+            backendRequest?.cancel(); backendRequest = nil
         }
         if binding.observe(connection) {
             cancelInteraction()

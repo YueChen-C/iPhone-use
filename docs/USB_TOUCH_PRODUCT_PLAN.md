@@ -4,6 +4,14 @@ PR #14 adds experimental USB touch **and keyboard** control to this application.
 Bluetooth remains the default; selection is explicit per full physical device ID.
 The PR stays Draft until the remaining acceptance and release gates are resolved.
 
+USB selection requires a read-only, exact-device iOS version check before
+retiring the previous backend. iOS versions below 17 are rejected with a localized
+Bluetooth recommendation; unreadable versions are not admitted. Desktop checks
+run off AppKit and reuse the in-window connection card, not a system alert;
+HTTP uses the same gate. A stale/disconnected window cannot apply
+an earlier result. Explicit launch preferences use the same version gate.
+iOS 17+ eligibility does not replace the existing host, DDI or service checks.
+
 ## Product contract
 
 - Swift native implementation, with an isolated worker in the application's own

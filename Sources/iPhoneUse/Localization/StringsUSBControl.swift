@@ -9,6 +9,9 @@ struct StringsUSBControl: LocalizedTable {
     let showGuidance: String
     let shortcutAcknowledged: (String) -> String
     let shortcutFailed: String
+    let requiresiOS17: (String) -> String
+    let versionUnavailable: String
+    let acknowledge: String
 
     static var current: Self { Self(language: AppLanguageStore.shared.language) }
     static let zh = Self(title: "USB 原生控制（实验性）", status: { value in
@@ -29,7 +32,10 @@ struct StringsUSBControl: LocalizedTable {
         }
     }, viewOnly: "仅查看画面", pill: "USB 控制未就绪 · 仅查看画面", showGuidance: "显示指引",
        shortcutAcknowledged: { "USB 已确认发送\($0)；请检查画面" },
-       shortcutFailed: "USB 快捷键未确认完成；请检查画面，勿重放")
+       shortcutFailed: "USB 快捷键未确认完成；请检查画面，勿重放",
+       requiresiOS17: { "USB 操控需要 iOS 17 或更高版本。当前设备为 iOS \($0)，请使用蓝牙操控。" },
+       versionUnavailable: "无法确认这台 iPhone 的系统版本，未切换到 USB。请确认设备已解锁并信任此 Mac 后重试。",
+       acknowledge: "知道了")
 
     static let en = Self(title: "Native USB Control (Experimental)", status: { value in
         status(value, language: .en)
@@ -49,7 +55,10 @@ struct StringsUSBControl: LocalizedTable {
         }
     }, viewOnly: "View screen only", pill: "USB control unavailable · View only", showGuidance: "Show guidance",
        shortcutAcknowledged: { "USB acknowledged \($0); inspect screen" },
-       shortcutFailed: "USB shortcut not confirmed; inspect screen, do not replay")
+       shortcutFailed: "USB shortcut not confirmed; inspect screen, do not replay",
+       requiresiOS17: { "USB control requires iOS 17 or later. This device runs iOS \($0); use Bluetooth control instead." },
+       versionUnavailable: "Could not verify this iPhone's iOS version; USB was not selected. Unlock the device, confirm trust in this Mac, then retry.",
+       acknowledge: "Got it")
     private static func status(_ value: ControlUSBPresentation, language: AppLanguage) -> String {
         func text(_ zh: String, _ en: String) -> String { "USB · " + (language == .zh ? zh : en) }
         if !value.hasScreen { return text("等待原设备", "Waiting for original device") }

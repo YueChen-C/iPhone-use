@@ -64,7 +64,7 @@ enum ControlAPI {
                     return .error("backend must be ble or usb")
                 }
                 let device = try DeviceRegistry.shared.find(deviceQuery)
-                USBInputController.shared.select(backend, device: device)
+                try USBInputController.shared.select(backend, device: device)
                 return .json(["ok": true, "device": device.id, "input": USBInputController.shared.status(device)])
             case ("GET", "/ax_tree"), ("POST", "/ax_tree"):
                 return AXTreeEndpoint.response(request,

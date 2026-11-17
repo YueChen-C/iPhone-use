@@ -2,12 +2,12 @@ import XCTest
 @testable import iPhoneUse
 
 final class USBInputShutdownTests: XCTestCase {
-    func testDefaultBLESelectionAndExplicitUSBRemainIsolatedPerDevice() {
-        let controller = USBInputController()
+    func testDefaultBLESelectionAndExplicitUSBRemainIsolatedPerDevice() throws {
+        let controller = USBInputController(requireUSB: { _ in })
         XCTAssertEqual(controller.selected("target"), .ble)
         let oldGeneration = controller.generation("target")
         XCTAssertTrue(controller.permitsBLE("target", generation: oldGeneration))
-        controller.selectAtLaunch(physicalID: "target")
+        try controller.selectAtLaunch(physicalID: "target")
         XCTAssertEqual(controller.selected("target"), .usb)
         XCTAssertFalse(controller.permitsBLE("target", generation: nil))
         XCTAssertFalse(controller.permitsBLE("target", generation: oldGeneration))
@@ -16,9 +16,9 @@ final class USBInputShutdownTests: XCTestCase {
         XCTAssertTrue(controller.stop(waitTimeout: 1))
     }
 
-    func testCaptureChangeDoesNotPrepareAnUnboundLaunchSelectionOrSwitchBackend() {
-        let controller = USBInputController()
-        controller.selectAtLaunch(physicalID: "fixture")
+    func testCaptureChangeDoesNotPrepareAnUnboundLaunchSelectionOrSwitchBackend() throws {
+        let controller = USBInputController(requireUSB: { _ in })
+        try controller.selectAtLaunch(physicalID: "fixture")
         let generation = controller.generation("fixture")
         controller.captureDidChange()
         XCTAssertEqual(controller.selected("fixture"), .usb)
@@ -27,9 +27,9 @@ final class USBInputShutdownTests: XCTestCase {
         XCTAssertTrue(controller.stop(waitTimeout: 1))
     }
 
-    func testCaptureChangeCannotReopenStoppedAdmission() {
-        let controller = USBInputController()
-        controller.selectAtLaunch(physicalID: "fixture")
+    func testCaptureChangeCannotReopenStoppedAdmission() throws {
+        let controller = USBInputController(requireUSB: { _ in })
+        try controller.selectAtLaunch(physicalID: "fixture")
         XCTAssertTrue(controller.stop(waitTimeout: 1))
         let generation = controller.generation("fixture")
         controller.captureDidChange()
@@ -39,19 +39,19 @@ final class USBInputShutdownTests: XCTestCase {
         XCTAssertTrue(controller.stop(waitTimeout: 0))
     }
 
-    func testStopWithoutWorkersClosesAdmissionAndIsIdempotent() {
-        let controller = USBInputController()
+    func testStopWithoutWorkersClosesAdmissionAndIsIdempotent() throws {
+        let controller = USBInputController(requireUSB: { _ in })
         XCTAssertTrue(controller.permitsBLE("fixture", generation: nil))
         XCTAssertTrue(controller.stop(waitTimeout: 1))
         XCTAssertFalse(controller.permitsBLE("fixture", generation: nil))
-        controller.selectAtLaunch(physicalID: "fixture")
+        XCTAssertThrowsError(try controller.selectAtLaunch(physicalID: "fixture"))
         XCTAssertEqual(controller.selected("fixture"), .ble)
         XCTAssertTrue(controller.stop(waitTimeout: 0))
     }
 
-    func testStopInvalidatesPreviouslySelectedRouteAndUnknownBLEInputs() {
-        let controller = USBInputController()
-        controller.selectAtLaunch(physicalID: "fixture")
+    func testStopInvalidatesPreviouslySelectedRouteAndUnknownBLEInputs() throws {
+        let controller = USBInputController(requireUSB: { _ in })
+        try controller.selectAtLaunch(physicalID: "fixture")
         let generation = controller.generation("fixture")
         XCTAssertTrue(controller.stop(waitTimeout: 1))
         XCTAssertNotEqual(controller.generation("fixture"), generation)
@@ -59,15 +59,15 @@ final class USBInputShutdownTests: XCTestCase {
         XCTAssertFalse(controller.permitsBLE("other-fixture", generation: nil))
     }
 
-    func testUnconfirmedInputReleaseCannotProduceSuccessfulSignalExit() {
+    func testUnconfirmedInputReleaseCannotProduceSuccessfulSignalExit() throws {
         let cleanCapture = ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
         XCTAssertEqual(Application.terminationExitCode(for: cleanCapture, usbInputReleased: true), 0)
         XCTAssertEqual(Application.terminationExitCode(for: cleanCapture, usbInputReleased: false), 1)
     }
 
-    func testInvalidTimeoutCannotReopenAdmission() {
+    func testInvalidTimeoutCannotReopenAdmission() throws {
         for timeout in [Double.nan, .infinity, -1] {
-            let controller = USBInputController()
+            let controller = USBInputController(requireUSB: { _ in })
             _ = controller.stop(waitTimeout: timeout)
             XCTAssertFalse(controller.permitsBLE("fixture", generation: nil))
             XCTAssertTrue(controller.stop(waitTimeout: 1))

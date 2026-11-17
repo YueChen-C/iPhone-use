@@ -34,6 +34,8 @@ final class ControlConnectionOverlay: NSView {
     private var hasConnected = false
     private var lastStatus: ControlConnectionStatus = .disconnected
     private var usbPresentation: ControlUSBPresentation?
+    private var backendSelectionFailure: String?
+    var onNoticeDismissed: (() -> Void)?
     private var instructionsField: NSTextField?
     private var helpField: NSTextField?
     var onEnableUSB: (() -> Void)?
@@ -157,8 +159,10 @@ final class ControlConnectionOverlay: NSView {
         setupProgress.minValue = 0; setupProgress.maxValue = 1
         setupProgress.isHidden = true
 
-        let stack = NSStackView(views: [viewOnlyButton, reconnectButton])
+        let stack = NSStackView()
         stack.orientation = .horizontal
+        // Keep a lone acknowledgement centered when the reconnect action hides.
+        stack.setViews([viewOnlyButton, reconnectButton], in: .center)
         stack.spacing = 12
         stack.alignment = .centerY
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -248,6 +252,11 @@ final class ControlConnectionOverlay: NSView {
     }
 
     @objc private func onViewOnlyClicked() {
+        if backendSelectionFailure != nil {
+            showBackendSelectionFailure(nil)
+            onNoticeDismissed?()
+            return
+        }
         setDismissed(true)
     }
 
@@ -276,6 +285,11 @@ final class ControlConnectionOverlay: NSView {
 
     func update(_ status: ControlConnectionStatus) {
         lastStatus = status
+        if status == .waitingForDevice { backendSelectionFailure = nil }
+        if let backendSelectionFailure {
+            updateSelectionFailureCard(backendSelectionFailure)
+            return
+        }
         if let usbPresentation {
             updateUSBCard(usbPresentation)
             return
@@ -339,6 +353,35 @@ final class ControlConnectionOverlay: NSView {
         usbPresentation = presentation
         if changedBackend { setDismissed(false) }
         update(lastStatus)
+    }
+
+    /// Reuse the app's connection card, without selecting USB or offering DDI
+    /// setup for an incompatible device. Polling must not erase the notice.
+    func showBackendSelectionFailure(_ message: String?) {
+        backendSelectionFailure = message
+        setDismissed(false)
+        update(lastStatus)
+    }
+
+    private func updateSelectionFailureCard(_ detail: String) {
+        let table = StringsUSBControl.current
+        isHidden = false
+        setAccessibilityLabel(table.title)
+        icon.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
+        title.stringValue = table.title
+        message.stringValue = detail
+        message.toolTip = detail
+        instructionsField?.isHidden = true
+        helpField?.isHidden = true
+        reconnectButton.isHidden = true
+        setupButton.isHidden = true
+        setupProgress.isHidden = true
+        setupProgress.stopAnimation(nil)
+        viewOnlyButton.title = table.acknowledge
+        viewOnlyButton.isHidden = false
+        viewOnlyButton.isEnabled = true
+        cardView?.isHidden = false
+        pillView.isHidden = true
     }
 
     private func updateUSBCard(_ presentation: ControlUSBPresentation) {

@@ -219,7 +219,8 @@ enum Application {
 
         // Explicit launch-only selection; BLE remains the default otherwise.
         if let device = ProcessInfo.processInfo.environment["IPHONE_USE_USB_DEVICE"], !device.isEmpty {
-            USBInputController.shared.selectAtLaunch(physicalID: device)
+            do { try USBInputController.shared.selectAtLaunch(physicalID: device) }
+            catch { log("USB selection refused: \(error)") }
         }
 
         DeviceRegistry.shared.start()
