@@ -17,6 +17,7 @@ fi
 cd "$ROOT"
 swiftc Tests/NativeInputRouting/Support.swift \
     Sources/iPhoneUse/Localization/AppLanguage.swift Sources/iPhoneUse/Localization/StringsAPI.swift \
+    Sources/iPhoneUse/Localization/StringsUSBControl.swift Sources/iPhoneUse/UI/ControlUSBPresentation.swift \
     Sources/iPhoneUse/Bluetooth/HIDReports.swift Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift \
     Sources/iPhoneUse/Devices/RelativePointerScreenMatcher.swift \
     Sources/iPhoneUse/Input/LegacyPointer/RelativePointerCalibration.swift \
@@ -28,8 +29,9 @@ swiftc Tests/NativeInputRouting/Support.swift \
     Sources/iPhoneUse/Input/USB/USBPreparationFailure.swift Sources/iPhoneUse/Input/USB/USBInputFailure.swift \
     Sources/iPhoneUse/Input/USB/USBTouchSession.swift Sources/iPhoneUse/Input/USB/USBTouchClient.swift \
     Sources/iPhoneUse/Input/USB/USBTouchWorker.swift Sources/iPhoneUse/Input/USB/USBInputController.swift \
+    Sources/iPhoneUse/Input/USB/USBBackendCompatibility.swift \
     Tests/NativeInputRouting/main.swift -o "$OUTPUT/input-routing-check"
-for mode in normal backpressure held-pointer queued-key usb-release-failure buttons without-buttons button-release-failure; do
+for mode in normal backpressure held-pointer queued-key usb-release-failure buttons without-buttons button-release-failure version-gate; do
     mkdir -m 700 "$OUTPUT/$mode"
     INPUT_ROUTING_FIXTURE_ROOT="$OUTPUT/$mode" "$OUTPUT/input-routing-check" "$mode"
 done

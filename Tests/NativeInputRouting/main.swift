@@ -16,7 +16,7 @@ func state(_ controller: USBInputController, _ device: Device) -> String {
     controller.status(device)["state"] as? String ?? "ble"
 }
 let mode = CommandLine.arguments.dropFirst().first ?? "normal"
-try require(["normal", "backpressure", "held-pointer", "queued-key", "usb-release-failure", "buttons", "without-buttons", "button-release-failure"].contains(mode), "unknown mode")
+try require(["normal", "backpressure", "held-pointer", "queued-key", "usb-release-failure", "buttons", "without-buttons", "button-release-failure", "version-gate"].contains(mode), "unknown mode")
 let controller = USBInputController(), hid = HIDPeripheral.shared
 let pause = InputPause()
 let a = Device(id: ["usb-release-failure", "without-buttons", "button-release-failure"].contains(mode) ? mode : "target", screen: ScreenCaptureSession())
@@ -29,6 +29,37 @@ func input(_ device: Device, _ host: UUID) -> DeviceInput {
                             sleep: { _ in if device.id == a.id { pause.pause() } })
     DeviceRegistry.shared.retain(input, for: device)
     return input
+}
+if mode == "version-gate" {
+    let root = ProcessInfo.processInfo.environment["INPUT_ROUTING_FIXTURE_ROOT"]!
+    for (id, status) in [("ios15", 400), ("ios16", 400), ("unknown-version", 503), ("inspection-failure", 503)] {
+        let device = Device(id: id, screen: ScreenCaptureSession()), host = UUID()
+        let ble = input(device, host), generation = controller.generation(id)
+        try ble.key("a", modifiers: [])
+        do {
+            try controller.select(.usb, device: device)
+            throw AXDTX.Failure("incompatible USB selection accepted")
+        } catch let error as USBInputFailure {
+            try require(error.httpStatus == status && !error.mayHaveExecuted, "version rejection evidence")
+        }
+        try require(controller.selected(id) == .ble && controller.generation(id) == generation
+                    && controller.permitsBLE(id, generation: generation) && !ble.isRetired
+                    && controller.input(device) == nil, "version rejection changed previous route")
+        try ble.key("b", modifiers: [])
+        try require(hid.reports(host).count == 4, "rejected selection interrupted BLE")
+        try require(!FileManager.default.fileExists(atPath: root + "/" + id + ".transport"),
+                    "rejected selection prepared native input")
+    }
+    let eligible = Device(id: "ios17", screen: ScreenCaptureSession()), host = UUID()
+    let ble = input(eligible, host)
+    try controller.select(.usb, device: eligible)
+    try wait("iOS17 USB readiness") { controller.input(eligible)?.isReady == true }
+    try require(ble.isRetired, "eligible USB did not retire BLE")
+    try controller.select(.ble, device: eligible)
+    try wait("iOS17 explicit BLE return") { controller.permitsBLE(eligible.id, generation: nil) }
+    try require(controller.stop(waitTimeout: 6), "version gate stop")
+    print("mode=version-gate rejected=4 blePreserved=true ios17Accepted=true hardware=simulated")
+    exit(0)
 }
 let old = input(a, hostA), peer = input(b, hostB)
 try old.key("a", modifiers: ["cmd"])
@@ -51,7 +82,7 @@ if mode == "queued-key" {
     try require(pause.entered.wait(timeout: .now() + 7) == .success, "key pacing boundary")
     try require(old.keyFromKeyboard("v", modifiers: ["cmd"]), "queued window shortcut")
 }
-controller.select(.usb, device: a)
+try controller.select(.usb, device: a)
 try require(!controller.permitsBLE(a.id, generation: nil), "BLE admission must close synchronously")
 if mode == "queued-key" { pause.open() }
 if mode == "backpressure" || mode == "held-pointer" {
@@ -60,7 +91,7 @@ if mode == "backpressure" || mode == "held-pointer" {
     try peer.key("c", modifiers: [])
     try require(hid.reports(hostB).count == 4, "peer blocked by target backpressure")
     hid.block(hostA, false)
-    controller.select(.usb, device: a)
+    try controller.select(.usb, device: a)
 }
 try wait("USB readiness") { controller.input(a)?.isReady == true }
 try require(old.isRetired && controller.selected(b.id) == .ble, "old BLE retired/peer selection")
@@ -88,7 +119,7 @@ try require(usb.isKeyboardReady, "native USB keyboard discovery")
 if mode == "usb-release-failure" {
     do { try usb.gesture("tap", points: [.init(x: 0.2, y: 0.3)], duration: 0.02); throw AXDTX.Failure("fault accepted") }
     catch let error as USBInputFailure { try require(error.mayHaveExecuted, "uncertain delivery lost") }
-    controller.select(.ble, device: a)
+    try controller.select(.ble, device: a)
     try wait("USB missing release gate") { state(controller, a) == "failed" }
     try require(!controller.permitsBLE(a.id, generation: nil), "unconfirmed USB release enabled BLE")
     try require(controller.selected(b.id) == .ble && peer.isBluetoothReady
@@ -109,7 +140,7 @@ if mode == "buttons" || mode == "button-release-failure" {
     if mode == "button-release-failure" {
         do { try usb.button(.home); throw AXDTX.Failure("button release fault accepted") }
         catch let error as USBInputFailure { try require(error.mayHaveExecuted, "button uncertainty lost") }
-        controller.select(.ble, device: a)
+        try controller.select(.ble, device: a)
         try wait("button release gate") { state(controller, a) == "failed" }
         try require(!controller.permitsBLE(a.id, generation: nil) && !controller.stop(waitTimeout: 6), "button release failed open")
         print("buttons uncertain=true releaseUnconfirmed=true bleAllowed=false hardware=simulated")
@@ -162,7 +193,7 @@ let expectedKeys = try [USBKeyboardReport.encode(modifiers: stroke.modifiers),
                         USBKeyboardReport.encode(modifiers: stroke.modifiers), USBKeyboardReport.encode()]
 try require(keyboardReports.map(String.init) == expectedKeys.map { "surface:8 report:" + $0.base64EncodedString() },
             "native USB shortcut press/release bytes")
-controller.select(.ble, device: a)
+try controller.select(.ble, device: a)
 try wait("explicit BLE return") { controller.permitsBLE(a.id, generation: nil) }
 try require(!usb.isReady, "old USB revived")
 let afterRetirement = try String(contentsOf: transport, encoding: .utf8)

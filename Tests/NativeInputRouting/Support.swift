@@ -1,6 +1,9 @@
 import CoreFoundation
 import Foundation
 
+// Keep diagnostics visible without compiling the application lifecycle entry.
+func log(_ message: String) { FileHandle.standardError.write(Data((message + "\n").utf8)) }
+
 // Pause exactly one production DeviceInput pacing boundary, without timing races.
 final class InputPause {
     private let lock = NSLock()
@@ -29,6 +32,23 @@ enum AXDTX {
     struct Failure: Error, CustomStringConvertible {
         let description: String
         init(_ value: String) { description = value }
+    }
+}
+// Only the native metadata-read boundary is simulated. The real compatibility
+// policy, localized errors and controller admission remain under test.
+enum DDIReviewRequest { case inspect(String) }
+struct DDIReviewResult { let json: String }
+struct DDIReviewClient {
+    init(executable: URL) {}
+    func run(_ request: DDIReviewRequest) throws -> DDIReviewResult {
+        let versions = ["target": "26.5", "usb-release-failure": "26.5", "without-buttons": "26.5",
+                        "button-release-failure": "26.5", "ios15": "15.4", "ios16": "16.7.12",
+                        "ios17": "17.0", "unknown-version": "unknown"]
+        let id: String
+        switch request { case .inspect(let value): id = value }
+        guard let version = versions[id] else { throw AXDTX.Failure("fixture inspection unavailable") }
+        let data = try JSONSerialization.data(withJSONObject: ["productVersion": version])
+        return DDIReviewResult(json: String(decoding: data, as: UTF8.self))
     }
 }
 struct DeviceError: Error, CustomStringConvertible {
