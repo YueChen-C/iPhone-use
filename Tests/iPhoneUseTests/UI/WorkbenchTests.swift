@@ -235,6 +235,64 @@ final class WorkbenchStateTests: XCTestCase {
 }
 
 final class WorkbenchNativeViewTests: XCTestCase {
+    func testHeaderLanguageSwitchUpdatesImmediatelyAndPersists() throws {
+        _ = NSApplication.shared
+        let store = AppLanguageStore.shared
+        let defaults = UserDefaults.standard
+        let savedValue = defaults.object(forKey: AppLanguageStore.defaultsKey)
+        let previousLanguage = store.language
+        defer {
+            store.set(previousLanguage)
+            defaults.set(savedValue, forKey: AppLanguageStore.defaultsKey)
+        }
+        store.set(.zh)
+        let controller = WorkbenchWindowController()
+        defer { controller.stop() }
+        let root = controller.root
+        let window = try XCTUnwrap(controller.window)
+        let picker = try XCTUnwrap(root.subviews.compactMap { $0 as? NSSegmentedControl }.first {
+            $0.accessibilityIdentifier() == "workbench-language"
+        }, "The workbench header must expose its own language control")
+        let search = try XCTUnwrap(root.subviews.compactMap { $0 as? NSSearchField }.first)
+        let draft = try XCTUnwrap(descendants(root).compactMap { $0 as? NSTextField }.first {
+            $0.accessibilityLabel() == StringsWorkbench.zh.textInput
+        })
+
+        for width: CGFloat in [1080, 1220, 1680] {
+            root.frame.size.width = width
+            renderLayout(root)
+            XCTAssertTrue(root.bounds.contains(picker.frame))
+            XCTAssertFalse(picker.frame.intersects(search.frame))
+        }
+        XCTAssertEqual(picker.label(forSegment: 0), "中文")
+        XCTAssertEqual(picker.label(forSegment: 1), "English")
+        XCTAssertEqual(picker.selectedSegment, 0)
+        XCTAssertEqual(search.placeholderString, StringsWorkbench.zh.search)
+        search.stringValue = "Demo iPhone"
+        root.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        draft.stringValue = "Draft, not sent"
+        root.setLayout(.focus)
+
+        for (index, language) in [(1, AppLanguage.en), (0, AppLanguage.zh)] {
+            picker.selectedSegment = index
+            XCTAssertTrue(picker.sendAction(picker.action, to: picker.target))
+            let strings = StringsWorkbench(language: language)
+            XCTAssertEqual(AppLanguageStore(defaults: defaults).language, language)
+            XCTAssertEqual(search.placeholderString, strings.search)
+            XCTAssertEqual(search.accessibilityLabel(), strings.search)
+            XCTAssertEqual(draft.accessibilityLabel(), strings.textInput)
+            XCTAssertEqual(window.title, "iPhone Use 2.0 — \(strings.title)")
+            XCTAssertEqual(search.stringValue, "Demo iPhone")
+            XCTAssertEqual(root.state.query, "Demo iPhone")
+            XCTAssertEqual(draft.stringValue, "Draft, not sent")
+            XCTAssertEqual(root.state.layout, .focus)
+        }
+
+        // The existing macOS menu uses this store; toggles there must update the header too.
+        store.set(.en)
+        XCTAssertEqual(picker.selectedSegment, 1)
+    }
+
     func testInfoDialogsShareHTMLGeometryAndCoverWorkspaceWithoutPhoneOverlay() throws {
         _ = NSApplication.shared
         for size in [NSSize(width: 1440, height: 807), NSSize(width: 1080, height: 700)] {
@@ -744,7 +802,8 @@ final class WorkbenchNativeViewTests: XCTestCase {
         XCTAssertEqual(buttons.filter { $0.appearanceStyle == .solid }.count, 1)
         XCTAssertFalse(buttons.contains { $0.appearanceStyle == .system })
         let segments = descendants(root).compactMap { $0 as? WorkbenchSegmentedControl }
-        XCTAssertEqual(segments.count, 2)
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertTrue(segments.contains { $0.accessibilityIdentifier() == "workbench-language" })
         XCTAssertTrue(segments.allSatisfy { $0.segmentDistribution == .fillEqually })
     }
 

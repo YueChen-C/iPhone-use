@@ -188,13 +188,14 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
     private let navigationHeading = WorkbenchStyle.label(size: 10, secondary: true)
     private var hardwareIdentities: [String: WorkbenchHardwareIdentity] = [:]
     private var hardwareLookups: [String: ObjectIdentifier] = [:]
-    private let topNote = WorkbenchStyle.label(size: 10, secondary: true)
     private let canvas = WorkbenchSurface()
     private let listScroll = NSScrollView()
     private let listDocument = WorkbenchSurface()
     private let scroll = NSScrollView()
     private let document = WorkbenchSurface()
     private let search = NSSearchField()
+    private let languageControl = WorkbenchSegmentedControl(
+        labels: AppLanguage.allCases.map(\.displayName), trackingMode: .selectOne, target: nil, action: nil)
     private let titleLabel = WorkbenchStyle.label(size: 25, weight: .semibold)
     private let subtitleLabel = WorkbenchStyle.label(size: 12, secondary: true)
     private let brand = WorkbenchStyle.label(size: 17, weight: .semibold)
@@ -249,8 +250,9 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         sidebar.fill = WorkbenchTheme.sidebar
         inspector.fill = WorkbenchTheme.paper
         canvas.fill = WorkbenchTheme.canvas
-        [sidebar, canvas, inspectorScroll, brandIcon, brand, version, breadcrumb, search, topNote, footer].forEach(
-            addSubview)
+        [
+            sidebar, canvas, inspectorScroll, brandIcon, brand, version, breadcrumb, search, languageControl, footer,
+        ].forEach(addSubview)
         inspectorScroll.documentView = inspector
         inspectorScroll.hasVerticalScroller = true
         inspectorScroll.drawsBackground = false
@@ -299,7 +301,10 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         search.font = .systemFont(ofSize: 11)
         search.focusRingType = .none
         search.delegate = self
-        search.setAccessibilityLabel(StringsWorkbench.current.search)
+        languageControl.segmentDistribution = .fillEqually
+        languageControl.target = self
+        languageControl.action = #selector(changeLanguage)
+        languageControl.setAccessibilityIdentifier("workbench-language")
         search.sendsSearchStringImmediately = true
         search.sendsWholeSearchString = false
         text.delegate = self
@@ -315,7 +320,6 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         text.focusRingType = .none
         text.maximumNumberOfLines = 0
         text.lineBreakMode = .byWordWrapping
-        text.setAccessibilityLabel(StringsWorkbench.current.textInput)
         help.maximumNumberOfLines = 0
         help.lineBreakMode = .byWordWrapping
         backendHelp.maximumNumberOfLines = 0
@@ -594,6 +598,12 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         guard let target = state.pageTarget(offset: offset) else { return }
         select(target, focusPhone: false)
     }
+    @objc private func changeLanguage() {
+        let languages = AppLanguage.allCases
+        guard languages.indices.contains(languageControl.selectedSegment) else { return }
+        AppLanguageStore.shared.set(languages[languageControl.selectedSegment])
+    }
+
     @objc private func changeLayout() { setLayout(layoutControl.selectedSegment == 1 ? .focus : .grid) }
     @objc private func changeBackend() {
         guard let id = state.selectedID, let controller = controllers[id] else { return }
@@ -732,11 +742,16 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         breadcrumb.stringValue =
             AppLanguageStore.shared.language == .zh ? "工作空间    ›    设备工作台" : "Workspace    ›    Device Workbench"
         navigationHeading.stringValue = AppLanguageStore.shared.language == .zh ? "工 作 空 间" : "WORKSPACE"
-        topNote.stringValue = AppLanguageStore.shared.language == .zh ? "• 原生 2.0" : "• Native 2.0"
+        let language = AppLanguageStore.shared.language
+        let languageLabel = language == .zh ? "界面语言" : "Interface language"
+        languageControl.selectedSegment = AppLanguage.allCases.firstIndex(of: language) ?? 0
+        languageControl.setAccessibilityLabel(languageLabel)
+        languageControl.toolTip = languageLabel
+        languageControl.needsDisplay = true
         titleLabel.stringValue = t.title
         subtitleLabel.stringValue = t.subtitle
         deviceTitle.stringValue = "\(t.devices)  \(state.devices.filter(\.connected).count)"
-        let zh = AppLanguageStore.shared.language == .zh
+        let zh = language == .zh
         sidebarNote.stringValue =
             zh ? "每台设备独立选择输入方式。\n画面始终通过 USB 连接。" : "Choose input for each device.\nDisplay always connects via USB."
         connectionGuide.heading.stringValue = zh ? "第一次连接？" : "First connection?"
@@ -780,6 +795,8 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         api.title = t.api
         guide.title = "↗ \(t.connect)"
         search.placeholderString = t.search
+        search.setAccessibilityLabel(t.search)
+        text.setAccessibilityLabel(t.textInput)
         layoutControl.setLabel(t.grid, forSegment: 0)
         layoutControl.setLabel(t.focus, forSegment: 1)
         pagePrevious.setAccessibilityLabel(zh ? "上一页设备" : "Previous devices")
@@ -813,7 +830,7 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         breadcrumb.isHidden = w < 1220
         breadcrumb.frame = NSRect(x: 319, y: 25, width: 300, height: 20)
         search.frame = NSRect(x: w - 417, y: 22, width: 218, height: 23)
-        topNote.frame = NSRect(x: w - 160, y: 25, width: 140, height: 20)
+        languageControl.frame = NSRect(x: w - 160, y: 18, width: 140, height: 29)
         navigationHeading.frame = NSRect(x: 27, y: 23, width: 175, height: 17)
         sidebar.frame = NSRect(x: 0, y: 64, width: 232, height: h - 94)
         inspectorScroll.frame = NSRect(x: w - 312, y: 64, width: 312, height: h - 94)
