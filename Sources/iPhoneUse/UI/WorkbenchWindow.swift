@@ -363,14 +363,15 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         api.invoke = { [weak self] in self?.showInfo(.api) }
         send.invoke = { [weak self] in self?.sendText() }
         paste.invoke = { [weak self] in self?.perform(.paste) }
-        let shortcuts: [ControlShortcut] = [.home, .search, .power, .volumeDown, .volumeUp, .enter]
+        let shortcuts: [ControlShortcut] = [.home, .search, .power, .volumeDown, .volumeUp, .enter, .inputMethod]
         for shortcut in shortcuts {
             let button = WorkbenchActionButton()
             button.image = NSImage(systemSymbolName: shortcut.symbol, accessibilityDescription: nil)
             button.imagePosition = .imageAbove
             button.bezelStyle = .regularSquare
-            button.appearanceStyle = .shortcut
+            button.appearanceStyle = shortcut == .inputMethod ? .outline : .shortcut
             button.symbolName = shortcut.symbol
+            button.setAccessibilityIdentifier("workbench-shortcut:\(shortcut.rawValue)")
             button.invoke = { [weak self] in self?.perform(shortcut) }
             inspector.addSubview(button)
             shortcutButtons[shortcut] = button
@@ -792,6 +793,7 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         help.stringValue = t.pasteHint
         for (shortcut, button) in shortcutButtons {
             button.title = zh && shortcut == .home ? "主屏幕" : shortcut.title
+            button.toolTip = shortcut.help
             button.setAccessibilityLabel(shortcut.title)
         }
         listFingerprint = ""
@@ -817,7 +819,7 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         inspectorScroll.frame = NSRect(x: w - 312, y: 64, width: 312, height: h - 94)
         let guidanceHeight = mountedGuidance?.preferredHeight(for: 268) ?? 0
         let guidanceOffset = guidanceHeight > 0 ? max(0, guidanceHeight - 42) + 12 : 0
-        inspector.frame = NSRect(x: 0, y: 0, width: 312, height: max(844 + guidanceOffset, inspectorScroll.bounds.height))
+        inspector.frame = NSRect(x: 0, y: 0, width: 312, height: max(888 + guidanceOffset, inspectorScroll.bounds.height))
         canvas.frame = NSRect(x: 232, y: 64, width: w - 544, height: h - 94)
         footer.frame = NSRect(x: 17, y: h - 24, width: w - 34, height: 18)
         workspace.frame = NSRect(x: 15, y: 48, width: 202, height: 39)
@@ -899,15 +901,17 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
                 x: 22 + CGFloat(i % 3) * (buttonWidth + 7), y: 342 + guidanceOffset + CGFloat(i / 3) * 70,
                 width: buttonWidth, height: 63)
         }
-        textTitle.frame = NSRect(x: 22, y: 498 + guidanceOffset, width: 120, height: 20)
-        textHint.frame = NSRect(x: 162, y: 500 + guidanceOffset, width: iw - 184, height: 18)
-        textBackground.frame = NSRect(x: 22, y: 525 + guidanceOffset, width: inner, height: 65)
-        text.frame = NSRect(x: 33, y: 537 + guidanceOffset, width: inner - 22, height: 44)
-        paste.frame = NSRect(x: 10, y: 598 + guidanceOffset, width: 150, height: 30)
+        shortcutButtons[.inputMethod]?.frame = NSRect(x: 22, y: 482 + guidanceOffset, width: inner, height: 34)
+        let textOffset = guidanceOffset + 44
+        textTitle.frame = NSRect(x: 22, y: 498 + textOffset, width: 120, height: 20)
+        textHint.frame = NSRect(x: 162, y: 500 + textOffset, width: iw - 184, height: 18)
+        textBackground.frame = NSRect(x: 22, y: 525 + textOffset, width: inner, height: 65)
+        text.frame = NSRect(x: 33, y: 537 + textOffset, width: inner - 22, height: 44)
+        paste.frame = NSRect(x: 10, y: 598 + textOffset, width: 150, height: 30)
         let sendWidth = max(79, send.requiredContentWidth)
-        send.frame = NSRect(x: iw - 22 - sendWidth, y: 598 + guidanceOffset, width: sendWidth, height: 31)
-        help.frame = NSRect(x: 22, y: 639 + guidanceOffset, width: inner, height: 35)
-        aiCard.frame = NSRect(x: 22, y: max(710 + guidanceOffset, inspector.bounds.height - 135), width: inner, height: 114)
+        send.frame = NSRect(x: iw - 22 - sendWidth, y: 598 + textOffset, width: sendWidth, height: 31)
+        help.frame = NSRect(x: 22, y: 639 + textOffset, width: inner, height: 35)
+        aiCard.frame = NSRect(x: 22, y: max(710 + textOffset, inspector.bounds.height - 135), width: inner, height: 114)
         updateActivity()
         infoOverlay?.frame = bounds
         infoOverlay?.layoutSubtreeIfNeeded()

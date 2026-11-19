@@ -13,6 +13,14 @@
 | USB 恢复/回滚 | 相同输入的 BASELINE、MODIFIED、ROLLBACK、重新应用均退出 0；9 个文件原哈希恢复一致 | 在独立副本执行，不回滚运行中的工作区 |
 | 同伴断连隔离 | 76 项身份/帧/USB 定向测试，0 失败；A/B 隔离探针与回滚对照通过 | fixture 不是物理拔线验收；不执行全量测试 |
 | USB 退休后重新准备 | 67 项 worker/准备/关闭/触控/按钮定向测试，0 失败；Release 编译退出 0 | 未确认输入继续阻断；不跑全量测试 |
+| 快捷控制输入法切换 | `ControlShortcut.inputMethod` 在当前设备复用 USB/BLE 键盘路线发送 Control+Space；42 项定向测试、Release 编译、中英文宽窄屏离线预览通过 | 保留瞬时反馈和键盘就绪门控；已更新开发工作台，不自动切换手机输入法 |
+
+### 输入法切换的局部验证
+
+- 命令：`swift test --filter 'ControlUSBShortcutTests|Workbench'`，42 项测试、0 失败；`swift build -c release` 退出 0。未执行全量测试。
+- BASELINE：无输入法选项，不生成按键；MODIFIED：USB/BLE 均生成 `space:ctrl`，仅键盘能力就绪时可用；ROLLBACK：六个原文件哈希恢复且输出与 BASELINE 一致；重新应用后匹配 MODIFIED。此为生产模型的录制键盘探针，不是手机切换结果。
+- 中文宽屏和英文窄屏离线预览均退出 0，未启动设备服务；原六宫格不变，下方增加整行“切换输入法”按钮，与文本区无重叠，点击不保持常亮。
+- 正常退出旧 GUI 后应用 Release，签名验证通过；只读状态观察到 iPhone 12 USB `ready` / `sessionCurrent=true`，SE2 蓝牙重新连接，两台画面身份均为 `verified`。未发送人工测试按键、手势或文字，未修改 DDI；手机需先配置多个输入法，实际切换效果仍待手动验收。
 
 最后一次 USB 定向检查：
 

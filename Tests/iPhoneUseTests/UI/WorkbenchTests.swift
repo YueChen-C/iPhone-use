@@ -778,6 +778,35 @@ final class WorkbenchNativeViewTests: XCTestCase {
         }
     }
 
+    func testInputMethodShortcutFitsInspectorAndStaysMomentaryAndPreviewOnly() {
+        _ = NSApplication.shared
+        for size in [NSSize(width: 1680, height: 980), NSSize(width: 1080, height: 700)] {
+            let root = WorkbenchRootView(frame: NSRect(origin: .zero, size: size), preview: true)
+            root.loadPreview([WorkbenchDevice(id: "selected", name: "Phone", connected: true, backend: .usb,
+                status: "sample", shortcuts: Set(ControlShortcut.allCases))])
+            renderLayout(root)
+            let buttons = descendants(root).compactMap { $0 as? WorkbenchActionButton }
+            let button = buttons.first {
+                $0.accessibilityIdentifier() == "workbench-shortcut:\(ControlShortcut.inputMethod.rawValue)"
+            }!
+            XCTAssertEqual(button.title, ControlShortcut.inputMethod.title)
+            XCTAssertEqual(button.toolTip, ControlShortcut.inputMethod.help)
+            XCTAssertNotNil(button.invoke)
+            XCTAssertFalse(button.isEnabled, "offline preview must never send input")
+            XCTAssertFalse(button.retainsSelection)
+            XCTAssertGreaterThanOrEqual(button.bounds.width, button.requiredContentWidth)
+            XCTAssertEqual(button.frame.width, 268)
+            let grid = buttons.filter { $0.appearanceStyle == .shortcut }
+            XCTAssertEqual(grid.count, 6)
+            XCTAssertTrue(grid.allSatisfy { $0.frame.maxY < button.frame.minY })
+            let text = descendants(root).compactMap { $0 as? NSTextField }.first {
+                $0.accessibilityLabel() == StringsWorkbench.current.textInput
+            }!
+            XCTAssertGreaterThan(text.frame.minY, button.frame.maxY)
+            XCTAssertLessThanOrEqual(button.frame.maxY, button.superview!.bounds.height)
+        }
+    }
+
     func testCommandButtonsOnlyHighlightDuringPressAndKeepNoLatchedState() {
         _ = NSApplication.shared
         for style in [WorkbenchActionButton.Appearance.navigation, .shortcut, .outline, .link, .solid, .plain] {

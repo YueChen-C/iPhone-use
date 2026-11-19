@@ -9,7 +9,7 @@ final class ControlSidebar: NSView {
     private static let shortcutGroups: [(title: KeyPath<StringsUI, String>, shortcuts: [ControlShortcut])] =
         [
             (\.groupNavigation, [.home, .search, .power]),
-            (\.groupInput, [.paste, .enter]),
+            (\.groupInput, [.paste, .inputMethod, .enter]),
             (\.groupVolume, [.volumeUp, .volumeDown]),
         ]
 
@@ -157,7 +157,7 @@ final class ControlSidebar: NSView {
 }
 
 enum ControlShortcut: Int, CaseIterable {
-    case home, search, paste, enter, volumeUp, volumeDown, power
+    case home, search, paste, enter, volumeUp, volumeDown, power, inputMethod
 
     var title: String {
         let table = StringsUI.current
@@ -165,6 +165,7 @@ enum ControlShortcut: Int, CaseIterable {
         case .home: table.shortcutHome
         case .search: table.shortcutSearch
         case .paste: table.shortcutPaste
+        case .inputMethod: table.shortcutInputMethod
         case .enter: table.shortcutEnter
         case .volumeUp: table.shortcutVolumeUp
         case .volumeDown: table.shortcutVolumeDown
@@ -177,6 +178,7 @@ enum ControlShortcut: Int, CaseIterable {
         case .home: "house"
         case .search: "magnifyingglass"
         case .paste: "doc.on.clipboard"
+        case .inputMethod: "globe"
         case .enter: "return"
         case .volumeUp: "speaker.plus"
         case .volumeDown: "speaker.minus"
@@ -190,6 +192,7 @@ enum ControlShortcut: Int, CaseIterable {
         case .home: table.helpHome
         case .search: table.helpSearch
         case .paste: table.helpPaste
+        case .inputMethod: table.helpInputMethod
         case .enter: table.helpEnter
         case .volumeUp: table.helpVolumeUp
         case .volumeDown: table.helpVolumeDown
@@ -200,7 +203,7 @@ enum ControlShortcut: Int, CaseIterable {
     var report: ReportID {
         switch self {
         case .home, .volumeUp, .volumeDown, .power: .consumer
-        case .search, .paste, .enter: .keyboard
+        case .search, .paste, .enter, .inputMethod: .keyboard
         }
     }
 
@@ -214,6 +217,7 @@ enum ControlShortcut: Int, CaseIterable {
         case .home: input.consumer(0x0223)
         case .search: try input.key("space", modifiers: ["cmd"])
         case .paste: try input.key("v", modifiers: ["cmd"])
+        case .inputMethod: try input.key("space", modifiers: ["ctrl"])
         case .enter: try input.key("enter", modifiers: [])
         case .volumeUp: input.consumer(0x00E9)
         case .volumeDown: input.consumer(0x00EA)
@@ -227,6 +231,7 @@ enum ControlShortcut: Int, CaseIterable {
         switch self {
         case .search: ("space", ["cmd"])
         case .paste: ("v", ["cmd"])
+        case .inputMethod: ("space", ["ctrl"])
         case .enter: ("enter", [])
         case .home, .power, .volumeUp, .volumeDown: nil
         }

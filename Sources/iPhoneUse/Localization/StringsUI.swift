@@ -26,6 +26,7 @@ struct StringsUI: LocalizedTable {
     let shortcutHome: String
     let shortcutSearch: String
     let shortcutPaste: String
+    let shortcutInputMethod: String
     let shortcutEnter: String
     let shortcutVolumeUp: String
     let shortcutVolumeDown: String
@@ -33,6 +34,7 @@ struct StringsUI: LocalizedTable {
     let helpHome: String
     let helpSearch: String
     let helpPaste: String
+    let helpInputMethod: String
     let helpEnter: String
     let helpVolumeUp: String
     let helpVolumeDown: String
@@ -98,6 +100,7 @@ struct StringsUI: LocalizedTable {
         shortcutHome: "Home",
         shortcutSearch: "搜索",
         shortcutPaste: "粘贴",
+        shortcutInputMethod: "切换输入法",
         shortcutEnter: "回车",
         shortcutVolumeUp: "音量 +",
         shortcutVolumeDown: "音量 −",
@@ -105,6 +108,7 @@ struct StringsUI: LocalizedTable {
         helpHome: "返回 iPhone 主屏幕",
         helpSearch: "打开 iPhone 搜索（⌘ Space）",
         helpPaste: "在手机上粘贴（⌘ V）；粘贴 Mac 内容需启用通用剪贴板",
+        helpInputMethod: "切换当前 iPhone 的输入法（Control + Space）；需先在手机配置多个输入法。",
         helpEnter: "发送回车键",
         helpVolumeUp: "提高 iPhone 音量",
         helpVolumeDown: "降低 iPhone 音量",
@@ -178,6 +182,7 @@ struct StringsUI: LocalizedTable {
         shortcutHome: "Home",
         shortcutSearch: "Search",
         shortcutPaste: "Paste",
+        shortcutInputMethod: "Switch input",
         shortcutEnter: "Return",
         shortcutVolumeUp: "Vol +",
         shortcutVolumeDown: "Vol −",
@@ -185,6 +190,7 @@ struct StringsUI: LocalizedTable {
         helpHome: "Go to the iPhone Home Screen",
         helpSearch: "Open iPhone Search (⌘ Space)",
         helpPaste: "Paste on the phone (⌘ V); pasting Mac content requires Universal Clipboard",
+        helpInputMethod: "Switch the current iPhone's input method (Control + Space); configure multiple input methods on the phone first.",
         helpEnter: "Send the Return key",
         helpVolumeUp: "Turn the iPhone volume up",
         helpVolumeDown: "Turn the iPhone volume down",
