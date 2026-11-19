@@ -5,6 +5,11 @@ import VideoToolbox
 /// A lightweight scrcpy-style window. The screen is drawn directly from the latest
 /// CVPixelBuffer and mouse events are sent to the phone's HID input queue.
 final class PhoneControlView: NSView {
+    var onInteraction: (() -> Void)?
+    var isKeyboardTarget = true
+    var isPointerTarget = true
+    private(set) var isRendering = false
+    var acceptsLocalKeyEquivalents: Bool { isKeyboardTarget && window?.firstResponder === self }
     private var binding: ControlDeviceBinding
     private let bluetoothDemandToken = UUID()
     private var timer: Timer?
@@ -21,7 +26,7 @@ final class PhoneControlView: NSView {
     var isBackendNoticeVisible = false {
         didSet { if isBackendNoticeVisible { cancelInteraction() } }
     }
-    func selectBackend(_ backend: InputBackendKind) {
+    func selectBackend(_ backend: InputBackendKind, completion: (() -> Void)? = nil) {
         cancelInteraction()
         activeShortcut = nil
         shortcutFeedback = nil
@@ -31,6 +36,7 @@ final class PhoneControlView: NSView {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let outcome = Result { try USBInputController.shared.select(backend, device: device, request: request) }
             DispatchQueue.main.async { [weak self] in
+                defer { completion?() }
                 guard let self, self.backendRequest === request, !request.isCancelled, self.binding.isRunning,
                       self.device?.screen === device.screen else { return }
                 switch outcome {
@@ -47,6 +53,7 @@ final class PhoneControlView: NSView {
     private let inputQueue = DispatchQueue(label: "iphone-use.window-input-resolution")
     private let shortcutQueue = DispatchQueue(label: "iphone-use.window-shortcuts")
     private var activeShortcut: ControlShortcut?
+    private var textDispatch: ControlTextDispatch?
     private var shortcutFeedback: (text: String, expires: Date)?
     private var lastShortcutState: (available: Set<ControlShortcut>, status: String)?
     private var lastUSBPresentation: ControlUSBPresentation?
@@ -58,7 +65,7 @@ final class PhoneControlView: NSView {
     var onLockStateChanged: ((DeviceLockState) -> Void)?
 
     private var canSendWindowInput: Bool {
-        !isBackendNoticeVisible && binding.acceptsEvents(isKeyWindow: window?.isKeyWindow == true)
+        isKeyboardTarget && !isBackendNoticeVisible && binding.acceptsEvents(isKeyWindow: window?.isKeyWindow == true)
             && connectionStatus == .connected
             && (usbSelected ? usbInput?.isKeyboardReady == true : input?.isBluetoothReady == true)
     }
@@ -66,7 +73,7 @@ final class PhoneControlView: NSView {
     /// Pointer input is not tied to key-window focus: the window under the
     /// mouse steers its own phone. Keyboard input keeps the focus gate above.
     private var canSendPointerInput: Bool {
-        !isBackendNoticeVisible && binding.isDeviceBound
+        isPointerTarget && !isBackendNoticeVisible && binding.isDeviceBound
             && connectionStatus == .connected
             && (usbSelected ? usbInput?.isReady == true : input?.isBluetoothReady == true)
     }
@@ -86,12 +93,13 @@ final class PhoneControlView: NSView {
     override func setFrameSize(_ newSize: NSSize) {
         // The image rectangle changes on resize. End a drag and let the next
         // sample position the pointer using the new geometry.
-        cancelInteraction()
+        if frame.size != newSize { cancelInteraction() }
         super.setFrameSize(newSize)
     }
 
     func start() {
         guard timer == nil else { return }
+        isRendering = true
         HIDPeripheral.shared.beginWindowDemand(bluetoothDemandToken)
         binding.start()
         let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
@@ -106,6 +114,7 @@ final class PhoneControlView: NSView {
     }
 
     func stop() {
+        isRendering = false
         backendRequest?.cancel(); backendRequest = nil
         HIDPeripheral.shared.endWindowDemand(bluetoothDemandToken)
         timer?.invalidate()
@@ -145,6 +154,16 @@ final class PhoneControlView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        if let device, !device.screen.displayIdentityConfirmed {
+            WorkbenchTheme.canvas.setFill()
+            dirtyRect.intersection(bounds).fill()
+            let text = AppLanguageStore.shared.language == .zh
+                ? "正在确认设备画面…" : "Verifying device display…"
+            WorkbenchTheme.text(text,
+                in: NSRect(x: 8, y: bounds.midY - 20, width: max(1, bounds.width - 16), height: 40),
+                size: 11, color: WorkbenchTheme.muted, alignment: .center)
+            return
+        }
         NSColor.black.setFill()
         dirtyRect.intersection(bounds).fill()
         guard let buffer = device?.screen.frame() else {
@@ -176,6 +195,7 @@ final class PhoneControlView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        onInteraction?()
         if usbSelected {
             guard canSendPointerInput, let device, let usbInput,
                   let point = normalizedPoint(event.locationInWindow, device: device) else { return }
@@ -255,15 +275,20 @@ final class PhoneControlView: NSView {
     // delivered. Forward it explicitly so the phone receives the native paste
     // shortcut and can use Universal Clipboard when available.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        guard window?.isKeyWindow == true else { return super.performKeyEquivalent(with: event) }
-        // AppKit consumes edit menu equivalents before keyDown. Keep app/window
-        // shortcuts (Quit, Close, Hide...) local, but send USB editing to iOS.
-        if usbSelected, event.modifierFlags.contains(.command),
+        guard acceptsLocalKeyEquivalents, window?.isKeyWindow == true else { return super.performKeyEquivalent(with: event) }
+        // Local edit menus must not consume focused-phone editing shortcuts.
+        // Keep app/window commands (Quit, Close, Hide...) local on both backends.
+        if event.modifierFlags.contains(.command),
            let name = event.charactersIgnoringModifiers?.lowercased(), ["a", "c", "x", "v", "z"].contains(name) {
+            preemptBackgroundPointerMotion()
             guard canSendWindowInput else { return true }
             switch ControlKeyboardEvent(event).command {
-            case .key(let key, let modifiers): _ = usbInput?.keyFromKeyboard(key, modifiers: modifiers)
-            case .text(let text, let modifiers): _ = usbInput?.typeFromKeyboard(text, modifiers: modifiers)
+            case .key(let key, let modifiers):
+                if usbSelected { _ = usbInput?.keyFromKeyboard(key, modifiers: modifiers) }
+                else { _ = input?.keyFromKeyboard(key, modifiers: modifiers) }
+            case .text(let text, let modifiers):
+                if usbSelected { _ = usbInput?.typeFromKeyboard(text, modifiers: modifiers) }
+                else { _ = input?.typeFromKeyboard(text, modifiers: modifiers) }
             case nil: break
             }
             return true
@@ -281,6 +306,11 @@ final class PhoneControlView: NSView {
     // MARK: Gesture and shortcut coordination
 
     func cancelInteraction(preservingBackgroundMotion: Bool = false) {
+        if let textDispatch {
+            textDispatch.cancel()
+            self.textDispatch = nil
+            activeShortcut = nil
+        }
         dragging = false
         mousePosition.reset()
         input?.cancelPointer(preservingBackgroundMotion: preservingBackgroundMotion)
@@ -322,6 +352,56 @@ final class PhoneControlView: NSView {
                 self.activeShortcut = nil
                 self.shortcutFeedback = (feedback, Date().addingTimeInterval(3))
                 self.refreshDevice()
+            }
+        }
+    }
+
+    func sendText(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        refreshDevice()
+        guard canSendWindowInput, activeShortcut == nil, let device,
+              lastShortcutState?.available.contains(.enter) == true else {
+            completion(.failure(DeviceError(StringsWorkbench.current.waitingInput))); return
+        }
+        let request: TypeTextRequest
+        do { request = try TypeTextRequest(["text": text], language: AppLanguageStore.shared.language) }
+        catch { completion(.failure(error)); return }
+        let usb = usbSelected
+        let backend = selectedBackend
+        let input = self.input
+        let usbInput = self.usbInput
+        let generation = binding.generation
+        cancelInteraction()
+        let ticket = ControlTextDispatch()
+        textDispatch = ticket
+        activeShortcut = .enter
+        updateShortcutState()
+        shortcutQueue.async { [weak self] in
+            let result = Result<Void, Error> {
+                guard !ticket.isCancelled, ScreenCaptureManager.shared.isCurrent(device.screen),
+                      USBInputController.shared.selected(device.id) == backend else {
+                    throw DeviceError(StringsWorkbench.current.disconnected)
+                }
+                if usb {
+                    guard let usbInput, usbInput.isKeyboardReady else { throw DeviceError(StringsWorkbench.current.waitingInput) }
+                    try usbInput.type(request, ocr: {
+                        guard let frame = device.screen.snapshotObservation(png: false, maxEdge: 1600) else { return nil }
+                        return USBKeyboardModeOCR.observe(frame.data, device: device.id, receivedAt: frame.receivedAt,
+                                                          includeCandidate: request.ensureChineseIME)
+                    })
+                } else {
+                    guard let input, input.isCurrentSession, input.isBluetoothReady else { throw DeviceError(StringsWorkbench.current.waitingInput) }
+                    try request.perform(on: input, ocr: {
+                        device.screen.snapshot(png: false).map { ScreenOCR.recognize($0, device: device.id) }
+                    })
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                if let self, self.binding.isCurrent(generation), self.textDispatch === ticket {
+                    self.textDispatch = nil
+                    self.activeShortcut = nil
+                    self.refreshDevice()
+                }
+                completion(ticket.finalResult(result))
             }
         }
     }
@@ -581,6 +661,11 @@ final class PhoneControlView: NSView {
             mousePosition.reset()
             return
         }
+        let localPoint = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard dragging || visibleRect.contains(localPoint) else {
+            mousePosition.reset()
+            return
+        }
         if let point = normalizedPoint(window.mouseLocationOutsideOfEventStream, device: device, clamp: dragging) {
             mousePosition.update(point)
             flushMousePosition()
@@ -779,5 +864,20 @@ private enum ControlScreenRenderer {
             .font: NSFont.systemFont(ofSize: 16), .paragraphStyle: style,
         ]
         (text as NSString).draw(in: bounds.insetBy(dx: 20, dy: bounds.height / 2 - 30), withAttributes: attributes)
+    }
+}
+
+/// Cancels pending UI text dispatch without reading AppKit state on a worker queue.
+/// Already-dispatched input is never replayed or rebound to a new selection.
+final class ControlTextDispatch {
+    private let lock = NSLock()
+    private var cancelled = false
+    var isCancelled: Bool { lock.withLock { cancelled } }
+    func cancel() { lock.withLock { cancelled = true } }
+
+    func finalResult(_ result: Result<Void, Error>) -> Result<Void, Error> {
+        // Cancellation cannot retract text already accepted by a backend.
+        // Preserve the draft and report uncertainty rather than a late success.
+        isCancelled ? .failure(DeviceError(StringsWorkbench.current.textCancelled)) : result
     }
 }

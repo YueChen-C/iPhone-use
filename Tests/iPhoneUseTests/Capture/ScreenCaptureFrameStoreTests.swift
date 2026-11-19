@@ -13,6 +13,16 @@ final class ScreenCaptureFrameStoreTests: XCTestCase {
         return try XCTUnwrap(value)
     }
 
+    func testExpectedPhysicalDimensionsRejectCrossRoutedFramesBeforeEncoding() throws {
+        let store = ScreenCaptureFrameStore()
+        store.publish(try buffer(width: 8, height: 6), receivedAt: 1)
+        let frame = try XCTUnwrap(store.snapshot())
+        XCTAssertTrue(ScreenCaptureSource.accepts(frame, expectedSize: CGSize(width: 8, height: 6)))
+        XCTAssertFalse(ScreenCaptureSource.accepts(frame, expectedSize: CGSize(width: 6, height: 8)))
+        XCTAssertFalse(ScreenCaptureSource.accepts(frame, expectedSize: CGSize(width: 16, height: 9)))
+        XCTAssertTrue(ScreenCaptureSource.accepts(frame, expectedSize: nil))
+    }
+
     func testSnapshotKeepsBufferSequenceAndTimestampTogether() throws {
         let store = ScreenCaptureFrameStore()
         XCTAssertNil(store.snapshot())

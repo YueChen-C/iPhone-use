@@ -35,6 +35,14 @@ struct ControlUSBPresentation: Equatable {
     var offersUSBSetup: Bool {
         hasScreen && (state == .requiresDDI || recovery == .services)
     }
+    /// Explicit connection preparation only; never resumes an earlier input.
+    var offersPreparationRetry: Bool {
+        guard hasScreen else { return false }
+        switch state {
+        case .failed, .disconnected, .identityUnverified, .requiresTrust, .requiresDeveloperMode, .requiresDDI: return true
+        default: return false
+        }
+    }
     var recovery: Recovery {
         if !hasScreen { return .connect }
         if reason == .displayUnavailable { return .display }

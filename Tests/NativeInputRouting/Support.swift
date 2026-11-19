@@ -56,17 +56,29 @@ struct DeviceError: Error, CustomStringConvertible {
     init(_ value: String) { description = value }
 }
 final class ScreenCaptureSession {
+    fileprivate(set) var id = ""
     let associationIdentity = UUID()
     let size: CGSize? = .init(width: 1170, height: 2532)
 }
 struct Device {
     let id: String
     let screen: ScreenCaptureSession
+    init(id: String, screen: ScreenCaptureSession) {
+        self.id = id; self.screen = screen
+        screen.id = id
+        ScreenCaptureManager.shared.register(screen)
+    }
 }
 final class ScreenCaptureManager {
     static let shared = ScreenCaptureManager()
-    func isCurrent(_ screen: ScreenCaptureSession) -> Bool { true }
-    func permitsPointerAssociation(for screen: ScreenCaptureSession) -> Bool { true }
+    private let lock = NSLock()
+    private var screens: [String: ScreenCaptureSession] = [:]
+    var all: [ScreenCaptureSession] { lock.withLock { Array(screens.values) } }
+    func register(_ screen: ScreenCaptureSession) { lock.withLock { screens[screen.id] = screen } }
+    func isCurrent(_ screen: ScreenCaptureSession) -> Bool {
+        lock.withLock { screens[screen.id] === screen }
+    }
+    func permitsPointerAssociation(for screen: ScreenCaptureSession) -> Bool { isCurrent(screen) }
 }
 
 // Keep the actual BLE notification FIFO/readiness model; do not substitute an
@@ -134,7 +146,14 @@ final class DeviceRegistry {
     static let shared = DeviceRegistry()
     private let lock = NSLock()
     private var inputs: [String: [DeviceInput]] = [:]
-    func retain(_ input: DeviceInput, for device: Device) { lock.withLock { inputs[device.id, default: []].append(input) } }
+    private var devices: [String: Device] = [:]
+    func all() -> [Device] { lock.withLock { Array(devices.values) } }
+    func retain(_ input: DeviceInput, for device: Device) {
+        lock.withLock {
+            devices[device.id] = device
+            inputs[device.id, default: []].append(input)
+        }
+    }
     func cancelBackgroundMotion(for device: Device) {
         for input in lock.withLock({ inputs[device.id] ?? [] }) { input.cancelBackgroundMotion() }
     }

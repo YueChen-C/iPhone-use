@@ -9,9 +9,11 @@ func log(_ message: String) {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     // Retain all device controllers for as long as their windows remain open.
-    private let windows = ControlWindowCoordinator()
+    private let windows = WorkbenchWindowCoordinator()
     private var quietModeItem: NSMenuItem?
     private var quitItem: NSMenuItem?
+    private var editMenu: NSMenu?
+    private var editItem: NSMenuItem?
     private var windowMenu: NSMenu?
     private var windowItem: NSMenuItem?
     private var showAllItem: NSMenuItem?
@@ -143,6 +145,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(quit)
         quitItem = quit
 
+        // Standard responder-chain editing belongs to local native text fields.
+        // PhoneControlView handles its own remote key equivalents only when focused.
+        let editMenu = AppEditMenu.make(language: AppLanguageStore.shared.language)
+        let editItem = NSMenuItem(title: editMenu.title, action: nil, keyEquivalent: "")
+        editItem.submenu = editMenu
+        menu.addItem(editItem)
+        self.editMenu = editMenu
+        self.editItem = editItem
+
         let windowMenu = NSMenu(title: StringsUI.current.windowMenu)
         let windowItem = NSMenuItem(title: StringsUI.current.windowMenu, action: nil, keyEquivalent: "")
         windowItem.submenu = windowMenu
@@ -172,6 +183,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshMenuTitles() {
         let table = StringsUI.current
+        if let editMenu {
+            AppEditMenu.localize(editMenu, language: AppLanguageStore.shared.language)
+            editItem?.title = editMenu.title
+        }
         quietModeItem?.title = table.quietBackgroundMode
         quietModeItem?.toolTip = table.quietBackgroundModeHelp
         ddiReviewItem?.title = StringsDDIReview.current.title
@@ -189,6 +204,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshRunModeMenuState() {
         quietModeItem?.state = AppRunModeStore.shared.mode == .residentQuiet ? .on : .off
+    }
+}
+
+/// Native text editing through the responder chain; never reads or forwards clipboard data.
+enum AppEditMenu {
+    private static let commands: [(selector: String, key: String)] = [
+        ("undo:", "z"), ("redo:", "z"), ("cut:", "x"),
+        ("copy:", "c"), ("paste:", "v"), ("selectAll:", "a"),
+    ]
+
+    static func make(language: AppLanguage) -> NSMenu {
+        let menu = NSMenu()
+        for (index, command) in commands.enumerated() {
+            if index == 2 { menu.addItem(.separator()) }
+            let item = NSMenuItem(title: "", action: Selector(command.selector), keyEquivalent: command.key)
+            item.tag = index
+            item.keyEquivalentModifierMask = index == 1 ? [.command, .shift] : [.command]
+            // A nil target lets AppKit route editing to the actual first responder.
+            menu.addItem(item)
+        }
+        localize(menu, language: language)
+        return menu
+    }
+
+    static func localize(_ menu: NSMenu, language: AppLanguage) {
+        let titles = language == .zh
+            ? ["撤销", "重做", "剪切", "拷贝", "粘贴", "全选"]
+            : ["Undo", "Redo", "Cut", "Copy", "Paste", "Select All"]
+        menu.title = language == .zh ? "编辑" : "Edit"
+        for item in menu.items where !item.isSeparatorItem && titles.indices.contains(item.tag) {
+            item.title = titles[item.tag]
+        }
     }
 }
 
@@ -217,7 +264,7 @@ enum Application {
         let appDelegate = AppDelegate()
         app.delegate = appDelegate
 
-        // Explicit launch-only selection; BLE remains the default otherwise.
+        // Explicit launch-only selection wins over the discovered iOS default.
         if let device = ProcessInfo.processInfo.environment["IPHONE_USE_USB_DEVICE"], !device.isEmpty {
             do { try USBInputController.shared.selectAtLaunch(physicalID: device) }
             catch { log("USB selection refused: \(error)") }

@@ -11,6 +11,45 @@ final class ControlUSBPresentationTests: XCTestCase {
         return .init(snapshot: snapshot, inputReady: ready, hasScreen: hasScreen)
     }
 
+    func testExplicitPreparationRetryIsNotOfferedWhileReadyBusyUnsupportedOrAbsent() {
+        for state in [InputBackendReadiness.failed, .identityUnverified, .disconnected, .requiresTrust,
+                      .requiresDeveloperMode, .requiresDDI] {
+            XCTAssertTrue(presentation(state).offersPreparationRetry, state.rawValue)
+            XCTAssertFalse(presentation(state, hasScreen: false).offersPreparationRetry)
+        }
+        for state in [InputBackendReadiness.preparing, .ready, .unsupportedHost, .unsupportedDevice, .disabled] {
+            XCTAssertFalse(presentation(state, ready: state == .ready).offersPreparationRetry)
+        }
+    }
+
+    func testExplicitPreparationButtonDebouncesAndNeverCallsSetupOrBluetooth() throws {
+        let old = AppLanguageStore.shared.language
+        defer { AppLanguageStore.shared.set(old) }
+        AppLanguageStore.shared.set(.en)
+        let overlay = ControlConnectionOverlay(frame: NSRect(x: 0, y: 0, width: 400, height: 800), presentation: .inspector)
+        overlay.updateUSB(presentation(.failed, detail: "native preflight diagnostic"))
+        let buttons = descendants(overlay).compactMap { $0 as? NSButton }
+        let retry = try XCTUnwrap(buttons.first { $0.title == StringsUSBControl.en.retryPreparation })
+        let bluetooth = try XCTUnwrap(buttons.first { $0.title == StringsUI.en.overlayButtonReconnect })
+        var retried = 0, setup = 0
+        var finish: (() -> Void)?
+        overlay.onRetryUSB = { completion in retried += 1; finish = completion }
+        overlay.onEnableUSB = { setup += 1 }
+        XCTAssertFalse(retry.isHiddenOrHasHiddenAncestor)
+        XCTAssertTrue(bluetooth.isHiddenOrHasHiddenAncestor)
+        retry.performClick(nil)
+        XCTAssertEqual(retried, 1); XCTAssertFalse(retry.isEnabled)
+        overlay.updateUSB(presentation(.failed)) // A polling update cannot enable a duplicate.
+        retry.performClick(nil); XCTAssertEqual(retried, 1)
+        finish?(); XCTAssertTrue(retry.isEnabled)
+        XCTAssertEqual(setup, 0)
+        AppLanguageStore.shared.set(.zh); overlay.refreshLocalization()
+        XCTAssertEqual(retry.title, StringsUSBControl.zh.retryPreparation)
+        overlay.updateUSB(presentation(.preparing)); XCTAssertTrue(retry.isHidden)
+        overlay.updateUSB(presentation(.ready, capabilities: ["tap"], ready: true)); XCTAssertTrue(retry.isHidden)
+        overlay.updateUSB(nil); XCTAssertTrue(retry.isHidden)
+    }
+
     func testReadyPresentationRequiresLiveInputAndSeparatesKeyboardCapability() {
         let touch = presentation(.ready, capabilities: ["tap"], ready: true)
         let keyboard = presentation(.ready, capabilities: ["tap", "text", "key"], ready: true)

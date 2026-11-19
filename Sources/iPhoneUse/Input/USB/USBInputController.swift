@@ -3,7 +3,7 @@ import Foundation
 /// Full physical identity owns selection and retirement. Switching is off the
 /// AppKit thread; neither backend may send while the previous one is retiring.
 final class USBInputController {
-    static let shared = USBInputController()
+    static let shared = USBInputController(preferences: .shared)
     private let lock = NSLock()
     private var transitions: [String: DispatchQueue] = [:]
     private var entries: [String: USBDeviceInput] = [:]
@@ -11,14 +11,26 @@ final class USBInputController {
     private var selections: [String: InputBackendSelection] = [:]
     private var selectionRequests: [String: UUID] = [:]
     private var refreshing: Set<String> = []
+    private var defaultInspections: [String: UUID] = [:]
     private let transitionWork = DispatchGroup()
     private var stopped = false
     private var shutdownWork: DispatchGroup?
     private var shutdownReleased = false
     private let requireUSB: (String) throws -> Void
+    private let preferences: InputBackendPreferences?
 
-    init(requireUSB: @escaping (String) throws -> Void = USBBackendCompatibility.require) {
+    init(requireUSB: @escaping (String) throws -> Void = USBBackendCompatibility.require,
+         preferences: InputBackendPreferences? = nil) {
         self.requireUSB = requireUSB
+        self.preferences = preferences
+        for (id, backend) in preferences?.load() ?? [:] {
+            var state = InputBackendSelection()
+            let generation = state.begin(backend)
+            state.finish(generation, released: true)
+            selections[id] = state
+            // Saved choices beat discovery metadata, just like current choices.
+            selectionRequests[id] = UUID()
+        }
     }
 
     func selectAtLaunch(physicalID: String) throws {
@@ -34,6 +46,22 @@ final class USBInputController {
         guard accepted else { throw USBInputFailure(.staleSession, "USB selection cancelled or superseded; no replay") }
     }
     func selected(_ id: String) -> InputBackendKind { lock.withLock { selections[id]?.backend ?? .ble } }
+    /// Metadata chooses a route, not readiness. No USB worker/input is usable
+    /// until refresh performs the normal release, identity and service gates.
+    /// Even an in-flight explicit choice wins over a late version inspection.
+    @discardableResult
+    func applyDefault(physicalID: String, version: String) -> Bool {
+        guard InputBackendKind.defaultForIOSVersion(version) == .usb else { return false }
+        return lock.withLock {
+            guard !stopped, selectionRequests[physicalID] == nil,
+                  entries[physicalID] == nil, selections[physicalID]?.backend != .usb else { return false }
+            var state = selections[physicalID] ?? InputBackendSelection()
+            let generation = state.begin(.usb)
+            state.finish(generation, released: true)
+            selections[physicalID] = state
+            return true
+        }
+    }
     func generation(_ id: String) -> UUID { lock.withLock {
         if selections[id] == nil { selections[id] = InputBackendSelection() }
         return selections[id]!.generation
@@ -44,7 +72,7 @@ final class USBInputController {
     func input(_ device: Device) -> USBDeviceInput? {
         lock.withLock {
             guard !stopped, selections[device.id]?.permits(.usb) == true, let input = entries[device.id],
-                  input.captureID == device.screen.associationIdentity else { return nil }
+                  !input.isRetired, input.captureID == device.screen.associationIdentity else { return nil }
             return input
         }
     }
@@ -70,15 +98,25 @@ final class USBInputController {
     }
     func select(_ backend: InputBackendKind, device: Device,
                 request: USBBackendSelectionRequest? = nil, expectedGeneration: UUID? = nil) throws {
-        let ticket = try checkSelection(backend, id: device.id, request: request, expectedGeneration: expectedGeneration)
-        guard ScreenCaptureManager.shared.isCurrent(device.screen) else {
-            throw USBInputFailure(.staleSession, StringsUSBControl.current.versionUnavailable)
+        // Do not inspect a provisional/obsolete capture. Recheck after the
+        // child returns: identity may have changed while reading the device.
+        func requireCurrentCapture() throws {
+            guard ScreenCaptureManager.shared.isCurrent(device.screen),
+                  backend != .usb || ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen) else {
+                throw USBInputFailure(.staleSession, StringsUSBControl.current.guidance(.identity))
+            }
         }
+        try requireCurrentCapture()
+        let ticket = try checkSelection(backend, id: device.id, request: request, expectedGeneration: expectedGeneration)
+        try requireCurrentCapture()
         let admitted = lock.withLock { () -> (UUID, USBDeviceInput?, DispatchQueue)? in
             guard !stopped, request?.isCancelled != true, selectionRequests[device.id] == ticket,
                   expectedGeneration == nil || selections[device.id]?.generation == expectedGeneration else { return nil }
             var state = selections[device.id] ?? InputBackendSelection()
             let generation = state.begin(backend); selections[device.id] = state
+            if expectedGeneration == nil {
+                preferences?.save(backend, physicalID: device.id)
+            }
             let previous = entries.removeValue(forKey: device.id)
             if let previous { retiring[device.id, default: []].append(previous) }
             let queue = transitions[device.id] ?? DispatchQueue(label: "iphone-use.input-transition.\(device.id)")
@@ -120,6 +158,9 @@ final class USBInputController {
         let allowed = lock.withLock { !stopped && selections[device.id]?.permits(.usb) == true }
         guard allowed else { return }
         if let entry = input(device) { entry.validateCapture(); return }
+        // Startup capture objects exist before physical/display identity is
+        // confirmed. Wait without inspecting or latching a preparation failure.
+        guard ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen) else { return }
         // Launch selection also needs preflight, without blocking a 30Hz UI tick
         // or launching duplicate inspections before the first one completes.
         let generation = lock.withLock { () -> UUID? in
@@ -132,26 +173,58 @@ final class USBInputController {
             defer { _ = lock.withLock { refreshing.remove(device.id) } }
             do { try select(.usb, device: device, expectedGeneration: generation) }
             catch {
+                // An obsolete discovery result is not a failure of the saved
+                // USB choice. The next current verified capture may prepare;
+                // no click, key or text request is queued or replayed here.
+                guard (error as? USBInputFailure)?.code != .staleSession,
+                      ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen) else {
+                    log("USB preparation deferred for \(device.id): \(error)")
+                    return
+                }
                 lock.withLock {
-                    // A rejected launch preference must not strand BLE. Do not
-                    // change an explicit selection made while inspection ran.
+                    // Keep the selected route and surface its failure. A USB
+                    // default must never silently fall back to Bluetooth.
                     if !stopped, selections[device.id]?.generation == generation, entries[device.id] == nil {
-                        var state = selections[device.id]!
-                        let generation = state.begin(.ble); state.finish(generation, released: true)
-                        selections[device.id] = state
+                        selections[device.id]?.fail(generation, message: String(describing: error))
                     }
                 }
-                log("USB selection refused: \(error)")
+                log("USB selection refused for \(device.id): \(error)")
             }
         }
     }
-    /// Capture removal/remapping/revoked identity must retire input even when
-    /// no control window is polling. Keep each entry owned until explicit
-    /// selection/shutdown can confirm release and exit; never prepare or replay
-    /// from a capture notification. Do not hold our lock across capture reads.
+    /// Capture removal or identity replacement retires only its own input.
+    /// Temporary gates release held input without retiring an idle transport.
+    /// Validate even when no control window is polling. Keep each entry owned until explicit
+    /// selection/shutdown can confirm release and exit. New capture metadata may
+    /// choose a default and prepare its route, but never replay any user input.
+    /// Do not hold our lock across capture reads.
     func captureDidChange() {
         let current = lock.withLock { stopped ? [] : Array(entries.values) }
         for input in current { input.validateCapture() }
+        // Restored USB preferences must prepare in quiet mode too; no visible
+        // PhoneControlView is required to poll them into readiness.
+        for device in DeviceRegistry.shared.all() where selected(device.id) == .usb {
+            refresh(device)
+        }
+        // One read-only inspection per capture lifetime, off AppKit/video paths.
+        // This also applies in quiet mode, before any workbench is opened.
+        for screen in ScreenCaptureManager.shared.all {
+            let inspect = lock.withLock { () -> Bool in
+                guard !stopped, selectionRequests[screen.id] == nil,
+                      defaultInspections[screen.id] != screen.associationIdentity else { return false }
+                defaultInspections[screen.id] = screen.associationIdentity
+                return true
+            }
+            guard inspect else { continue }
+            DispatchQueue.global(qos: .utility).async { [self] in
+                guard let version = try? USBBackendCompatibility.version(physicalID: screen.id),
+                      ScreenCaptureManager.shared.isCurrent(screen),
+                      applyDefault(physicalID: screen.id, version: version),
+                      let device = DeviceRegistry.shared.all().first(where: { $0.screen === screen }) else { return }
+                log("Default input USB for iOS \(version): \(screen.id)")
+                refresh(device)
+            }
+        }
     }
     func status(_ device: Device) -> [String: Any] {
         let (state, isStopped) = lock.withLock { (selections[device.id], stopped) }
@@ -205,7 +278,8 @@ final class USBInputController {
 final class USBDeviceInput {
     let physicalID: String
     let captureID: UUID
-    private weak var screen: ScreenCaptureSession?
+    private weak var boundScreen: ScreenCaptureSession?
+    private var screen: ScreenCaptureSession? { lock.withLock { boundScreen } }
     private let lock = NSLock()
     private let queue: DispatchQueue
     private var client: USBTouchClient?
@@ -213,6 +287,8 @@ final class USBDeviceInput {
     private var readiness: InputBackendReadiness = .preparing
     private var preparationFailure: USBPreparationFailure?
     private var retired = false
+    private var capturePaused = false
+    var isRetired: Bool { lock.withLock { retired } }
     private var pendingMotion: USBTouchPoint?
     private var motionScheduled: UUID?
     private var admission = USBWindowInputAdmission()
@@ -246,7 +322,7 @@ final class USBDeviceInput {
         }
     }
     init(device: Device) {
-        physicalID = device.id; captureID = device.screen.associationIdentity; screen = device.screen
+        physicalID = device.id; captureID = device.screen.associationIdentity; boundScreen = device.screen
         queue = DispatchQueue(label: "iphone-use.usb-input.\(device.id)")
     }
     func prepare() {
@@ -276,7 +352,29 @@ final class USBDeviceInput {
             } catch { fail(error) }
         }
     }
-    func validateCapture() { if !screenValid { retire() } }
+    func validateCapture() {
+        let manager = ScreenCaptureManager.shared
+        guard let current = manager.all.first(where: {
+            $0.id == physicalID && $0.associationIdentity == captureID
+        }) else { retire(); return }
+        let rebound = lock.withLock { () -> Bool in
+            guard boundScreen !== current else { return false }
+            boundScreen = current
+            return true
+        }
+        let valid = screenValid
+        let action = lock.withLock { () -> (cancel: Bool, retire: Bool) in
+            let wasPaused = capturePaused
+            capturePaused = !valid
+            let cancel = (rebound || (!valid && !wasPaused)) && !retired
+            return (cancel, cancel && synchronousGesture)
+        }
+        // Temporary identity checks release held input without discarding an
+        // idle exact-device transport. Interrupting a synchronous gesture does
+        // close its worker: retire it so refresh can prepare after confirmed release.
+        if action.retire { retire() }
+        else if action.cancel { cancel() }
+    }
     private func fail(_ error: Error) {
         keyboardGate.cancel()
         lock.withLock {

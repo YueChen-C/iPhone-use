@@ -215,6 +215,9 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     private var sources: [String: ScreenCaptureSource] = [:]
     private var screens: [String: ScreenCaptureSession] = [:]
     private var verifiedScreenIDs: Set<String> = []
+    // Learned only from independent physical-to-video verification. Hardware
+    // dimensions survive a peer disconnect, but not manager shutdown.
+    private var confirmedSizes: [String: CGSize] = [:]
     private var refreshTimer: Timer?
     private var loggedNoScreens = false
     private var emptyRefreshCount = 0
@@ -223,6 +226,9 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     private let shutdownQueue = DispatchQueue(label: "iphone-use.capture-shutdown", qos: .userInitiated)
     private var identityGeneration: UInt64 = 0
     private var verificationState: ScreenCaptureIdentityState = .singleDevice
+    // Once muxing has been observed, even the surviving single nominal source
+    // may carry another phone's pixels during unplug/replug discovery.
+    private var requiresDisplayVerification = false
     private var associationIdentities = CaptureAssociationIdentity()
     private var sourceRecovery = CaptureSourceRecovery()
     private var valeriaRecovery = CaptureValeriaRecoveryTracker()
@@ -400,8 +406,10 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             deviceObservers.removeAll()
             let currentSources = Array(sources.values)
             sources.removeAll()
+            screens.values.forEach { $0.setDisplayIdentityConfirmed(false) }
             screens.removeAll()
             verifiedScreenIDs.removeAll()
+            confirmedSizes.removeAll()
             _ = valeriaRecovery.reset()
             identityGeneration &+= 1
             return (currentObservers, currentSources)
@@ -464,13 +472,13 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     var identityState: ScreenCaptureIdentityState { lock.withLock { verificationState } }
 
     var permitsPointerAssociation: Bool {
-        lock.withLock { verificationState.permitsAssociation(identityVerified: true) }
+        lock.withLock { screens.values.contains { $0.displayIdentityConfirmed } }
     }
 
     func permitsPointerAssociation(for screen: ScreenCaptureSession) -> Bool {
         lock.withLock {
             screens[screen.id] === screen
-                && verificationState.permitsAssociation(identityVerified: verifiedScreenIDs.contains(screen.id))
+                && screen.displayIdentityConfirmed
         }
     }
 
@@ -485,7 +493,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     var associationScreens: [ScreenCaptureSession] {
         lock.withLock {
             screens.values.filter {
-                verificationState.permitsAssociation(identityVerified: verifiedScreenIDs.contains($0.id))
+                $0.displayIdentityConfirmed
             }
             .sorted { $0.name < $1.name }
         }
@@ -495,12 +503,13 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     /// distinguishable. Status polling never starts new screenshot work.
     func retryIdentityVerification() {
         let job: (UInt64, [String: ScreenCaptureSource])? = lock.withLock {
-            guard !isStopped, sources.count > 1,
+            guard !isStopped, !sources.isEmpty,
                 verificationState == .failed || verificationState == .unavailable
                     || verificationState == .partiallyVerified
             else { return nil }
             identityGeneration &+= 1
             verificationState = .pending
+            rebuildScreens(mapping: [:], verified: false)
             return (identityGeneration, sources)
         }
         guard let job else { return }
@@ -539,6 +548,15 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         let didRun = lock.withLock { () -> Bool in
             guard !isStopped, lifecycleGeneration == generation else { return false }
             refreshLifecycle = lifecycleGeneration
+            // Source IDs alone are not physical identity. Keep only routes
+            // whose independently learned dimensions remain unambiguous.
+            if Set(sources.keys) != present {
+                let stable = stableMappings(physicalIDs: present)
+                for screen in screens.values {
+                    screen.setDisplayIdentityConfirmed(
+                        stable[screen.id] == screen.sourceID && present.contains(screen.sourceID))
+                }
+            }
             var newlyClaimedSwitches: [CaptureValeriaRecoveryTracker.ScheduledPostSwitchCheck] = []
             for (id, source) in sources where !present.contains(id) {
                 source.stop()
@@ -605,7 +623,8 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
                 associationIdentities.retain(physicalIDs: Set(sources.keys))
                 sourceRecovery.retain(sources: activeInstances)
                 identityGeneration &+= 1
-                if present.count > 1 {
+                if present.count > 1 { requiresDisplayVerification = true }
+                if present.count > 1 || (requiresDisplayVerification && !sources.isEmpty) {
                     // A failed capture must not turn two discovered phones into
                     // an assumed single-device identity.
                     verificationState = sources.count == present.count ? .pending : .failed
@@ -675,6 +694,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     func enterMultiDevicePendingForValeriaLocked() {
         identityGeneration &+= 1
         verificationState = .pending
+        requiresDisplayVerification = true
         rebuildScreens(mapping: [:], verified: false)
     }
 
@@ -701,28 +721,51 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             restartSource: restartSource)
     }
 
-    /// Called under lock. Retain surviving preview objects and Bluetooth proofs
-    /// while input remains blocked by the separate capture verification state.
+    private func stableMappings(physicalIDs: Set<String>? = nil) -> [String: String] {
+        CaptureScreenMapping.continuing(
+            physicalIDs: physicalIDs ?? Set(sources.keys), expectedSizes: confirmedSizes,
+            sourceSizes: sources.compactMapValues(\.size))
+    }
+
+    /// A peer failure must not erase a proven, dimension-unique route. Screen
+    /// objects and workers survive while the physical/source binding survives.
     private func rebuildScreens(mapping: [String: String], verified: Bool) {
+        if verified {
+            for (id, sourceID) in mapping {
+                if let size = sources[sourceID]?.size { confirmedSizes[id] = size }
+            }
+        }
+        var proven = stableMappings()
+        // Fresh independent evidence wins, including same-resolution devices.
+        for (id, sourceID) in mapping where verified {
+            proven = proven.filter { $0.key == id || $0.value != sourceID }
+            proven[id] = sourceID
+        }
         let displayMapping = CaptureScreenMapping.previews(
-            confirmed: mapping,
+            confirmed: proven,
             previous: screens.mapValues { .init(id: $0.sourceID, instance: $0.sourceInstanceID) },
             sources: sources.mapValues(\.instanceID))
-        verifiedScreenIDs = verified ? Set(mapping.keys) : []
+        verifiedScreenIDs = Set(proven.keys)
+        let previousScreens = screens
         screens = displayMapping.reduce(into: [:]) { result, entry in
             guard let physical = sources[entry.key], let source = sources[entry.value] else { return }
-            let identity = associationIdentities.identity(
-                physicalID: entry.key,
-                isConfirmed: (verified && mapping[entry.key] != nil) || verificationState == .singleDevice)
-            if let previous = screens[entry.key], previous.sourceInstanceID == source.instanceID,
-                previous.associationIdentity == identity
-            {
+            let displayConfirmed = proven[entry.key] == entry.value
+                || (verificationState == .singleDevice && !requiresDisplayVerification)
+            let identity = associationIdentities.identity(physicalID: entry.key, isConfirmed: displayConfirmed)
+            let expectedSize = confirmedSizes[entry.key]
+            if let previous = previousScreens[entry.key], previous.sourceInstanceID == source.instanceID,
+                previous.associationIdentity == identity, previous.expectedSize == expectedSize {
+                previous.setDisplayIdentityConfirmed(displayConfirmed)
                 result[entry.key] = previous
                 return
             }
             result[entry.key] = ScreenCaptureSession(
                 id: entry.key, name: physical.name, source: source,
-                associationIdentity: identity)
+                associationIdentity: identity, displayIdentityConfirmed: displayConfirmed,
+                expectedSize: expectedSize)
+        }
+        for (id, previous) in previousScreens where screens[id] !== previous {
+            previous.setDisplayIdentityConfirmed(false)
         }
     }
 
@@ -735,6 +778,15 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             guard let self else { return }
             let isCurrent = { self.lock.withLock { !self.isStopped && self.identityGeneration == generation } }
             guard isCurrent() else { return }
+            let alreadyResolved = self.lock.withLock { () -> Bool in
+                guard self.identityGeneration == generation else { return false }
+                let stable = self.stableMappings()
+                guard !stable.isEmpty, stable.count == self.sources.count else { return false }
+                self.rebuildScreens(mapping: stable, verified: true)
+                self.verificationState = .verified
+                return true
+            }
+            if alreadyResolved { self.onScreensChanged?(); return }
             let result = CaptureIdentityVerifier.verify(
                 physicalIDs: sources.keys.sorted(),
                 sourceImages: { sources.compactMapValues { $0.identityImage() } },
@@ -756,11 +808,11 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
                 case .unavailable:
                     // Without an independent check, pointer discovery must
                     // prove this mapping again before reusing Bluetooth input.
-                    self.associationIdentities = CaptureAssociationIdentity()
                     self.rebuildScreens(mapping: [:], verified: false)
                     self.verificationState = .unavailable
                     log("capture identity unverified: native USB screenshot service unavailable")
                 case .failed:
+                    self.rebuildScreens(mapping: [:], verified: false)
                     self.verificationState = .failed
                     shouldRetry = retryOnFailure
                     shouldRecover = !retryOnFailure
@@ -775,6 +827,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
                         // stream's pixels. Keep Bluetooth proofs, but recheck
                         // the complete video mapping before accepting input.
                         self.verificationState = .pending
+                        self.rebuildScreens(mapping: [:], verified: false)
                         for source in empty where selected.contains(source.instanceID) {
                             log("restarting empty capture source: \(source.name) (\(source.id))")
                             source.restart()
@@ -820,34 +873,63 @@ final class ScreenCaptureSession {
     let name: String
     let associationIdentity: UUID
     private let source: ScreenCaptureSource
+    private let displayIdentity: CaptureDisplayIdentity
+    let expectedSize: CGSize?
 
     var sourceID: String { source.id }
     var sourceInstanceID: UUID { source.instanceID }
-    var size: CGSize? { source.size }
+    var size: CGSize? {
+        frame().map { CGSize(width: CVPixelBufferGetWidth($0), height: CVPixelBufferGetHeight($0)) }
+    }
+    var displayIdentityConfirmed: Bool {
+        displayIdentity.isConfirmed && (expectedSize == nil || source.size == expectedSize)
+    }
     var captureError: String? { source.lastError }
 
     fileprivate init(
-        id: String, name: String, source: ScreenCaptureSource, associationIdentity: UUID
+        id: String, name: String, source: ScreenCaptureSource, associationIdentity: UUID,
+        displayIdentityConfirmed: Bool, expectedSize: CGSize? = nil
     ) {
         self.id = id
         self.name = name
         self.source = source
         self.associationIdentity = associationIdentity
+        displayIdentity = CaptureDisplayIdentity(confirmed: displayIdentityConfirmed)
+        self.expectedSize = expectedSize
     }
 
-    func frame() -> CVPixelBuffer? { source.frame() }
+    fileprivate func setDisplayIdentityConfirmed(_ confirmed: Bool) { displayIdentity.setConfirmed(confirmed) }
 
-    func observationFrame() -> ScreenCaptureFrameStore.Snapshot? { source.observationFrame() }
+    func frame() -> CVPixelBuffer? {
+        displayIdentity.read {
+            guard let buffer = source.frame(), accepts(buffer) else { return nil }
+            return buffer
+        }
+    }
+
+    private func accepts(_ buffer: CVPixelBuffer) -> Bool {
+        expectedSize == nil || expectedSize == CGSize(
+            width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
+    }
+
+    func observationFrame() -> ScreenCaptureFrameStore.Snapshot? {
+        displayIdentity.read {
+            guard let snapshot = source.observationFrame(), accepts(snapshot.buffer) else { return nil }
+            return snapshot
+        }
+    }
 
     func snapshot(png: Bool, maxWidth: Int? = nil, maxEdge: Int? = nil) -> Data? {
-        source.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge)
+        displayIdentity.read { source.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge, expectedSize: expectedSize) }
     }
 
     func snapshotObservation(png: Bool, maxEdge: Int? = nil) -> (data: Data, receivedAt: TimeInterval)? {
-        source.snapshotObservation(png: png, maxEdge: maxEdge)
+        displayIdentity.read { source.snapshotObservation(png: png, maxEdge: maxEdge, expectedSize: expectedSize) }
     }
 
-    func thumbnail(width: Int, height: Int) -> [UInt8]? { source.thumbnail(width: width, height: height) }
+    func thumbnail(width: Int, height: Int) -> [UInt8]? {
+        displayIdentity.read { source.thumbnail(width: width, height: height, expectedSize: expectedSize) }
+    }
 }
 
 /// Keeps frame pixels and their freshness metadata under the same lock.
@@ -1248,14 +1330,19 @@ final class ScreenCaptureSource:
     }
 
     /// JPEG or PNG of the latest frame, scaled so neither edge exceeds the limits.
-    func snapshot(png: Bool, maxWidth: Int? = nil, maxEdge: Int? = nil) -> Data? {
-        guard let frame = frames.snapshot() else { return nil }
+    func snapshot(png: Bool, maxWidth: Int? = nil, maxEdge: Int? = nil, expectedSize: CGSize? = nil) -> Data? {
+        guard let frame = frames.snapshot(), Self.accepts(frame, expectedSize: expectedSize) else { return nil }
         return Self.snapshot(frame, png: png, maxWidth: maxWidth, maxEdge: maxEdge)?.data
     }
 
-    func snapshotObservation(png: Bool, maxEdge: Int? = nil) -> (data: Data, receivedAt: TimeInterval)? {
-        guard let frame = frames.snapshot() else { return nil }
+    func snapshotObservation(png: Bool, maxEdge: Int? = nil, expectedSize: CGSize? = nil) -> (data: Data, receivedAt: TimeInterval)? {
+        guard let frame = frames.snapshot(), Self.accepts(frame, expectedSize: expectedSize) else { return nil }
         return Self.snapshot(frame, png: png, maxEdge: maxEdge)
+    }
+
+    static func accepts(_ frame: ScreenCaptureFrameStore.Snapshot, expectedSize: CGSize?) -> Bool {
+        expectedSize == nil || expectedSize == CGSize(
+            width: CVPixelBufferGetWidth(frame.buffer), height: CVPixelBufferGetHeight(frame.buffer))
     }
 
     /// Retain one frame for encoding; never attach a later frame's timestamp to
@@ -1278,8 +1365,9 @@ final class ScreenCaptureSource:
     }
 
     /// Grayscale pixels of the latest frame at a small size, first row at the top.
-    func thumbnail(width: Int, height: Int) -> [UInt8]? {
-        guard let buffer = frame() else { return nil }
+    func thumbnail(width: Int, height: Int, expectedSize: CGSize? = nil) -> [UInt8]? {
+        guard let frame = frames.snapshot(), Self.accepts(frame, expectedSize: expectedSize) else { return nil }
+        let buffer = frame.buffer
         return Self.grayscale(buffer, width: width, height: height)
     }
 

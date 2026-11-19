@@ -24,7 +24,9 @@ swiftc Tests/NativeInputRouting/Support.swift \
     Sources/iPhoneUse/Input/LegacyPointer/PointerMotionObservation.swift \
     Sources/iPhoneUse/Input/LegacyPointer/AutomaticPointerCalibration.swift \
     Sources/iPhoneUse/Input/DeviceInput.swift Sources/iPhoneUse/Input/KeyboardMap.swift \
-    Sources/iPhoneUse/Input/InputBackend.swift Sources/iPhoneUse/Input/TextEntry.swift \
+    Sources/iPhoneUse/Input/InputBackend.swift Sources/iPhoneUse/Input/InputBackendPreferences.swift \
+    Sources/iPhoneUse/Input/USB/DDIBundlePreflight.swift Sources/iPhoneUse/Input/USB/NativeDDIInspection.swift \
+    Sources/iPhoneUse/Input/TextEntry.swift \
     Sources/iPhoneUse/Capture/ScreenOCR.swift Sources/iPhoneUse/Input/USB/USBKeyboard.swift \
     Sources/iPhoneUse/Input/USB/USBPreparationFailure.swift Sources/iPhoneUse/Input/USB/USBInputFailure.swift \
     Sources/iPhoneUse/Input/USB/USBTouchSession.swift Sources/iPhoneUse/Input/USB/USBTouchClient.swift \

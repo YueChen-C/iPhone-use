@@ -43,7 +43,7 @@ struct CaptureIdentityRecovery {
         stopped: Bool, expected: UInt64, current: UInt64,
         sourceCount: Int, state: ScreenCaptureIdentityState
     ) -> Bool {
-        !stopped && expected == current && sourceCount > 1
+        !stopped && expected == current && sourceCount > 0
             && [.failed, .partiallyVerified].contains(state)
     }
 }
