@@ -223,6 +223,9 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     private let shutdownQueue = DispatchQueue(label: "iphone-use.capture-shutdown", qos: .userInitiated)
     private var identityGeneration: UInt64 = 0
     private var verificationState: ScreenCaptureIdentityState = .singleDevice
+    // Once muxing has been observed, even the surviving single nominal source
+    // may carry another phone's pixels during unplug/replug discovery.
+    private var requiresDisplayVerification = false
     private var associationIdentities = CaptureAssociationIdentity()
     private var sourceRecovery = CaptureSourceRecovery()
     private var valeriaRecovery = CaptureValeriaRecoveryTracker()
@@ -400,6 +403,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             deviceObservers.removeAll()
             let currentSources = Array(sources.values)
             sources.removeAll()
+            screens.values.forEach { $0.setDisplayIdentityConfirmed(false) }
             screens.removeAll()
             verifiedScreenIDs.removeAll()
             _ = valeriaRecovery.reset()
@@ -470,6 +474,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     func permitsPointerAssociation(for screen: ScreenCaptureSession) -> Bool {
         lock.withLock {
             screens[screen.id] === screen
+                && screen.displayIdentityConfirmed
                 && verificationState.permitsAssociation(identityVerified: verifiedScreenIDs.contains(screen.id))
         }
     }
@@ -485,7 +490,8 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     var associationScreens: [ScreenCaptureSession] {
         lock.withLock {
             screens.values.filter {
-                verificationState.permitsAssociation(identityVerified: verifiedScreenIDs.contains($0.id))
+                $0.displayIdentityConfirmed
+                    && verificationState.permitsAssociation(identityVerified: verifiedScreenIDs.contains($0.id))
             }
             .sorted { $0.name < $1.name }
         }
@@ -495,12 +501,13 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     /// distinguishable. Status polling never starts new screenshot work.
     func retryIdentityVerification() {
         let job: (UInt64, [String: ScreenCaptureSource])? = lock.withLock {
-            guard !isStopped, sources.count > 1,
+            guard !isStopped, !sources.isEmpty,
                 verificationState == .failed || verificationState == .unavailable
                     || verificationState == .partiallyVerified
             else { return nil }
             identityGeneration &+= 1
             verificationState = .pending
+            screens.values.forEach { $0.setDisplayIdentityConfirmed(false) }
             return (identityGeneration, sources)
         }
         guard let job else { return }
@@ -539,6 +546,11 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         let didRun = lock.withLock { () -> Bool in
             guard !isStopped, lifecycleGeneration == generation else { return false }
             refreshLifecycle = lifecycleGeneration
+            // A new/removed muxed stream can reroute surviving sources as soon
+            // as it starts/stops. Revoke display access BEFORE either mutation.
+            if Set(sources.keys) != present {
+                screens.values.forEach { $0.setDisplayIdentityConfirmed(false) }
+            }
             var newlyClaimedSwitches: [CaptureValeriaRecoveryTracker.ScheduledPostSwitchCheck] = []
             for (id, source) in sources where !present.contains(id) {
                 source.stop()
@@ -602,10 +614,12 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             shouldReconcilePendingSwitch = valeriaReconciliation.shouldReconcilePendingSwitch
             postSwitchChecks = valeriaReconciliation.postSwitchChecks
             if changed {
+                screens.values.forEach { $0.setDisplayIdentityConfirmed(false) }
                 associationIdentities.retain(physicalIDs: Set(sources.keys))
                 sourceRecovery.retain(sources: activeInstances)
                 identityGeneration &+= 1
-                if present.count > 1 {
+                if present.count > 1 { requiresDisplayVerification = true }
+                if present.count > 1 || (requiresDisplayVerification && !sources.isEmpty) {
                     // A failed capture must not turn two discovered phones into
                     // an assumed single-device identity.
                     verificationState = sources.count == present.count ? .pending : .failed
@@ -675,6 +689,8 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     func enterMultiDevicePendingForValeriaLocked() {
         identityGeneration &+= 1
         verificationState = .pending
+        requiresDisplayVerification = true
+        screens.values.forEach { $0.setDisplayIdentityConfirmed(false) }
         rebuildScreens(mapping: [:], verified: false)
     }
 
@@ -714,15 +730,18 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             let identity = associationIdentities.identity(
                 physicalID: entry.key,
                 isConfirmed: (verified && mapping[entry.key] != nil) || verificationState == .singleDevice)
+            let displayConfirmed = (verified && mapping[entry.key] != nil)
+                || (verificationState == .singleDevice && !requiresDisplayVerification)
             if let previous = screens[entry.key], previous.sourceInstanceID == source.instanceID,
                 previous.associationIdentity == identity
             {
+                previous.setDisplayIdentityConfirmed(displayConfirmed)
                 result[entry.key] = previous
                 return
             }
             result[entry.key] = ScreenCaptureSession(
                 id: entry.key, name: physical.name, source: source,
-                associationIdentity: identity)
+                associationIdentity: identity, displayIdentityConfirmed: displayConfirmed)
         }
     }
 
@@ -761,6 +780,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
                     self.verificationState = .unavailable
                     log("capture identity unverified: native USB screenshot service unavailable")
                 case .failed:
+                    self.screens.values.forEach { $0.setDisplayIdentityConfirmed(false) }
                     self.verificationState = .failed
                     shouldRetry = retryOnFailure
                     shouldRecover = !retryOnFailure
@@ -775,6 +795,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
                         // stream's pixels. Keep Bluetooth proofs, but recheck
                         // the complete video mapping before accepting input.
                         self.verificationState = .pending
+                        self.screens.values.forEach { $0.setDisplayIdentityConfirmed(false) }
                         for source in empty where selected.contains(source.instanceID) {
                             log("restarting empty capture source: \(source.name) (\(source.id))")
                             source.restart()
@@ -820,34 +841,42 @@ final class ScreenCaptureSession {
     let name: String
     let associationIdentity: UUID
     private let source: ScreenCaptureSource
+    private let displayIdentity: CaptureDisplayIdentity
 
     var sourceID: String { source.id }
     var sourceInstanceID: UUID { source.instanceID }
-    var size: CGSize? { source.size }
+    var size: CGSize? { displayIdentity.read { source.size } }
+    var displayIdentityConfirmed: Bool { displayIdentity.isConfirmed }
     var captureError: String? { source.lastError }
 
     fileprivate init(
-        id: String, name: String, source: ScreenCaptureSource, associationIdentity: UUID
+        id: String, name: String, source: ScreenCaptureSource, associationIdentity: UUID,
+        displayIdentityConfirmed: Bool
     ) {
         self.id = id
         self.name = name
         self.source = source
         self.associationIdentity = associationIdentity
+        displayIdentity = CaptureDisplayIdentity(confirmed: displayIdentityConfirmed)
     }
 
-    func frame() -> CVPixelBuffer? { source.frame() }
+    fileprivate func setDisplayIdentityConfirmed(_ confirmed: Bool) { displayIdentity.setConfirmed(confirmed) }
 
-    func observationFrame() -> ScreenCaptureFrameStore.Snapshot? { source.observationFrame() }
+    func frame() -> CVPixelBuffer? { displayIdentity.read { source.frame() } }
+
+    func observationFrame() -> ScreenCaptureFrameStore.Snapshot? { displayIdentity.read { source.observationFrame() } }
 
     func snapshot(png: Bool, maxWidth: Int? = nil, maxEdge: Int? = nil) -> Data? {
-        source.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge)
+        displayIdentity.read { source.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge) }
     }
 
     func snapshotObservation(png: Bool, maxEdge: Int? = nil) -> (data: Data, receivedAt: TimeInterval)? {
-        source.snapshotObservation(png: png, maxEdge: maxEdge)
+        displayIdentity.read { source.snapshotObservation(png: png, maxEdge: maxEdge) }
     }
 
-    func thumbnail(width: Int, height: Int) -> [UInt8]? { source.thumbnail(width: width, height: height) }
+    func thumbnail(width: Int, height: Int) -> [UInt8]? {
+        displayIdentity.read { source.thumbnail(width: width, height: height) }
+    }
 }
 
 /// Keeps frame pixels and their freshness metadata under the same lock.

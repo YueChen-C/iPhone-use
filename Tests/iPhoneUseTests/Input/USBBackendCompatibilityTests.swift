@@ -27,6 +27,33 @@ final class USBBackendCompatibilityTests: XCTestCase {
             }
         }
     }
+    func testInspectionPreservesNativeErrorAndExactRequestedIdentity() throws {
+        let id = "00008101-0018242C3400001E"
+        var requested: [String] = []
+        XCTAssertEqual(try USBBackendCompatibility.version(physicalID: id, inspect: { value in
+            requested.append(value)
+            return "{\"productVersion\":\"26.5\"}"
+        }), "26.5")
+        XCTAssertEqual(requested, [id])
+        struct NativeFailure: Error, CustomStringConvertible {
+            var description: String { "DDI start existing session: 0xe8000084" }
+        }
+        XCTAssertThrowsError(try USBBackendCompatibility.version(physicalID: id, inspect: { _ in
+            throw NativeFailure()
+        })) { error in
+            guard case USBBackendCompatibility.Failure.inspection(let detail) = error else {
+                return XCTFail("Expected the original native diagnostic, got \(error)")
+            }
+            XCTAssertEqual(detail, "DDI start existing session: 0xe8000084")
+            XCTAssertTrue(String(describing: error).contains(detail))
+        }
+        XCTAssertThrowsError(try USBBackendCompatibility.version(physicalID: id, inspect: { _ in "{}" })) {
+            guard case USBBackendCompatibility.Failure.unavailable = $0 else {
+                return XCTFail("Missing version must remain unavailable")
+            }
+        }
+    }
+
     func testLocalizedPromptNamesMinimumActualVersionAndBluetooth() {
         for texts in [StringsUSBControl.en, .zh] {
             let value = texts.requiresiOS17("15.4")

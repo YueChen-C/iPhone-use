@@ -7,7 +7,7 @@
 | 目录 | 主要文件与职责 |
 | --- | --- |
 | 根目录、`App/` | `main.swift` 选择启动模式；`Application.swift` 持有应用级对象，协调启动顺序、设备窗口与应用菜单 |
-| `UI/` | `ControlWindow.swift` 管理多设备窗口生命周期与单窗布局；`PhoneControlView.swift` 按固定设备 ID 协调画面、设备与交互；`ControlInput.swift` 集中坐标/鼠标/键盘转换；侧栏和连接蒙层分别维护 |
+| `UI/` | `WorkbenchWindow.swift` / `WorkbenchState.swift` 管理 2.0 三栏工作台与纯展示状态；`ControlWindow.swift` 保留独立设备窗口及共享内容；`PhoneControlView.swift` 按固定设备 ID 协调画面、设备与交互；`ControlInput.swift` 集中坐标/鼠标/键盘转换；侧栏和连接蒙层分别维护 |
 | `Devices/` | `DeviceRegistry.swift` 管理设备模型、配对与会话输入缓存；`DevicePairing.swift` 集中配对文件和探测评分 |
 | `Capture/` | `ScreenCapture.swift` 管理设备发现和帧采集；`CaptureIdentityVerifier.swift` 比较物理 USB 身份与视频源；`USBIdentityScreenshot.swift` 在隔离工作进程中调用系统 MobileDevice 服务，无外部截图命令依赖 |
 | `Bluetooth/` | `HIDPeripheral.swift` 管理 GATT；`HIDConnectionState.swift` 管理连接和背压；`HIDReports.swift` 定义描述符与报告字节 |
@@ -22,9 +22,28 @@
 
 应用进程在 `AppLanguageStore`（NSLock 保护）持有当前语言：应用菜单「语言 / Language」切换，UserDefaults 持久化，未选择时跟随系统语言；变更通过通知广播，菜单原地改写标题、窗口与侧栏/蒙层调用各自的 `refreshLocalization()`，侧栏状态行和画布等待文字随 30 Hz 刷新自然跟随。MCP 是独立 stdio 进程，读不到应用 UserDefaults，因而在 initialize/tools/list 时通过 `GET /config` 获取语言并缓存，失败保持英文（兼容旧版主程序）。`/viewer` 按当前语言生成页面，JS 文案以 JSON 字典注入；页面轮询 `/config` 在语言变化时自动刷新，`?lang=zh|en` 可锁定。MCP 工具名、参数名和 schema 键永远保持英文；HTTP 状态码与 reason 短语不随语言变化。
 
-## 多设备窗口
+## 原生 2.0 工作台
 
-窗口按完整 USB 设备 ID 管理；默认 `desktop` 模式下，每台已连接手机自动创建一个窗口。设备名称仅用于显示，不能作为窗口、画面或输入路由的标识；同名手机必须保持独立。每个窗口的渲染尺寸、鼠标坐标换算、输入绑定与快捷按钮都只使用对应设备的数据。
+默认桌面入口为 AppKit 三栏设备工作台：左侧设备列表/搜索，中间 USB 画面平铺或聚焦，右侧当前设备输入后端、快捷键和文本输入。完整设备 ID 是唯一身份；断开后保留原 tile，不能按名称、顺序或前缀重新绑定。USB 画面与 Bluetooth/实验性 USB Touch 输入就绪状态独立显示；控制可用性来自已有 PhoneControlView 的实际能力回调。
+
+输入后端按完整设备 ID 记录到本机 `IPHONE_USE_INPUT_BACKENDS` 偏好。用户显式选择被接受后保存，下一次启动优先恢复；没有记录时，真实 iOS 26 及以上版本默认 USB Touch，旧系统默认蓝牙。启动环境覆盖和自动默认值不改写用户偏好；USB 未就绪或准备失败保留 USB 选中及错误提示，不偷偷回退蓝牙。系统版本检查在后台执行，不在渲染路径启动子进程。平铺卡片的空白、状态、外框区域仅选择该设备，不发送手机输入；画面与功能按钮保持原事件命中路径。
+
+工作台嵌入现有控制内容，不新建采集 owner，也不引入 WebView/HTML。2 Hz 更新展示快照，PhoneControlView 仍使用既有 30 Hz 渲染；控制器按 ID 持久复用，常规刷新不重建输入绑定。最小化、遮挡/隐藏、滚出画布和移至独立窗口时暂停对应嵌入刷新；恢复时重新绑定原 ID。当前设备快捷键、文本、截图都捕获准确设备，不自动重试或回退。切换/失焦/关闭会取消交互及尚未派发的文本；已经提交到底层队列的文本可能在原设备完成，不会改发新选择。
+
+`residentQuiet` 启动与 USB 热插拔不自动展示工作台；Dock 或菜单显式请求后才展示。桌面模式关闭工作台但尚有独立窗口时不退出，最后窗口关闭才退出。工作台每张卡片可打开传统独立窗口；`IPHONE_USE_LEGACY_UI=1` 完整回退原多窗口界面。既有 HTTP/MCP、DDI 审查和配对流程保持原服务边界。
+
+显式离线导出（在任何 DDI/Bluetooth/USB/HTTP 服务启动之前退出）：
+
+```sh
+swift run iphone-use --workbench-preview /tmp/iphone-use-workbench.png
+# 可附加 --empty、--en、--dark、--focus；--assets DIR 仅加载显式示例图片。
+```
+
+导出是原生 AppKit view 的 PNG，不是硬件就绪证据；预览使用进程内语言覆盖，不写用户语言偏好。实施与真机验收见 `docs/native-ui-2.0/ROADMAP.md`。
+
+## 传统多设备窗口（独立窗口 / legacy 回退）
+
+窗口按完整 USB 设备 ID 管理；启用 legacy 回退时，`desktop` 模式为每台已连接手机自动创建一个窗口。设备名称仅用于显示，不能作为窗口、画面或输入路由的标识；同名手机必须保持独立。每个窗口的渲染尺寸、鼠标坐标换算、输入绑定与快捷按钮都只使用对应设备的数据。
 
 USB 断开后保留原窗口，清除旧画面与输入绑定并显示等待状态；原设备重新连接后恢复，不允许改绑其他手机。用户主动关闭窗口时停止该窗口的刷新和输入交互，但不停止设备采集或 API/MCP 服务，也不应在下一次刷新时自动重新打开。菜单“窗口 → 显示所有设备”和 Dock 重新激活可以恢复已关闭的已连接设备窗口。默认 `desktop` 模式下关闭最后一个窗口退出应用；显式开启 `residentQuiet`（`AppRunModeStore`）后，关闭最后一个窗口保留后台服务且不生成等待占位窗口。无未最小化的等待占位窗口时，启动与 USB 热插拔保持静默，不自动打开或前置窗口；若屏幕上已有未最小化的等待占位窗口（例如无设备时显式打开，或从 `desktop` 切换保留），接入手机时会原地替换为当前已连接设备的窗口（仅在原占位窗为 key 时保持 key，否则停留在原后台层级），其余情况仅由用户显式点击 Dock /“显示所有设备”或切回默认模式时恢复窗口。
 

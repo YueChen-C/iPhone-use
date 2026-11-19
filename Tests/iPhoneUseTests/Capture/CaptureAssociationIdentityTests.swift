@@ -3,6 +3,46 @@ import XCTest
 @testable import iPhoneUse
 
 final class CaptureAssociationIdentityTests: XCTestCase {
+    func testProvisionalPixelsAreHiddenUntilIndependentVerificationAndOnRemap() {
+        let gate = CaptureDisplayIdentity(confirmed: false)
+        var reads = 0
+        func pixels() -> String? { reads += 1; return "peer-phone-pixels" }
+        XCTAssertNil(gate.read(pixels))
+        XCTAssertEqual(reads, 0, "unverified render/screenshot must not read the source")
+        gate.setConfirmed(true)
+        XCTAssertEqual(gate.read { "exact-phone-pixels" }, "exact-phone-pixels")
+        gate.setConfirmed(false)
+        XCTAssertNil(gate.read(pixels), "topology changes revoke the old session as well")
+        XCTAssertFalse(gate.isConfirmed)
+        gate.setConfirmed(true)
+        XCTAssertEqual(gate.read { "reverified-phone-pixels" }, "reverified-phone-pixels")
+        XCTAssertNil(gate.read {
+            gate.setConfirmed(false)
+            gate.setConfirmed(true)
+            return "encoded-before-topology-changed"
+        }, "an old in-flight snapshot cannot survive revoke/reverify")
+    }
+
+    func testPendingCrossMappedReconnectNeverDisplaysANominalPeerFrame() {
+        let a = UUID(), b = UUID()
+        let previous: [String: CaptureScreenMapping.Source] = [
+            "SE": .init(id: "12", instance: b), "12": .init(id: "SE", instance: a),
+        ]
+        let sources = ["SE": a, "12": UUID()]
+        let provisional = CaptureScreenMapping.previews(confirmed: [:], previous: previous, sources: sources)
+        let gates = provisional.mapValues { _ in CaptureDisplayIdentity(confirmed: false) }
+        for (phone, source) in provisional {
+            XCTAssertNil(gates[phone]?.read { source })
+        }
+        let confirmed = CaptureScreenMapping.previews(
+            confirmed: ["SE": "SE", "12": "12"], previous: previous, sources: sources)
+        XCTAssertEqual(confirmed, ["SE": "SE", "12": "12"])
+        for (phone, source) in confirmed {
+            gates[phone]?.setConfirmed(true)
+            XCTAssertEqual(gates[phone]?.read { source }, phone)
+        }
+    }
+
     func testSurvivingPhoneRetainsBluetoothProofWhileCaptureInputIsPaused() {
         var identities = CaptureAssociationIdentity()
         let original = identities.identity(physicalID: "SE", isConfirmed: true)

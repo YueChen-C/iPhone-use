@@ -24,6 +24,10 @@ enum ControlConnectionStatus {
 /// Covers the complete content area, including shortcuts, while keeping the
 /// captured screen visible underneath. Window input is also gated at its source.
 final class ControlConnectionOverlay: NSView {
+    enum Presentation { case screenOverlay, inspector }
+    let presentation: Presentation
+    var onLayoutChanged: (() -> Void)?
+    private var messageStack: NSStackView?
     private static let controllerNameLock = NSLock()
     private static var cachedControllerName: String?
     private static var controllerNameLoaded = false
@@ -39,6 +43,9 @@ final class ControlConnectionOverlay: NSView {
     private var instructionsField: NSTextField?
     private var helpField: NSTextField?
     var onEnableUSB: (() -> Void)?
+    var onRetryUSB: ((@escaping () -> Void) -> Void)?
+    private let retryUSBButton = NSButton(title: "", target: nil, action: nil)
+    private var retryingUSB = false
     var onCancelUSBSetup: (() -> Void)?
     private var setup: USBSetupPresentation?
     private let setupButton = NSButton(title: "", target: nil, action: nil)
@@ -52,7 +59,12 @@ final class ControlConnectionOverlay: NSView {
     private let pillButton = NSButton(title: "", target: nil, action: nil)
     private(set) var isDismissed = false
 
-    override init(frame: NSRect) {
+    override convenience init(frame: NSRect) {
+        self.init(frame: frame, presentation: .screenOverlay)
+    }
+
+    init(frame: NSRect, presentation: Presentation) {
+        self.presentation = presentation
         super.init(frame: frame)
         wantsLayer = true
         setAccessibilityElement(true)
@@ -67,6 +79,7 @@ final class ControlConnectionOverlay: NSView {
         let buttons = makeButtonsStack()
         let stack = makeMessageStack(
             card: card, icon: icon, instructions: instructions, help: help, buttons: buttons)
+        messageStack = stack
         installConstraints(
             card: card, stack: stack, icon: icon, instructions: instructions, help: help, buttons: buttons)
         setupPillView()
@@ -75,6 +88,7 @@ final class ControlConnectionOverlay: NSView {
 
     private func makeMessageCard() -> NSView {
         let card = ConnectionMessageCard()
+        card.compact = presentation == .inspector
         card.wantsLayer = true
         card.layer?.cornerRadius = 16
         card.layer?.masksToBounds = true
@@ -88,11 +102,13 @@ final class ControlConnectionOverlay: NSView {
                 systemSymbolName: "antenna.radiowaves.left.and.right.slash",
                 accessibilityDescription: nil)
         icon.contentTintColor = .systemOrange
-        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 28, weight: .medium)
-        title.font = .systemFont(ofSize: 19, weight: .semibold)
-        title.alignment = .center
-        message.font = .systemFont(ofSize: 13)
-        message.alignment = .center
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: presentation == .inspector ? 20 : 28, weight: .medium)
+        title.font = .systemFont(ofSize: presentation == .inspector ? 13 : 19, weight: .semibold)
+        title.alignment = presentation == .inspector ? .left : .center
+        title.maximumNumberOfLines = 0
+        title.lineBreakMode = .byWordWrapping
+        message.font = .systemFont(ofSize: presentation == .inspector ? 12 : 13)
+        message.alignment = presentation == .inspector ? .left : .center
         message.textColor = .secondaryLabelColor
         return icon
     }
@@ -127,6 +143,7 @@ final class ControlConnectionOverlay: NSView {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.instructionsField?.stringValue = self.pairingText()
+                self.onLayoutChanged?()
             }
         }
     }
@@ -159,12 +176,19 @@ final class ControlConnectionOverlay: NSView {
         setupProgress.minValue = 0; setupProgress.maxValue = 1
         setupProgress.isHidden = true
 
+        retryUSBButton.title = StringsUSBControl.current.retryPreparation
+        retryUSBButton.bezelStyle = .rounded
+        retryUSBButton.setButtonType(.momentaryPushIn)
+        retryUSBButton.target = self
+        retryUSBButton.action = #selector(onRetryUSBClicked)
+        retryUSBButton.isHidden = true
+
         let stack = NSStackView()
-        stack.orientation = .horizontal
+        stack.orientation = presentation == .inspector ? .vertical : .horizontal
         // Keep a lone acknowledgement centered when the reconnect action hides.
-        stack.setViews([viewOnlyButton, reconnectButton], in: .center)
-        stack.spacing = 12
-        stack.alignment = .centerY
+        stack.setViews([viewOnlyButton, retryUSBButton, reconnectButton], in: .center)
+        stack.spacing = presentation == .inspector ? 6 : 12
+        stack.alignment = presentation == .inspector ? .leading : .centerY
         stack.translatesAutoresizingMaskIntoConstraints = false
         return stack
     }
@@ -175,8 +199,8 @@ final class ControlConnectionOverlay: NSView {
         // Keep the longer setup action on its own row in narrow phone windows.
         let stack = NSStackView(views: [icon, title, message, instructions, help, setupProgress, setupButton, buttons])
         stack.orientation = .vertical
-        stack.alignment = .centerX
-        stack.spacing = 12
+        stack.alignment = presentation == .inspector ? .leading : .centerX
+        stack.spacing = presentation == .inspector ? 10 : 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(stack)
         return stack
@@ -208,7 +232,7 @@ final class ControlConnectionOverlay: NSView {
         pillView.addSubview(pillStack)
 
         NSLayoutConstraint.activate([
-            pillView.topAnchor.constraint(equalTo: topAnchor, constant: 14),
+            pillView.topAnchor.constraint(equalTo: topAnchor, constant: presentation == .inspector ? 0 : 14),
             pillView.centerXAnchor.constraint(equalTo: centerXAnchor),
             pillView.heightAnchor.constraint(equalToConstant: 28),
             pillStack.leadingAnchor.constraint(equalTo: pillView.leadingAnchor, constant: 12),
@@ -221,6 +245,24 @@ final class ControlConnectionOverlay: NSView {
         card: NSView, stack: NSStackView, icon: NSImageView,
         instructions: NSTextField, help: NSTextField, buttons: NSStackView
     ) {
+        if presentation == .inspector {
+            NSLayoutConstraint.activate([
+                card.leadingAnchor.constraint(equalTo: leadingAnchor),
+                card.trailingAnchor.constraint(equalTo: trailingAnchor),
+                card.topAnchor.constraint(equalTo: topAnchor),
+                stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+                stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+                stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+                stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
+                icon.heightAnchor.constraint(equalToConstant: 24),
+                title.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                message.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                instructions.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                help.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                setupProgress.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            ])
+            return
+        }
         let preferredWidth = card.widthAnchor.constraint(equalToConstant: 420)
         preferredWidth.priority = NSLayoutConstraint.Priority(500)
         NSLayoutConstraint.activate([
@@ -243,6 +285,18 @@ final class ControlConnectionOverlay: NSView {
         ])
     }
 
+    /// Measure wrapping at the Inspector's actual width; its scroll document
+    /// grows with guidance rather than clipping controls or stretching a phone.
+    func preferredHeight(for width: CGFloat) -> CGFloat {
+        guard !isHidden else { return 0 }
+        guard !isDismissed else { return 28 }
+        let textWidth = max(1, width - 28)
+        for field in [title, message, instructionsField, helpField].compactMap({ $0 }) {
+            field.preferredMaxLayoutWidth = textWidth
+        }
+        return ceil(messageStack?.fittingSize.height ?? 0) + 28
+    }
+
     @objc private func onReconnectClicked() {
         reconnectButton.isEnabled = false
         DeviceRegistry.shared.reconnectBluetooth(resetExhausted: true)
@@ -258,6 +312,18 @@ final class ControlConnectionOverlay: NSView {
             return
         }
         setDismissed(true)
+    }
+
+    @objc private func onRetryUSBClicked() {
+        guard usbPresentation?.offersPreparationRetry == true, !retryingUSB,
+              setup?.isWorking != true, let onRetryUSB else { return }
+        retryingUSB = true
+        retryUSBButton.isEnabled = false
+        onRetryUSB { [weak self] in
+            guard let self else { return }
+            self.retryingUSB = false
+            self.update(self.lastStatus)
+        }
     }
 
     @objc private func onEnableUSBClicked() {
@@ -281,9 +347,11 @@ final class ControlConnectionOverlay: NSView {
         cardView?.isHidden = dismissed
         pillView.isHidden = !dismissed
         needsDisplay = true
+        onLayoutChanged?()
     }
 
     func update(_ status: ControlConnectionStatus) {
+        defer { onLayoutChanged?() }
         lastStatus = status
         if status == .waitingForDevice { backendSelectionFailure = nil }
         if let backendSelectionFailure {
@@ -300,6 +368,7 @@ final class ControlConnectionOverlay: NSView {
         }
         isHidden = !status.showsOverlay
         let table = StringsUI.current
+        retryUSBButton.isHidden = true
         setupButton.isHidden = true
         setupProgress.isHidden = true
         setupProgress.stopAnimation(nil)
@@ -374,6 +443,7 @@ final class ControlConnectionOverlay: NSView {
         instructionsField?.isHidden = true
         helpField?.isHidden = true
         reconnectButton.isHidden = true
+        retryUSBButton.isHidden = true
         setupButton.isHidden = true
         setupProgress.isHidden = true
         setupProgress.stopAnimation(nil)
@@ -393,6 +463,9 @@ final class ControlConnectionOverlay: NSView {
         instructionsField?.isHidden = true
         helpField?.isHidden = false
         reconnectButton.isHidden = true // Never route USB recovery into Bluetooth reconnect.
+        retryUSBButton.title = table.retryPreparation
+        retryUSBButton.isHidden = !presentation.offersPreparationRetry
+        retryUSBButton.isEnabled = !retryingUSB && setup?.isWorking != true
         viewOnlyButton.isHidden = !presentation.hasScreen
         title.stringValue = table.title
         message.stringValue = table.status(presentation)
@@ -447,12 +520,12 @@ final class ControlConnectionOverlay: NSView {
         guard bounds.contains(localPoint) else { return nil }
         if isDismissed {
             if !pillView.isHidden, pillView.frame.contains(localPoint) {
-                return pillView.hitTest(point)
+                return pillView.hitTest(localPoint)
             }
             return nil
         }
         if let cardView, !cardView.isHidden, cardView.frame.contains(localPoint) {
-            return cardView.hitTest(point)
+            return cardView.hitTest(localPoint)
         }
         return self
     }
@@ -463,7 +536,7 @@ final class ControlConnectionOverlay: NSView {
     override func keyDown(with event: NSEvent) {}
 
     override func draw(_ dirtyRect: NSRect) {
-        guard !isDismissed else { return }
+        guard presentation == .screenOverlay, !isDismissed else { return }
         NSColor.black.withAlphaComponent(0.45).setFill()
         dirtyRect.fill(using: .sourceOver)
     }
@@ -472,8 +545,9 @@ final class ControlConnectionOverlay: NSView {
 }
 
 private final class ConnectionMessageCard: NSView {
+    var compact = false
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
+        (compact ? NSColor.controlBackgroundColor : NSColor.windowBackgroundColor).setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 16, yRadius: 16).fill()
     }
 }

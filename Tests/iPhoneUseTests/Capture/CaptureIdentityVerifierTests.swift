@@ -21,9 +21,14 @@ final class CaptureIdentityVerifierTests: XCTestCase {
         XCTAssertFalse(
             CaptureIdentityRecovery.permitsRetry(
                 stopped: false, expected: 7, current: 8, sourceCount: 2, state: .failed))
-        XCTAssertFalse(
+        // A surviving nominal stream after a multi-phone unplug still needs
+        // an independent check; failure must keep retrying without showing it.
+        XCTAssertTrue(
             CaptureIdentityRecovery.permitsRetry(
                 stopped: false, expected: 7, current: 7, sourceCount: 1, state: .failed))
+        XCTAssertFalse(
+            CaptureIdentityRecovery.permitsRetry(
+                stopped: false, expected: 7, current: 7, sourceCount: 0, state: .failed))
     }
 
     private func image(inverted: Bool = false) -> CaptureIdentityImage {

@@ -254,6 +254,7 @@ enum ControlAPI {
                     "physicalID": screen.id,
                     "sourceID": screen.sourceID,
                     "identityVerified": manager.identityVerified(for: screen),
+                    "displayIdentityConfirmed": screen.displayIdentityConfirmed,
                     "permitsPointerAssociation": manager.permitsPointerAssociation(for: screen),
                 ]
                 if let error = screen.captureError {

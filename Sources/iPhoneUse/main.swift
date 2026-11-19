@@ -1,5 +1,10 @@
 import Foundation
 
+// Offline UI export never starts DDI ownership, Bluetooth, capture, or HTTP.
+if CommandLine.arguments.dropFirst().first == "--workbench-preview" {
+    exit(WorkbenchPreview.run(arguments: Array(CommandLine.arguments.dropFirst(2))))
+}
+
 // Held for the full lifetime of every non-management entry, including MCP,
 // AX and screenshot helpers. Acquire before any entry can start device work:
 // legacy-process discovery alone cannot stop an owner starting after its scan.

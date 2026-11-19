@@ -103,6 +103,22 @@ final class ControlWindowCoordinator {
     private var timer: Timer?
     private var modeObserver: NSObjectProtocol?
     private var cascadePoint: NSPoint?
+    var automaticPresentationEnabled = true
+    var hasCompanionWindow: () -> Bool = { false }
+    var hasOpenWindows: Bool { !controllers.isEmpty || waitingController != nil }
+    var openDeviceIDs: Set<String> { Set(controllers.keys) }
+
+    func showDevice(_ device: Device) {
+        _ = state.update(connectedIDs: [device.id], reason: .userRequest)
+        if controllers[device.id] == nil {
+            let controller = ControlWindowController(deviceID: device.id, name: device.screen.name)
+            controller.onClose = { [weak self] in self?.windowClosed(deviceID: device.id) }
+            controllers[device.id] = controller
+        }
+        controllers[device.id]?.window?.deminiaturize(nil)
+        controllers[device.id]?.window?.makeKeyAndOrderFront(nil)
+        QuietModeActivityController.shared.setOpenWindows(true)
+    }
 
     init(modeStore: AppRunModeStore = .shared) {
         self.modeStore = modeStore
@@ -160,6 +176,7 @@ final class ControlWindowCoordinator {
         guard mode != state.mode else { return }
         let hadOpenWindow = !controllers.isEmpty || waitingController != nil
         state.setMode(mode)
+        guard automaticPresentationEnabled else { return }
         if mode == .desktop {
             refresh(reason: hadOpenWindow ? .discovery : .resumeDesktopMode)
         }
@@ -170,6 +187,10 @@ final class ControlWindowCoordinator {
             $0.screen.name == $1.screen.name ? $0.id < $1.id : $0.screen.name < $1.screen.name
         }
         let connected = Dictionary(uniqueKeysWithValues: devices.map { ($0.id, $0) })
+        if !automaticPresentationEnabled, reason == .discovery {
+            for (id, controller) in controllers { controller.updateDevice(connected[id]) }
+            return
+        }
         let hadDeviceWindows = !controllers.isEmpty
         let existingWaitingWindow = waitingController?.window
         let waitingWindowWasKey = existingWaitingWindow?.isKeyWindow == true
@@ -218,7 +239,7 @@ final class ControlWindowCoordinator {
             self.waitingController = nil
         }
 
-        QuietModeActivityController.shared.setOpenWindows(!controllers.isEmpty || waitingController != nil)
+        QuietModeActivityController.shared.setOpenWindows(hasOpenWindows || hasCompanionWindow())
 
         let shouldMakeFirstAddedKey: Bool
         switch reason {
@@ -264,14 +285,14 @@ final class ControlWindowCoordinator {
         } else {
             waitingController = nil
         }
-        QuietModeActivityController.shared.setOpenWindows(!controllers.isEmpty || waitingController != nil)
-        if state.close(deviceID: deviceID) { NSApplication.shared.terminate(nil) }
+        QuietModeActivityController.shared.setOpenWindows(hasOpenWindows || hasCompanionWindow())
+        if state.close(deviceID: deviceID), !hasCompanionWindow() { NSApplication.shared.terminate(nil) }
     }
 }
 
 final class ControlWindowController: NSWindowController, NSWindowDelegate {
     let deviceID: String?
-    private let controlView: PhoneControlView
+    let controlView: PhoneControlView
     private let sidebar: ControlSidebar
     private let content: ControlWindowContent
     private var lastKnownDevice: Device?
@@ -280,30 +301,37 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     private var setupGeneration = UUID()
     private var preparedDDI: DDIDownload.Prepared?
     private var ddiReview: DDIReviewWindowController?
+    var onPresentationChanged: (() -> Void)?
+    private(set) var availableShortcuts: Set<ControlShortcut> = []
+    private(set) var inputStatus = StringsWorkbench.current.waitingInput
+    var embeddedView: NSView { content }
+    /// Embedded workbench guidance is hosted by the selected device's Inspector,
+    /// never inside its captured screen. The controller still owns all actions.
+    var connectionGuidanceView: ControlConnectionOverlay { content.connectionOverlay }
     var onClose: (() -> Void)?
     var onDeminiaturize: (() -> Void)?
 
-    init(deviceID: String?, name: String? = nil) {
+    init(deviceID: String?, name: String? = nil, embedded: Bool = false) {
         self.deviceID = deviceID
         controlView = PhoneControlView(deviceID: deviceID, frame: NSRect(x: 0, y: 0, width: 390, height: 700))
         sidebar = ControlSidebar(frame: .zero)
-        let content = ControlWindowContent(phoneView: controlView, sidebar: sidebar)
+        let content = ControlWindowContent(phoneView: controlView, sidebar: sidebar, embedded: embedded)
         self.content = content
-        let window = NSWindow(
+        let window: NSWindow? = embedded ? nil : NSWindow(
             contentRect: content.frame,
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
-        window.title = deviceID.map { "\(name ?? "iPhone") — \($0)" } ?? StringsUI.current.waitingWindowTitle
-        window.tabbingMode = .disallowed
-        window.isReleasedWhenClosed = false
-        window.contentView = content
-        window.acceptsMouseMovedEvents = true
-        window.contentMinSize = NSSize(width: 240 + ControlSidebar.width, height: 460)
-        window.center()
+        window?.title = deviceID.map { "\(name ?? "iPhone") — \($0)" } ?? StringsUI.current.waitingWindowTitle
+        window?.tabbingMode = .disallowed
+        window?.isReleasedWhenClosed = false
+        if !embedded { window?.contentView = content }
+        window?.acceptsMouseMovedEvents = true
+        window?.contentMinSize = NSSize(width: 240 + ControlSidebar.width, height: 460)
+        window?.center()
         super.init(window: window)
-        window.delegate = self
-        window.initialFirstResponder = controlView
-        window.makeFirstResponder(controlView)
+        window?.delegate = self
+        window?.initialFirstResponder = controlView
+        window?.makeFirstResponder(controlView)
         sidebar.onAction = { [weak controlView] shortcut in
             controlView?.performShortcut(shortcut)
         }
@@ -320,8 +348,20 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         }
         content.onEnableUSB = { [weak self] in self?.beginUSBSetup() }
         content.onCancelUSBSetup = { [weak self] in self?.cancelUSBSetup() }
-        controlView.onShortcutStateChanged = { [weak sidebar] available, status in
-            sidebar?.update(available: available, status: status)
+        content.connectionOverlay.onRetryUSB = { [weak self] finished in
+            guard let self, self.lastKnownDevice != nil, self.controlView.selectedBackend == .usb else {
+                finished(); return
+            }
+            self.content.showBackendSelectionFailure(nil)
+            self.cancelUSBSetup()
+            self.controlView.selectBackend(.usb, completion: finished)
+        }
+        controlView.onShortcutStateChanged = { [weak self] available, status in
+            guard let self else { return }
+            self.availableShortcuts = available
+            self.inputStatus = status
+            self.sidebar.update(available: available, status: status)
+            self.onPresentationChanged?()
         }
         controlView.onConnectionStateChanged = { [weak content] status in
             content?.updateConnectionState(status)
@@ -338,7 +378,13 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         ) { [weak self] _ in
             self?.refreshLocalization()
         }
-        controlView.start()
+        if !embedded { controlView.start() }
+    }
+
+    func selectInputBackend(_ backend: InputBackendKind) {
+        content.showBackendSelectionFailure(nil)
+        cancelUSBSetup()
+        controlView.selectBackend(backend)
     }
 
     func updateDevice(_ device: Device?) {
@@ -373,7 +419,11 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         content.refreshLocalization()
     }
 
-    func stop() { cancelUSBSetup(); controlView.stop() }
+    func stop() {
+        cancelUSBSetup(); controlView.stop()
+        availableShortcuts = []
+        inputStatus = StringsWorkbench.current.waitingInput
+    }
 
     private func cancelUSBSetup() {
         setupGeneration = UUID()
@@ -461,11 +511,12 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-/// Keeps the phone geometry separate from the sidebar and places the connection
-/// overlay above both so disconnected input cannot reach either control surface.
+/// Legacy windows overlay connection guidance. Embedded workbench content keeps
+/// guidance external; PhoneControlView's readiness/error gates still guard input.
 private final class ControlWindowContent: NSView {
     private let phoneView: PhoneControlView
-    private let connectionOverlay = ControlConnectionOverlay(frame: .zero)
+    private var automaticallyFocus = true
+    let connectionOverlay: ControlConnectionOverlay
     private let lockNotice = ControlLockNotice(frame: .zero)
     var onEnableUSB: (() -> Void)? {
         get { connectionOverlay.onEnableUSB }
@@ -480,25 +531,30 @@ private final class ControlWindowContent: NSView {
     func showBackendSelectionFailure(_ message: String?) {
         phoneView.isBackendNoticeVisible = message != nil
         connectionOverlay.showBackendSelectionFailure(message)
-        window?.makeFirstResponder(connectionOverlay.isHidden ? phoneView : connectionOverlay)
+        if automaticallyFocus { window?.makeFirstResponder(connectionOverlay.isHidden ? phoneView : connectionOverlay) }
     }
 
-    init(phoneView: PhoneControlView, sidebar: ControlSidebar) {
+    init(phoneView: PhoneControlView, sidebar: ControlSidebar, embedded: Bool = false) {
         self.phoneView = phoneView
+        self.automaticallyFocus = !embedded
+        connectionOverlay = ControlConnectionOverlay(frame: .zero, presentation: embedded ? .inspector : .screenOverlay)
+        sidebar.isHidden = embedded
         super.init(frame: NSRect(x: 0, y: 0, width: 390 + ControlSidebar.width, height: 700))
         connectionOverlay.onNoticeDismissed = { [weak self] in
             guard let self else { return }
             self.phoneView.isBackendNoticeVisible = false
-            self.window?.makeFirstResponder(self.connectionOverlay.isHidden ? self.phoneView : self.connectionOverlay)
+            if self.automaticallyFocus { self.window?.makeFirstResponder(self.connectionOverlay.isHidden ? self.phoneView : self.connectionOverlay) }
         }
         phoneView.translatesAutoresizingMaskIntoConstraints = false
         sidebar.translatesAutoresizingMaskIntoConstraints = false
         addSubview(phoneView)
-        addSubview(sidebar)
+        if !embedded { addSubview(sidebar) }
         lockNotice.translatesAutoresizingMaskIntoConstraints = false
         connectionOverlay.translatesAutoresizingMaskIntoConstraints = false
         // Last sibling receives hit testing first while the overlay is visible.
-        addSubview(connectionOverlay)
+        if !embedded {
+            addSubview(connectionOverlay)
+        }
         // The advisory remains visible over pairing guidance, and passes events
         // through to the existing overlay or phone without changing either gate.
         addSubview(lockNotice)
@@ -506,31 +562,35 @@ private final class ControlWindowContent: NSView {
             phoneView.leadingAnchor.constraint(equalTo: leadingAnchor),
             phoneView.topAnchor.constraint(equalTo: topAnchor),
             phoneView.bottomAnchor.constraint(equalTo: bottomAnchor),
-            phoneView.trailingAnchor.constraint(equalTo: sidebar.leadingAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: ControlSidebar.width),
-            sidebar.topAnchor.constraint(equalTo: topAnchor),
-            sidebar.trailingAnchor.constraint(equalTo: trailingAnchor),
-            sidebar.bottomAnchor.constraint(equalTo: bottomAnchor),
+            phoneView.trailingAnchor.constraint(equalTo: embedded ? trailingAnchor : sidebar.leadingAnchor),
             lockNotice.centerXAnchor.constraint(equalTo: phoneView.centerXAnchor),
             lockNotice.bottomAnchor.constraint(equalTo: phoneView.bottomAnchor, constant: -24),
             lockNotice.widthAnchor.constraint(equalTo: phoneView.widthAnchor, constant: -24),
-            connectionOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            // Keep backend selection reachable even while BLE is disconnected.
-            connectionOverlay.trailingAnchor.constraint(equalTo: phoneView.trailingAnchor),
-            connectionOverlay.topAnchor.constraint(equalTo: topAnchor),
-            connectionOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+        if !embedded {
+            NSLayoutConstraint.activate([
+                connectionOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+                // Keep backend selection reachable even while BLE is disconnected.
+                connectionOverlay.trailingAnchor.constraint(equalTo: phoneView.trailingAnchor),
+                connectionOverlay.topAnchor.constraint(equalTo: topAnchor),
+                connectionOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+                sidebar.widthAnchor.constraint(equalToConstant: ControlSidebar.width),
+                sidebar.topAnchor.constraint(equalTo: topAnchor),
+                sidebar.trailingAnchor.constraint(equalTo: trailingAnchor),
+                sidebar.bottomAnchor.constraint(equalTo: bottomAnchor),
+            ])
+        }
     }
 
     func updateConnectionState(_ status: ControlConnectionStatus) {
         if status == .waitingForDevice { phoneView.isBackendNoticeVisible = false }
         connectionOverlay.update(status)
-        window?.makeFirstResponder(connectionOverlay.isHidden ? phoneView : connectionOverlay)
+        if automaticallyFocus { window?.makeFirstResponder(connectionOverlay.isHidden ? phoneView : connectionOverlay) }
     }
 
     func updateUSBPresentation(_ presentation: ControlUSBPresentation?) {
         connectionOverlay.updateUSB(presentation)
-        window?.makeFirstResponder(connectionOverlay.isHidden ? phoneView : connectionOverlay)
+        if automaticallyFocus { window?.makeFirstResponder(connectionOverlay.isHidden ? phoneView : connectionOverlay) }
     }
 
     func refreshLocalization() {

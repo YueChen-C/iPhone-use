@@ -12,11 +12,12 @@ final class USBBackendSelectionRequest {
 /// The isolated native inspection is read-only, exact-UDID bound and bounded.
 enum USBBackendCompatibility {
     enum Failure: Error, CustomStringConvertible {
-        case unsupported(String), unavailable
+        case unsupported(String), unavailable, inspection(String)
         var description: String {
             switch self {
             case .unsupported(let version): StringsUSBControl.current.requiresiOS17(version)
             case .unavailable: StringsUSBControl.current.versionUnavailable
+            case .inspection(let diagnostic): StringsUSBControl.current.versionUnavailable + "\n" + diagnostic
             }
         }
     }
@@ -30,14 +31,23 @@ enum USBBackendCompatibility {
     }
 
     static func require(physicalID: String) throws {
-        let version: String
+        try validate(version: version(physicalID: physicalID))
+    }
+
+    /// Keep the original child/transport diagnostic. A read failure does not
+    /// establish a DDI, trust or Developer Mode fault.
+    static func version(physicalID: String, inspect: (String) throws -> String = inspectVersion) throws -> String {
         do {
-            guard let executable = Bundle.main.executableURL else { throw Failure.unavailable }
-            let result = try DDIReviewClient(executable: executable).run(.inspect(physicalID))
-            guard let object = try JSONSerialization.jsonObject(with: Data(result.json.utf8)) as? [String: Any],
+            let json = try inspect(physicalID)
+            guard let object = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
                   let value = object["productVersion"] as? String else { throw Failure.unavailable }
-            version = value
-        } catch { throw Failure.unavailable }
-        try validate(version: version)
+            return value
+        } catch let error as Failure { throw error }
+        catch { throw Failure.inspection(String(describing: error)) }
+    }
+
+    private static func inspectVersion(physicalID: String) throws -> String {
+        guard let executable = Bundle.main.executableURL else { throw Failure.unavailable }
+        return try DDIReviewClient(executable: executable).run(.inspect(physicalID)).json
     }
 }
