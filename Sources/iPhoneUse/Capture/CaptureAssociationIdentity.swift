@@ -1,7 +1,8 @@
+import CoreGraphics
 import Foundation
 
 /// A nominal AVFoundation UID is not proof of which phone supplies its pixels.
-/// Close this gate on topology changes, before exposing any provisional mapping.
+/// Close only affected gates on topology changes; a proven surviving route may stay open.
 /// No image processing, probing or logging runs on the display path.
 final class CaptureDisplayIdentity {
     private let lock = NSLock()
@@ -53,6 +54,23 @@ enum CaptureScreenMapping {
     struct Source {
         let id: String
         let instance: UUID
+    }
+
+    /// Reuse a proven route only when current raw dimensions uniquely identify
+    /// that physical phone among every present phone. Unknown and equal-sized
+    /// peers require independent verification; never infer them by elimination.
+    static func continuing(
+        physicalIDs: Set<String>, expectedSizes: [String: CGSize], sourceSizes: [String: CGSize]
+    ) -> [String: String] {
+        guard physicalIDs.allSatisfy({ expectedSizes[$0] != nil }) else { return [:] }
+        var result: [String: String] = [:]
+        for id in physicalIDs {
+            guard let expected = expectedSizes[id], expected.width > 0, expected.height > 0,
+                expectedSizes.values.filter({ $0 == expected }).count == 1 else { continue }
+            let candidates = sourceSizes.filter { $0.value == expected }
+            if candidates.count == 1 { result[id] = candidates.first!.key }
+        }
+        return result
     }
 
     static func previews(

@@ -72,7 +72,7 @@ final class USBInputController {
     func input(_ device: Device) -> USBDeviceInput? {
         lock.withLock {
             guard !stopped, selections[device.id]?.permits(.usb) == true, let input = entries[device.id],
-                  input.captureID == device.screen.associationIdentity else { return nil }
+                  !input.isRetired, input.captureID == device.screen.associationIdentity else { return nil }
             return input
         }
     }
@@ -192,8 +192,9 @@ final class USBInputController {
             }
         }
     }
-    /// Capture removal/remapping/revoked identity must retire input even when
-    /// no control window is polling. Keep each entry owned until explicit
+    /// Capture removal or identity replacement retires only its own input.
+    /// Temporary gates release held input without retiring an idle transport.
+    /// Validate even when no control window is polling. Keep each entry owned until explicit
     /// selection/shutdown can confirm release and exit. New capture metadata may
     /// choose a default and prepare its route, but never replay any user input.
     /// Do not hold our lock across capture reads.
@@ -277,7 +278,8 @@ final class USBInputController {
 final class USBDeviceInput {
     let physicalID: String
     let captureID: UUID
-    private weak var screen: ScreenCaptureSession?
+    private weak var boundScreen: ScreenCaptureSession?
+    private var screen: ScreenCaptureSession? { lock.withLock { boundScreen } }
     private let lock = NSLock()
     private let queue: DispatchQueue
     private var client: USBTouchClient?
@@ -285,6 +287,8 @@ final class USBDeviceInput {
     private var readiness: InputBackendReadiness = .preparing
     private var preparationFailure: USBPreparationFailure?
     private var retired = false
+    private var capturePaused = false
+    var isRetired: Bool { lock.withLock { retired } }
     private var pendingMotion: USBTouchPoint?
     private var motionScheduled: UUID?
     private var admission = USBWindowInputAdmission()
@@ -318,7 +322,7 @@ final class USBDeviceInput {
         }
     }
     init(device: Device) {
-        physicalID = device.id; captureID = device.screen.associationIdentity; screen = device.screen
+        physicalID = device.id; captureID = device.screen.associationIdentity; boundScreen = device.screen
         queue = DispatchQueue(label: "iphone-use.usb-input.\(device.id)")
     }
     func prepare() {
@@ -348,7 +352,29 @@ final class USBDeviceInput {
             } catch { fail(error) }
         }
     }
-    func validateCapture() { if !screenValid { retire() } }
+    func validateCapture() {
+        let manager = ScreenCaptureManager.shared
+        guard let current = manager.all.first(where: {
+            $0.id == physicalID && $0.associationIdentity == captureID
+        }) else { retire(); return }
+        let rebound = lock.withLock { () -> Bool in
+            guard boundScreen !== current else { return false }
+            boundScreen = current
+            return true
+        }
+        let valid = screenValid
+        let action = lock.withLock { () -> (cancel: Bool, retire: Bool) in
+            let wasPaused = capturePaused
+            capturePaused = !valid
+            let cancel = (rebound || (!valid && !wasPaused)) && !retired
+            return (cancel, cancel && synchronousGesture)
+        }
+        // Temporary identity checks release held input without discarding an
+        // idle exact-device transport. Interrupting a synchronous gesture does
+        // close its worker: retire it so refresh can prepare after confirmed release.
+        if action.retire { retire() }
+        else if action.cancel { cancel() }
+    }
     private func fail(_ error: Error) {
         keyboardGate.cancel()
         lock.withLock {

@@ -2,6 +2,49 @@ import XCTest
 
 @testable import iPhoneUse
 
+final class CaptureContinuityTests: XCTestCase {
+    private let se = CGSize(width: 750, height: 1334)
+    private let twelve = CGSize(width: 1170, height: 2532)
+
+    func testRemovingAResolvesBWithoutScreenshotAndRepeatedReattachPreservesIt() {
+        let expected = ["A": twelve, "B": se]
+        XCTAssertEqual(CaptureScreenMapping.continuing(
+            physicalIDs: ["B"], expectedSizes: expected, sourceSizes: ["B": se]), ["B": "B"])
+        for _ in 0..<8 {
+            XCTAssertEqual(CaptureScreenMapping.continuing(
+                physicalIDs: ["A", "B"], expectedSizes: expected,
+                sourceSizes: ["A": twelve, "B": se]), ["A": "A", "B": "B"])
+        }
+    }
+
+    func testSwappedNominalStreamsUseLearnedPhysicalDimensionsNotNominalUIDs() {
+        XCTAssertEqual(CaptureScreenMapping.continuing(
+            physicalIDs: ["A", "B"], expectedSizes: ["A": twelve, "B": se],
+            sourceSizes: ["A": se, "B": twelve]), ["A": "B", "B": "A"])
+    }
+
+    func testUnknownOrEqualSizedPeersCannotBeApprovedByDimensions() {
+        XCTAssertTrue(CaptureScreenMapping.continuing(
+            physicalIDs: ["A", "B"], expectedSizes: ["B": se],
+            sourceSizes: ["A": twelve, "B": se]).isEmpty)
+        XCTAssertTrue(CaptureScreenMapping.continuing(
+            physicalIDs: ["A", "B"], expectedSizes: ["A": se, "B": se],
+            sourceSizes: ["A": se, "B": se]).isEmpty)
+        XCTAssertTrue(CaptureScreenMapping.continuing(
+            physicalIDs: ["B"], expectedSizes: ["A": se, "B": se],
+            sourceSizes: ["B": se]).isEmpty, "a removed equal-sized peer may leave ambiguous pixels")
+    }
+
+    func testMissingOrAmbiguousStreamDoesNotDisableAnotherProvenRoute() {
+        XCTAssertEqual(CaptureScreenMapping.continuing(
+            physicalIDs: ["A", "B"], expectedSizes: ["A": twelve, "B": se],
+            sourceSizes: ["A": se]), ["B": "A"])
+        XCTAssertEqual(CaptureScreenMapping.continuing(
+            physicalIDs: ["A", "B", "C"], expectedSizes: ["A": twelve, "B": se, "C": se],
+            sourceSizes: ["A": twelve, "B": se, "C": se]), ["A": "A"])
+    }
+}
+
 final class CaptureAssociationIdentityTests: XCTestCase {
     func testProvisionalPixelsAreHiddenUntilIndependentVerificationAndOnRemap() {
         let gate = CaptureDisplayIdentity(confirmed: false)
