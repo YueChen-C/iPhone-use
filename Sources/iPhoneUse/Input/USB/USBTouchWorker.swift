@@ -17,6 +17,15 @@ enum USBTouchWorker {
         try? FileHandle.standardOutput.write(contentsOf: bytes + Data([10]))
     }
 
+    /// Used only after execute succeeds. These terminal operations already
+    /// release touch/keys/buttons and PING; down/move still own a held contact.
+    static func acknowledgement(_ command: USBTouchWorkerCommand, physicalID: String) -> [String: Any] {
+        let terminal = ["tap", "swipe", "up", "cancel", "keyboard"].contains(command.operation)
+            || USBHardwareButton(rawValue: command.operation) != nil
+        return ["event": "ack", "id": command.id.uuidString, "physicalID": physicalID,
+                "inputReleased": terminal, "uiVerified": false]
+    }
+
     static func run(physicalID: String) -> Int32 {
         signal(SIGPIPE, SIG_IGN)
         var sessionPrepared = false
@@ -75,7 +84,7 @@ enum USBTouchWorker {
                             let command = try JSONDecoder().decode(USBTouchWorkerCommand.self, from: line)
                             do {
                                 try session.execute(command.operation, points: command.points, duration: command.duration, strokes: command.strokes)
-                                emit(["event": "ack", "id": command.id.uuidString, "uiVerified": false])
+                                emit(acknowledgement(command, physicalID: physicalID))
                             } catch {
                                 session.cancel()
                                 emit(["event": "error", "id": command.id.uuidString, "error": "\(error)",

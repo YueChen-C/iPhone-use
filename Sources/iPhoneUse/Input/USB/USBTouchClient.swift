@@ -1,16 +1,42 @@
 import Darwin
 import Foundation
 
-/// Exit alone never proves safety. A worker that explicitly failed before
-/// session construction needs no contact release, provided no command was sent.
+/// Exit alone never proves safety. A read-only prepared worker has no input to
+/// release; after dispatch, only the latest exact-command release/PING proof
+/// can restore that idle evidence. Unknown or held input remains gated.
 struct USBTouchWorkerLifetime {
     var becameReady = false
     var commandDispatched = false
     var released = false
     var unprepared = false
     var exited = false
+    private var pendingCommand: UUID?
+    private var inputReleased = false
+
+    init(becameReady: Bool = false, commandDispatched: Bool = false, released: Bool = false,
+         unprepared: Bool = false, exited: Bool = false) {
+        self.becameReady = becameReady; self.commandDispatched = commandDispatched
+        self.released = released; self.unprepared = unprepared; self.exited = exited
+    }
+
+    mutating func dispatch(_ id: UUID, mayHoldInput: Bool = true) {
+        let wasIdle = becameReady && (!commandDispatched || inputReleased)
+        commandDispatched = true
+        pendingCommand = id
+        // A release-only cancel cannot create input, but cannot clear existing
+        // uncertainty either. Every other write revokes proof before dispatch.
+        inputReleased = !mayHoldInput && wasIdle
+    }
+
+    mutating func acknowledge(_ id: UUID, inputReleased: Bool) {
+        guard pendingCommand == id else { return }
+        pendingCommand = nil
+        self.inputReleased = inputReleased
+    }
+
     var retirementConfirmed: Bool {
-        exited && (released || (unprepared && !becameReady && !commandDispatched))
+        exited && (released || (unprepared && !becameReady && !commandDispatched)
+            || (becameReady && (!commandDispatched || inputReleased)))
     }
 }
 
@@ -116,6 +142,10 @@ final class USBTouchClient {
                 }
                 lifetime.unprepared = true
             } else if let id = object["id"] as? String {
+                if object["event"] as? String == "ack", object["physicalID"] as? String == physicalID,
+                   let command = UUID(uuidString: id) {
+                    lifetime.acknowledge(command, inputReleased: object["inputReleased"] as? Bool == true)
+                }
                 replies[id] = object
             } else if object["event"] as? String == "failed" { failure = USBPreparationFailure(workerEvent: object) }
             condition.broadcast()
@@ -139,7 +169,7 @@ final class USBTouchClient {
                 let message = failure?.description ?? "USB session closed"; condition.unlock()
                 throw USBInputFailure(.notReady, message)
             }
-            lifetime.commandDispatched = true // Even a partial pipe write invalidates no-contact proof.
+            lifetime.dispatch(id, mayHoldInput: operation != "cancel")
             condition.unlock()
             do { try input.fileHandleForWriting.write(contentsOf: bytes) }
             catch {
@@ -174,8 +204,8 @@ final class USBTouchClient {
         }
     }
     /// A process being killed is not proof of contact release. Keep the next
-    /// transport gated unless release/PING was confirmed, or explicit pre-session
-    /// failure proved no contact was possible. Both paths also require exit.
+    /// transport gated unless the last input was confirmed released, no input
+    /// could have been sent, or shutdown release/PING succeeded. All require exit.
     func closeAndWait() -> Bool {
         close()
         condition.lock(); defer { condition.unlock() }
