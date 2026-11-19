@@ -62,6 +62,14 @@ if mode == "version-gate" {
     exit(0)
 }
 let old = input(a, hostA), peer = input(b, hostB)
+let captures = ScreenCaptureManager.shared
+try require(captures.all.contains { $0.id == a.id && $0 === a.screen }
+            && captures.all.contains { $0.id == b.id && $0 === b.screen }, "fixture capture identity table")
+try require(DeviceRegistry.shared.all().contains { $0.id == a.id && $0.screen === a.screen }
+            && DeviceRegistry.shared.all().contains { $0.id == b.id && $0.screen === b.screen }, "fixture registry table")
+let unknownScreen = ScreenCaptureSession()
+try require(!captures.isCurrent(unknownScreen) && !captures.permitsPointerAssociation(for: unknownScreen),
+            "fixture must reject unregistered captures")
 try old.key("a", modifiers: ["cmd"])
 try peer.key("b", modifiers: [])
 try require(hid.reports(hostA).count == 4 && hid.reports(hostB).count == 2, "initial BLE input")
