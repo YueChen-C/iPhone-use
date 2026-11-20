@@ -17,8 +17,8 @@ final class InputBackendPreferencesTests: XCTestCase {
                                             preferences: restartedStore)
         XCTAssertEqual(controller.selected(modern), .ble)
         XCTAssertEqual(controller.selected(older), .usb)
-        XCTAssertFalse(controller.applyDefault(physicalID: modern, version: "26.5"))
-        XCTAssertEqual(controller.selected(modern), .ble, "Saved Bluetooth beats the iOS 26 default")
+        XCTAssertFalse(controller.applyDefault(physicalID: modern, version: "17.3"))
+        XCTAssertEqual(controller.selected(modern), .ble, "Saved Bluetooth beats the iOS 17.3 default")
         XCTAssertEqual(controller.selected("unknown"), .ble)
         XCTAssertTrue(controller.stop(waitTimeout: 1))
     }
@@ -29,7 +29,7 @@ final class InputBackendPreferencesTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         let store = InputBackendPreferences(defaults: defaults)
         let automatic = USBInputController(requireUSB: { _ in }, preferences: store)
-        XCTAssertTrue(automatic.applyDefault(physicalID: modern, version: "26.5"))
+        XCTAssertTrue(automatic.applyDefault(physicalID: modern, version: "17.3"))
         XCTAssertTrue(store.load().isEmpty)
         XCTAssertTrue(automatic.stop(waitTimeout: 1))
         store.save(.ble, physicalID: modern)

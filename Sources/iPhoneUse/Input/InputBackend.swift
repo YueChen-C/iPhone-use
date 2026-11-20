@@ -5,9 +5,11 @@ enum InputBackendKind: String, Codable, CaseIterable {
     case ble, usb
 
     static func defaultForIOSVersion(_ version: String) -> Self {
-        guard (try? USBBackendCompatibility.validate(version: version)) != nil,
-              let major = version.split(separator: ".").first.flatMap({ Int($0) }), major >= 26
-        else { return .ble }
+        guard (try? USBBackendCompatibility.validate(version: version)) != nil else { return .ble }
+        let parts = version.split(separator: ".")
+        guard let major = Int(parts[0]) else { return .ble }
+        if major > 17 { return .usb }
+        guard parts.count > 1, let minor = Int(parts[1]), minor >= 3 else { return .ble }
         return .usb
     }
 }

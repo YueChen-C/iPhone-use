@@ -22,7 +22,9 @@ final class AXUSBProxy: AXByteStream {
     private(set) var client = Data(), server = Data()
     private(set) var rsdPort: UInt16 = 0
 
-    init(device id: String) throws {
+    enum Unsupported: Error { case legacyDevice }
+
+    init(device id: String, requireCoreDevice: Bool = false) throws {
         let library = try AXMobileDeviceLibrary()
         self.library = library
         func symbol<T>(_ name: String, _: T.Type) throws -> T {
@@ -74,6 +76,7 @@ final class AXUSBProxy: AXByteStream {
                     throw AXDTX.Failure("Selected iPhone did not report ProductVersion")
                 }
                 legacy = try Self.usesLegacyService(version: version)
+                if requireCoreDevice && legacy { throw Unsupported.legacyDevice }
                 let name = legacy ? "com.apple.accessibility.axAuditDaemon.remoteserver"
                                   : "com.apple.internal.devicecompute.CoreDeviceProxy"
                 try check(service(d, name as CFString, nil, &connection),

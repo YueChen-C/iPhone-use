@@ -86,6 +86,50 @@ final class USBIdentityScreenshotTests: XCTestCase {
         }
     }
 
+    func testDeveloperFallbackRunsOnlyForMissingLegacyCapability() throws {
+        enum Fault: Error { case transport }
+        var fallbackCalls = 0
+        let fallback = { fallbackCalls += 1; return Data([2]) }
+        XCTAssertEqual(try USBIdentityScreenshot.withDeveloperServiceFallback(legacy: { Data([1]) }, developer: fallback), Data([1]))
+        XCTAssertThrowsError(try USBIdentityScreenshot.withDeveloperServiceFallback(legacy: { throw Fault.transport }, developer: fallback))
+        XCTAssertEqual(fallbackCalls, 0)
+        XCTAssertEqual(try USBIdentityScreenshot.withDeveloperServiceFallback(
+            legacy: { throw USBIdentityScreenshot.LegacyServiceUnavailable.notOffered }, developer: fallback), Data([2]))
+        XCTAssertEqual(fallbackCalls, 1)
+    }
+
+    func testDeveloperScreenshotRequiresExactUSBPeerAndValidEndpoint() throws {
+        let service = CoreDeviceIdentityScreenshot.service
+        let peer: [String: Any] = ["Properties": ["UniqueDeviceID": "A"], "Services": [service: ["Port": "123"]]]
+        XCTAssertEqual(try CoreDeviceIdentityScreenshot.screenshotPort(peer: peer, physicalID: "A"), 123)
+        XCTAssertThrowsError(try CoreDeviceIdentityScreenshot.screenshotPort(peer: peer, physicalID: "B")) {
+            XCTAssertEqual($0 as? CoreDeviceIdentityScreenshot.Failure, .identityMismatch)
+        }
+        for port in ["0", "65536", "invalid"] {
+            XCTAssertThrowsError(try CoreDeviceIdentityScreenshot.screenshotPort(
+                peer: ["Properties": ["UniqueDeviceID": "A"], "Services": [service: ["Port": port]]], physicalID: "A"))
+        }
+    }
+
+    func testDeveloperScreenshotRejectsWrongReplySequence() throws {
+        func message(id: UInt32, channel: UInt32, conversation: UInt32, object: Any? = nil) throws -> AXDTX.Message {
+            let body = try object.map { try NSKeyedArchiver.archivedData(withRootObject: $0, requiringSecureCoding: false) } ?? Data()
+            return .init(identifier: id, conversation: conversation, channel: channel, expectsReply: false,
+                         payload: AXDTX.number(3) + AXDTX.number(0) + AXDTX.number(UInt64(body.count), bytes: 8) + body)
+        }
+        let hello = try message(id: 1, channel: 0, conversation: 0, object: "_notifyOfPublishedCapabilities:")
+        let open = try message(id: 2, channel: 0, conversation: 1)
+        let image = Data([0x89, 0x50, 0x4e, 0x47])
+        for channel: UInt32 in [1, 2] {
+            var messages = [hello, open, try message(id: 3, channel: channel, conversation: 1, object: image)]
+            var sent: [Data] = []
+            let read = { try CoreDeviceIdentityScreenshot.read(send: { sent.append($0) }, next: { messages.removeFirst() }) }
+            if channel == 1 { XCTAssertEqual(try read(), image) } else { XCTAssertThrowsError(try read()) }
+            XCTAssertEqual(sent.count, 3)
+            XCTAssertEqual(try AXDTX.integer(sent[2], 24), 1)
+        }
+    }
+
     func testWorkerPreservesUnavailableAndFailureExitCodes() {
         for code in [0, USBIdentityScreenshot.unavailableExitCode, USBIdentityScreenshot.failedExitCode] {
             XCTAssertEqual(

@@ -22,7 +22,7 @@ https://github.com/user-attachments/assets/e4aa9473-3236-4573-9841-bfbf83e248e1
 
 1. 在 **macOS 14+** 的 Mac 上，从 [Releases](https://github.com/YueChen-C/iPhone-use/releases) 下载 **Assets** 中的 `iPhoneUse-v<版本号>-macOS-universal.zip`（支持 Apple Silicon 和 Intel），解压后将 `iPhoneUse.app` 拖入「应用程序」。安装包未经过 Apple 公证；若系统阻止打开，确认来源后按「隐私与安全性」提示操作。
 2. 用可传输数据的 USB 线连接并解锁 iPhone，选择「信任此电脑」，并允许 Mac 的相机权限以获取画面。
-3. 在工作台选择输入方式。**iOS 26+ 默认 USB 触控**；旧系统默认蓝牙。蓝牙需授权、开启 iPhone 的辅助触控并完成配对；USB 触控为实验性功能，需 iOS 17+、兼容的 Apple Silicon 主机、开发者模式和兼容 DDI。
+3. 在工作台选择输入方式。**iOS 17.3+ 默认 USB 触控**；旧系统默认蓝牙。蓝牙需授权、开启 iPhone 的辅助触控并完成配对；USB 触控为实验性功能，需 iOS 17+、兼容的 Apple Silicon 主机、开发者模式和兼容 DDI。
 
 [从源码运行](docs/user-guide.md#1-获取代码并启动) · [连接和配对](docs/user-guide.md#2-连接手机并授权) · [USB 触控配置](docs/user-guide.md#实验性原生-usb-触控) · [故障排查](docs/user-guide.md#常见问题与限制)
 

@@ -31,6 +31,16 @@ final class CaptureIdentityVerifierTests: XCTestCase {
                 stopped: false, expected: 7, current: 7, sourceCount: 0, state: .failed))
     }
 
+    func testTerminalDisplayStatesDoNotLookLikeAnActiveCheck() {
+        for language in [AppLanguage.zh, .en] {
+            let pending = ScreenCaptureIdentityState.pending.unconfirmedMessage(language: language)
+            XCTAssertNotEqual(ScreenCaptureIdentityState.unavailable.unconfirmedMessage(language: language), pending)
+            XCTAssertNotEqual(ScreenCaptureIdentityState.failed.unconfirmedMessage(language: language), pending)
+            XCTAssertEqual(ScreenCaptureIdentityState.partiallyVerified.unconfirmedMessage(language: language),
+                           ScreenCaptureIdentityState.failed.unconfirmedMessage(language: language))
+        }
+    }
+
     private func image(inverted: Bool = false) -> CaptureIdentityImage {
         CaptureIdentityImage(
             aspectRatio: 750.0 / 1334,

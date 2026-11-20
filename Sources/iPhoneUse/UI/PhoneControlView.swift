@@ -158,8 +158,7 @@ final class PhoneControlView: NSView {
         if let device, !device.screen.displayIdentityConfirmed {
             WorkbenchTheme.canvas.setFill()
             dirtyRect.intersection(bounds).fill()
-            let text = AppLanguageStore.shared.language == .zh
-                ? "正在确认设备画面…" : "Verifying device display…"
+            let text = ScreenCaptureManager.shared.identityState.unconfirmedMessage(language: AppLanguageStore.shared.language)
             WorkbenchTheme.text(text,
                 in: NSRect(x: 8, y: bounds.midY - 20, width: max(1, bounds.width - 16), height: 40),
                 size: 11, color: WorkbenchTheme.muted, alignment: .center)

@@ -10,6 +10,18 @@ enum ScreenCaptureIdentityState: String {
     /// Independent screenshots did not prove a reliable mapping.
     case failed
 
+    func unconfirmedMessage(language: AppLanguage) -> String {
+        let zh = language == .zh
+        switch self {
+        case .unavailable:
+            return zh ? "画面校验服务不可用，已暂停操控" : "Display verification service unavailable. Control paused."
+        case .failed, .partiallyVerified:
+            return zh ? "未能确认此设备的画面，已暂停操控" : "This display could not be verified. Control paused."
+        default:
+            return zh ? "正在确认设备画面…" : "Verifying device display…"
+        }
+    }
+
     func permitsAssociation(identityVerified: Bool) -> Bool {
         switch self {
         case .singleDevice, .verified, .unavailable: true

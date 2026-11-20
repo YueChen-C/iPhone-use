@@ -37,8 +37,8 @@ struct WorkbenchInfoContent {
         case .guide:
             title = zh ? "连接真实 iPhone" : "Connect a real iPhone"
             introduction = zh
-                ? "1. 使用可传输数据的 USB 线连接，解锁 iPhone 并信任此 Mac。\n2. 允许 Mac 的相机权限，用于读取 USB 画面。\n3. iOS 26 及以上默认 USB 触控；旧系统默认蓝牙，需要允许蓝牙权限、开启辅助触控并完成配对。手动选择会按设备保留。\n4. USB Touch 为实验性后端：需 iOS 17+、兼容的 Apple Silicon 主机、开发者模式及兼容 DDI。最低版本不代表所有组合均支持。"
-                : "1. Connect a data-capable USB cable, unlock your iPhone and trust this Mac.\n2. Allow camera access on the Mac for USB capture.\n3. iOS 26+ defaults to USB Touch; older versions default to Bluetooth and need permission, AssistiveTouch and pairing. Your explicit choice is saved per device.\n4. USB Touch is experimental: iOS 17+, compatible Apple Silicon hardware, Developer Mode and DDI are required. A minimum version does not guarantee every combination works."
+                ? "1. 使用可传输数据的 USB 线连接，解锁 iPhone 并信任此 Mac。\n2. 允许 Mac 的相机权限，用于读取 USB 画面。\n3. iOS 17.3 及以上默认 USB 触控；旧系统默认蓝牙，需要允许蓝牙权限、开启辅助触控并完成配对。手动选择会按设备保留。\n4. USB Touch 为实验性后端：需 iOS 17+、兼容的 Apple Silicon 主机、开发者模式及兼容 DDI。最低版本不代表所有组合均支持。"
+                : "1. Connect a data-capable USB cable, unlock your iPhone and trust this Mac.\n2. Allow camera access on the Mac for USB capture.\n3. iOS 17.3+ defaults to USB Touch; older versions default to Bluetooth and need permission, AssistiveTouch and pairing. Your explicit choice is saved per device.\n4. USB Touch is experimental: iOS 17+, compatible Apple Silicon hardware, Developer Mode and DDI are required. A minimum version does not guarantee every combination works."
             code = nil
             detail = zh
                 ? "USB 画面已连接不等于输入已就绪。USB Touch 不可用时不自动转发至蓝牙。下载 DDI 不等于安装，安装前需核对计划。"

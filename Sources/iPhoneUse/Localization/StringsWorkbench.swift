@@ -39,7 +39,7 @@ struct StringsWorkbench: LocalizedTable {
     static let zh = Self(
         title: "设备工作台", subtitle: "真实 iPhone，各自独立，也能一览全局。", devices: "已发现设备", search: "搜索设备名称或 ID…", connect: "连接设备",
         grid: "平铺", focus: "聚焦", current: "当前控制设备", onlyCurrent: "操作仅作用于此设备", noDevice: "连接你的第一台 iPhone",
-        guide: "USB 连接并信任此 Mac，允许相机权限用于投屏。iOS 26 及以上默认 USB 触控；旧系统默认蓝牙，需完成配对与辅助触控设置。", inputBackend: "输入后端", experimental: "USB Touch · 实验性",
+        guide: "USB 连接并信任此 Mac，允许相机权限用于投屏。iOS 17.3 及以上默认 USB 触控；旧系统默认蓝牙，需完成配对与辅助触控设置。", inputBackend: "输入后端", experimental: "USB Touch · 实验性",
         screenshot: "截图", screenshotIdentityUnverified: "画面与设备身份尚未确认，未保存截图；请先重新匹配原设备。",
         screenshotNotReady: "画面尚未就绪，未保存截图。", independent: "独立窗口", textInput: "文本输入", send: "发送文本", pasteHint: "手机端粘贴发送 Cmd-V，不读取 Mac 剪贴板。",
         ai: "AI 接入", api: "脚本与 API", mcpHint: "通过外部 MCP 客户端使用截图、点击、滑动与输入工具。", local: "HTTP 仅监听本机回环地址",
@@ -53,7 +53,7 @@ struct StringsWorkbench: LocalizedTable {
         focus: "Focus", current: "Current device", onlyCurrent: "Actions target this device only",
         noDevice: "Connect your first iPhone",
         guide:
-            "Connect via USB, trust this Mac and allow camera access for capture. iOS 26+ defaults to USB Touch; older systems default to Bluetooth, which needs pairing and AssistiveTouch.",
+            "Connect via USB, trust this Mac and allow camera access for capture. iOS 17.3+ defaults to USB Touch; older systems default to Bluetooth, which needs pairing and AssistiveTouch.",
         inputBackend: "Input backend", experimental: "USB Touch · Experimental", screenshot: "Screenshot",
         screenshotIdentityUnverified: "Display identity is unverified. Screenshot not saved; rematch the original device first.",
         screenshotNotReady: "Display not ready. Screenshot not saved.",

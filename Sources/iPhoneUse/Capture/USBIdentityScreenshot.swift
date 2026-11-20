@@ -33,7 +33,7 @@ enum USBIdentityScreenshot {
         defer { try? handle.close() }
         let status = run(
             executable: executable, arguments: [workerArgument, physicalID, output.path],
-            timeout: 8, diagnostic: handle)
+            timeout: 10, diagnostic: handle)
         if status == unavailableExitCode {
             let detail = (try? String(contentsOf: diagnostic, encoding: .utf8)) ?? ""
             log(
@@ -72,17 +72,106 @@ enum USBIdentityScreenshot {
     /// Only the isolated worker calls into MobileDevice. Do not attempt pairing,
     /// mount developer images, reset USB, or fall back to a different phone.
     static func write(physicalID: String, output: URL) -> Int32 {
-        guard let services = NativeUSBDeviceServices() else { return unavailableExitCode }
         do {
-            let data = try services.screenshot(physicalID: physicalID)
+            let data = try withDeveloperServiceFallback(legacy: {
+                guard let services = NativeUSBDeviceServices() else { throw LegacyServiceUnavailable.notOffered }
+                do { return try services.screenshot(physicalID: physicalID) }
+                catch NativeUSBDeviceServices.Failure.unavailable { throw LegacyServiceUnavailable.notOffered }
+            }, developer: { try CoreDeviceIdentityScreenshot.capture(physicalID: physicalID) })
             try data.write(to: output, options: .atomic)
             return 0
-        } catch NativeUSBDeviceServices.Failure.unavailable {
+        } catch AXUSBProxy.Unsupported.legacyDevice {
+            return unavailableExitCode
+        } catch CoreDeviceIdentityScreenshot.Failure.serviceUnavailable {
             return unavailableExitCode
         } catch {
             log("native USB screenshot: \(error)")
             return failedExitCode
         }
+    }
+
+    /// The newer service is a capability fallback, not a retry for disconnects,
+    /// trust failures, or malformed replies. Both calls stay in the same worker.
+    static func withDeveloperServiceFallback(legacy: () throws -> Data, developer: () throws -> Data) throws -> Data {
+        do { return try legacy() }
+        catch LegacyServiceUnavailable.notOffered { return try developer() }
+    }
+
+    enum LegacyServiceUnavailable: Error { case notOffered }
+}
+
+/// Only the screenshot channel on the exact phone's own USB CoreDevice tunnel.
+/// No input, network fallback, image mounting, or external helper is involved.
+enum CoreDeviceIdentityScreenshot {
+    enum Failure: Error { case serviceUnavailable, identityMismatch, invalidReply }
+    static let service = "com.apple.instruments.dtservicehub"
+    private static let screenshotChannel = "com.apple.instruments.server.services.screenshot"
+
+    static func capture(physicalID: String) throws -> Data {
+        try NativeDDIInspection.validateIdentity(physicalID)
+        let tunnel = try AXUSBProxy(device: physicalID, requireCoreDevice: true)
+        let rsd = try AXTunnelSocket(tunnel: tunnel, port: tunnel.rsdPort, local: 52001)
+        let peer = try AXRSD.discover(socket: rsd)
+        let port = try screenshotPort(peer: peer, physicalID: physicalID)
+        let socket = try AXTunnelSocket(tunnel: tunnel, port: port, local: 52003)
+        let data = try read(send: socket.send, next: { try AXDTX.receive(read: socket.read) })
+        guard let image = CGImageSourceCreateWithData(data as CFData, nil), CGImageSourceGetCount(image) == 1,
+              let properties = CGImageSourceCopyPropertiesAtIndex(image, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int, (1...8192).contains(width),
+              let height = properties[kCGImagePropertyPixelHeight] as? Int, (1...8192).contains(height),
+              width * height <= 16_777_216 else { throw Failure.invalidReply }
+        return data
+    }
+
+    static func screenshotPort(peer: [String: Any], physicalID: String) throws -> UInt16 {
+        guard (peer["Properties"] as? [String: Any])?["UniqueDeviceID"] as? String == physicalID else {
+            throw Failure.identityMismatch
+        }
+        guard let services = peer["Services"] as? [String: Any] else { throw Failure.invalidReply }
+        guard let endpoint = services[service] else { throw Failure.serviceUnavailable }
+        guard let advertised = endpoint as? [String: Any],
+              let text = advertised["Port"] as? String, let port = UInt16(text), port > 0 else {
+            throw Failure.invalidReply
+        }
+        return port
+    }
+
+    static func read(send: (Data) throws -> Void, next: () throws -> AXDTX.Message) throws -> Data {
+        let capabilities = "_notifyOfPublishedCapabilities:"
+        try send(request(1, 0, capabilities, aux: archive([
+            "com.apple.private.DTXBlockCompression": 0, "com.apple.private.DTXConnection": 1,
+        ]), expectsReply: false))
+        let hello = try next()
+        guard hello.channel == 0, hello.conversation == 0, !hello.expectsReply,
+              try (AXDTX.object(hello.payload) as? String) == capabilities else { throw Failure.invalidReply }
+        // DVT channel numbers are primitive Int32 auxiliary items, not archived NSNumber.
+        let channel = AXDTX.number(10) + AXDTX.number(3) + AXDTX.number(1)
+        try send(request(2, 0, "_requestChannelWithCode:identifier:", aux: channel + archive(screenshotChannel)))
+        let opened = try next()
+        guard reply(opened, id: 2, channel: 0), try AXDTX.object(opened.payload) == nil else { throw Failure.invalidReply }
+        try send(request(3, 1, "takeScreenshot"))
+        let captured = try next()
+        guard reply(captured, id: 3, channel: 1), let data = try AXDTX.object(captured.payload) as? Data,
+              !data.isEmpty else { throw Failure.invalidReply }
+        return data
+    }
+
+    private static func reply(_ message: AXDTX.Message, id: UInt32, channel: UInt32) -> Bool {
+        message.identifier == id && message.channel == channel && message.conversation == 1 && !message.expectsReply
+    }
+
+    private static func archive(_ object: Any) throws -> Data {
+        let data = try NSKeyedArchiver.archivedData(withRootObject: object, requiringSecureCoding: false)
+        return AXDTX.number(10) + AXDTX.number(2) + AXDTX.number(UInt64(data.count)) + data
+    }
+
+    private static func request(_ id: UInt32, _ channel: UInt32, _ selector: String,
+                                aux: Data = Data(), expectsReply: Bool = true) throws -> Data {
+        let name = try NSKeyedArchiver.archivedData(withRootObject: selector, requiringSecureCoding: false)
+        let args = aux.isEmpty ? Data() : AXDTX.number(0x1f0, bytes: 8) + AXDTX.number(UInt64(aux.count), bytes: 8) + aux
+        let payload = AXDTX.number(expectsReply ? 0x1002 : 2) + AXDTX.number(UInt64(args.count))
+            + AXDTX.number(UInt64(args.count + name.count), bytes: 8) + args + name
+        return AXDTX.packet(id: id, channel: channel, reply: expectsReply, payload: payload)
     }
 }
 

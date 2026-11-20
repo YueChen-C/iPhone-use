@@ -199,7 +199,7 @@ final class WorkbenchStateTests: XCTestCase {
                     XCTAssertTrue(content.code?.contains("device=DEVICE_ID") == true)
                 } else {
                     XCTAssertNil(content.code)
-                    XCTAssertTrue(content.introduction.contains("26"))
+                    XCTAssertTrue(content.introduction.contains("17.3"))
                     XCTAssertTrue(content.introduction.contains("17+"))
                 }
             }

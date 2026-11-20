@@ -22,7 +22,7 @@ https://github.com/user-attachments/assets/e4aa9473-3236-4573-9841-bfbf83e248e1
 
 1. On **macOS 14+**, download `iPhoneUse-v<version>-macOS-universal.zip` from **Assets** on the [Releases page](https://github.com/YueChen-C/iPhone-use/releases). Extract `iPhoneUse.app` and move it to Applications. The build supports Apple Silicon and Intel but is not notarized. If macOS blocks it, confirm the download source and follow the Privacy & Security prompt.
 2. Connect and unlock your iPhone with a USB data cable. Trust the Mac and grant camera access on macOS for mirroring.
-3. Choose an input backend in the workbench. **iOS 26+ defaults to USB touch**; older versions default to Bluetooth. Bluetooth requires permission, pairing, and AssistiveTouch. Experimental USB touch requires iOS 17+, a compatible Apple Silicon Mac, Developer Mode, and a compatible Developer Disk Image (DDI).
+3. Choose an input backend in the workbench. **iOS 17.3+ defaults to USB touch**; older versions default to Bluetooth. Bluetooth requires permission, pairing, and AssistiveTouch. Experimental USB touch requires iOS 17+, a compatible Apple Silicon Mac, Developer Mode, and a compatible Developer Disk Image (DDI).
 
 [Build from source](docs/user-guide.md#1-获取代码并启动) · [Connect and pair](docs/user-guide.md#2-连接手机并授权) · [USB touch setup](docs/user-guide.md#实验性原生-usb-触控) · [Troubleshooting](docs/user-guide.md#常见问题与限制) (guide in Chinese)
 
