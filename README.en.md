@@ -6,7 +6,7 @@
 
 [Download for macOS](https://github.com/YueChen-C/iPhone-use/releases) · [Quick Start](#quick-start) · [AI Integration](#ai-integration)
 
-![iPhone Use 2.0: control iPhone from your Mac](docs/assets/github-hero-en.png)
+![iPhone Use 2.0: control iPhone from your Mac](docs/assets/github-hero-en.webp)
 
 ## Hands-on Demo
 

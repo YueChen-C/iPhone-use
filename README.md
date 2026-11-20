@@ -6,7 +6,7 @@
 
 [下载 macOS 版](https://github.com/YueChen-C/iPhone-use/releases) · [快速开始](#快速开始) · [接入 AI Agent](#接入-ai-agent)
 
-![iPhone Use 2.0：Mac 鼠标和键盘操控，支持 AI 通过 MCP 操作 iPhone](docs/assets/github-hero-zh.png)
+![iPhone Use 2.0：Mac 鼠标和键盘操控，支持 AI 通过 MCP 操作 iPhone](docs/assets/github-hero-zh.webp)
 
 ## 实操演示
 
