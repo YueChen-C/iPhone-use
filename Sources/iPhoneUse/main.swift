@@ -25,10 +25,26 @@ catch {
     exit(78)
 }
 
+// The desktop setup button starts the pinned DDI installer. This
+// bounded child has no AppKit, HTTP, capture or input entry points.
+if CommandLine.arguments.dropFirst().first == DDIFirstMount.argument {
+    guard let ddiInputLease else { exit(78) }
+    exit(DDIFirstMount.run(arguments: Array(CommandLine.arguments.dropFirst(2)), inputLease: ddiInputLease))
+}
+
 // Native USB control runs in this executable, isolated from AppKit/BLE/capture.
 if CommandLine.arguments.dropFirst().first == USBTouchWorker.argument {
     guard CommandLine.arguments.count == 3 else { exit(64) }
-    exit(USBTouchWorker.run(physicalID: CommandLine.arguments[2]))
+    let physicalID = CommandLine.arguments[2]
+    do {
+        guard let ddiInputLease else { exit(78) }
+        let lease = try ddiInputLease.deviceService(physicalID: physicalID, exclusive: false)
+        exit(withExtendedLifetime(lease) { USBTouchWorker.run(physicalID: physicalID) })
+    } catch {
+        USBTouchWorker.emit(["event": "unprepared", "physicalID": physicalID, "inputSent": false])
+        USBTouchWorker.emit(USBPreparationFailure(.unknown, String(describing: error)).workerEvent)
+        exit(78)
+    }
 }
 
 // An opt-in, read-only listener for validating AX without a second BLE/capture owner.

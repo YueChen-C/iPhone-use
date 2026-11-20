@@ -55,20 +55,12 @@ final class DDIDownload {
             let lease = try DDIFileLock(directory: root, name: "download.lock", exclusive: true,
                                        unavailable: "Another DDI download is using the cache; retry after it completes")
             return try withExtendedLifetime(lease) {
-                let destination = cache.appendingPathComponent("27B52-" + Self.revision, isDirectory: true)
+                let destination = Self.cacheEntry(in: cache)
                 if fm.fileExists(atPath: destination.path) {
                     progress(.verifying)
-                    let prepared = Prepared(bundle: destination.appendingPathComponent("bundle"),
-                                            receipt: destination.appendingPathComponent("source-receipt.json"))
+                    let prepared = Self.prepared(at: destination)
                     do {
-                        let data = try DDILocalFile.metadata(root: destination, path: "source-receipt.json", limit: 64 * 1024)
-                        let source = try JSONDecoder().decode(DDISourceRecord.self, from: data)
-                        var hashes = Self.payloadHashes
-                        if source.location == Self.fallbackLocation { hashes["version.plist"] = Self.digest(Self.version) }
-                        guard source.kind == "third-party-mirror", source.revision == Self.revision,
-                              [Self.archiveURL.absoluteString, Self.fallbackLocation].contains(source.location),
-                              source.sha256 == hashes else { throw DDIManagementError("Cached DDI pins differ") }
-                        _ = try DDIBundlePreflight.inspect(bundle: prepared.bundle, source: source, productType: productType)
+                        _ = try Self.verifyCached(at: destination, productType: productType)
                     } catch {
                         try checkCancelled()
                         // Only this revision's app-owned cache entry is discarded.
@@ -81,6 +73,37 @@ final class DDIDownload {
                 return try prepare(destination: destination, productType: productType, progress: progress)
             }
         }
+    }
+
+    /// The install child rechecks app-embedded pins, holding the cache against
+    /// replacement until the native mount and verification finish.
+    static func withVerifiedCache<T>(productType: String, _ use: (DDIBundlePreflight) throws -> T) throws -> T {
+        let cache = try canonicalDirectory(cacheDirectory)
+        return try DDILocalFile.withDirectory(cache) { root in
+            let lease = try DDIFileLock(directory: root, name: "download.lock", exclusive: false,
+                                       unavailable: "DDI cache is being updated; retry after download finishes")
+            return try withExtendedLifetime(lease) { try use(verifyCached(at: cacheEntry(in: cache), productType: productType)) }
+        }
+    }
+
+    private static func cacheEntry(in cache: URL) -> URL {
+        cache.appendingPathComponent("27B52-" + revision, isDirectory: true)
+    }
+
+    private static func prepared(at destination: URL) -> Prepared {
+        Prepared(bundle: destination.appendingPathComponent("bundle"), receipt: destination.appendingPathComponent("source-receipt.json"))
+    }
+
+    private static func verifyCached(at destination: URL, productType: String) throws -> DDIBundlePreflight {
+        let data = try DDILocalFile.metadata(root: destination, path: "source-receipt.json", limit: 64 * 1024)
+        let source = try JSONDecoder().decode(DDISourceRecord.self, from: data)
+        var hashes = payloadHashes
+        if source.location == fallbackLocation { hashes["version.plist"] = digest(version) }
+        guard source.kind == "third-party-mirror", source.revision == revision,
+              [archiveURL.absoluteString, fallbackLocation].contains(source.location), source.sha256 == hashes else {
+            throw DDIManagementError("Cached DDI pins differ")
+        }
+        return try DDIBundlePreflight.inspect(bundle: prepared(at: destination).bundle, source: source, productType: productType)
     }
 
     private static let fallbackLocation = "https://github.com/doronz88/DeveloperDiskImage/tree/" + revision

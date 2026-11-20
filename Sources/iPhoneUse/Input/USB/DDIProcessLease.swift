@@ -36,6 +36,15 @@ final class DDIProcessLease {
         }
         return lease
     }
+    /// Hold under a shared lifetime input lease. First mount and same-device
+    /// USB workers must not overlap; other phones retain their own sessions.
+    func deviceService(physicalID: String, exclusive: Bool) throws -> DDIFileLock {
+        try NativeDDIInspection.validateIdentity(physicalID)
+        return try DDILocalFile.withDirectory(directory) { root in
+            try DDIFileLock(directory: root, name: "usb-" + physicalID.uppercased() + ".lock",
+                            exclusive: exclusive, unavailable: "USB device is busy; retry after setup or input has stopped")
+        }
+    }
     struct Pending: Codable, Equatable { let transactionPath: String; let planSHA256: String }
     /// Discovery must work while pending blocks input, without acquiring an
     /// input/exclusive lease, creating a directory or clearing any barrier.

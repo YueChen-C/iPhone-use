@@ -26,13 +26,14 @@ final class PhoneControlView: NSView {
     var isBackendNoticeVisible = false {
         didSet { if isBackendNoticeVisible { cancelInteraction() } }
     }
-    func selectBackend(_ backend: InputBackendKind, completion: (() -> Void)? = nil) {
+    func selectBackend(_ backend: InputBackendKind, request: USBBackendSelectionRequest = USBBackendSelectionRequest(),
+                       completion: (() -> Void)? = nil) {
         cancelInteraction()
         activeShortcut = nil
         shortcutFeedback = nil
         guard let device else { return }
         backendRequest?.cancel()
-        let request = USBBackendSelectionRequest(); backendRequest = request
+        backendRequest = request
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let outcome = Result { try USBInputController.shared.select(backend, device: device, request: request) }
             DispatchQueue.main.async { [weak self] in

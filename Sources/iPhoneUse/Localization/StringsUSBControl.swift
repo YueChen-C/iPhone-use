@@ -28,7 +28,7 @@ struct StringsUSBControl: LocalizedTable {
         case .device: "此设备尚不受支持。核对兼容性记录；不会切换到其他手机。"
         case .trust: "在这台 iPhone 上核对并明确确认信任此 Mac，再重新选择 USB Touch。不会自动配对。"
         case .developerMode: "核对这台 iPhone 的开发者模式要求，处理后重新选择 USB Touch。应用不会自动更改系统设置。"
-        case .ddi: "使用本地 DDI 计划与审阅核对镜像、来源和恢复记录。挂载需单独授权；输入准备不会更换镜像。"
+        case .ddi: "点击「开启 USB 操控…」自动安装所需的开发者镜像。"
         case .select: "先检查当前画面，再点击“重新准备 USB”。释放未确认时仍会阻止输入；不会重放。也可明确选择 Bluetooth，需其独立就绪。"
         }
     }, viewOnly: "仅查看画面", pill: "USB 控制未就绪 · 仅查看画面", showGuidance: "显示指引",
@@ -51,7 +51,7 @@ struct StringsUSBControl: LocalizedTable {
         case .device: "This device is not supported. Check the compatibility record; no other phone will be selected."
         case .trust: "Review and explicitly confirm Trust This Mac on this iPhone, then reselect USB Touch. Pairing is not automatic."
         case .developerMode: "Review this iPhone's Developer Mode requirements, then reselect USB Touch. The app does not change system settings automatically."
-        case .ddi: "Use local DDI Plan & Review to inspect the image, source and recovery record. Mounting needs separate authorization; input preparation does not change images."
+        case .ddi: "Click Enable USB control… to install the required developer image."
         case .select: "Inspect the screen, then click Prepare USB again. Unconfirmed release still blocks input; no replay. You may explicitly select Bluetooth, which must be independently ready."
         }
     }, viewOnly: "View screen only", pill: "USB control unavailable · View only", showGuidance: "Show guidance",

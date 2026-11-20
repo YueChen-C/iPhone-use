@@ -40,17 +40,6 @@ final class DDIReviewWindowController: NSWindowController, NSTextFieldDelegate {
     deinit { if let languageObserver { NotificationCenter.default.removeObserver(languageObserver) } }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    /// A downloaded candidate is not a plan or permission to mount. The user
-    /// must still supply the actual mounted-image baseline and review a plan.
-    func useDownloadedCandidate(_ prepared: DDIDownload.Prepared, physicalID: String) {
-        guard !busy else { return }
-        fields[0].stringValue = physicalID
-        fields[1].stringValue = prepared.bundle.path
-        fields[2].stringValue = prepared.receipt.path
-        commands = nil; copyButton.isEnabled = false
-        result.string = StringsUSBSetup.current.progress(.prepared)
-    }
-
     private func build(_ window: NSWindow) {
         window.contentView?.wantsLayer = true
         window.contentView?.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor

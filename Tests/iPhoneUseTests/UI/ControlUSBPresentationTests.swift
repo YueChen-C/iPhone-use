@@ -179,7 +179,7 @@ final class ControlUSBPresentationTests: XCTestCase {
         XCTAssertFalse(presentation(.requiresDDI, hasScreen: false).offersUSBSetup)
     }
 
-    func testOverlaySetupProgressCancellationRetryAndReviewNeverReconnectBluetooth() throws {
+    func testOverlaySetupProgressCancellationAndCompletionNeverReconnectBluetooth() throws {
         let old = AppLanguageStore.shared.language
         defer { AppLanguageStore.shared.set(old) }
         AppLanguageStore.shared.set(.en)
@@ -211,12 +211,25 @@ final class ControlUSBPresentationTests: XCTestCase {
         overlay.updateSetup(.failed)
         XCTAssertTrue(bar.isHidden); XCTAssertTrue(viewOnly.isEnabled)
         XCTAssertEqual(setup.title, StringsUSBSetup.en.enable)
-        overlay.updateSetup(.prepared)
-        XCTAssertEqual(setup.title, StringsUSBSetup.en.review)
-        setup.performClick(nil)
-        XCTAssertEqual(enables, 2)
+        overlay.updateSetup(.installing)
+        XCTAssertTrue(setup.isHidden); XCTAssertFalse(bar.isHidden); XCTAssertTrue(bar.isIndeterminate)
+        overlay.updateSetup(.connecting)
+        overlay.updateUSB(presentation(.preparing))
+        XCTAssertFalse(bar.isHidden); XCTAssertTrue(setup.isHidden)
+        overlay.updateUSB(presentation(.ready, ready: true))
+        overlay.updateSetup(.complete)
+        XCTAssertFalse(overlay.isHidden); XCTAssertFalse(bar.isHidden)
+        XCTAssertFalse(bar.isIndeterminate); XCTAssertEqual(bar.doubleValue, 1)
+        XCTAssertTrue(views.compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue == StringsUSBSetup.en.progress(.complete) && !$0.isHiddenOrHasHiddenAncestor
+        })
         AppLanguageStore.shared.set(.zh); overlay.refreshLocalization()
-        XCTAssertEqual(setup.title, StringsUSBSetup.zh.review)
+        XCTAssertTrue(views.compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue == StringsUSBSetup.zh.progress(.complete) && !$0.isHiddenOrHasHiddenAncestor
+        })
+        overlay.updateSetup(nil)
+        XCTAssertTrue(overlay.isHidden)
+        XCTAssertEqual(enables, 1); XCTAssertEqual(cancels, 1)
         overlay.updateUSB(nil)
         XCTAssertTrue(setup.isHidden); XCTAssertTrue(bar.isHidden); XCTAssertTrue(viewOnly.isEnabled)
     }

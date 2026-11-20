@@ -238,11 +238,18 @@ private final class NativeUSBDeviceServices {
 extension Process {
     /// Deadline for a directly owned child only; never terminates other sessions.
     /// Launch errors, timeout and signal exit remain distinct to each caller.
-    func run(timeout: TimeInterval) throws -> Bool {
+    func run(timeout: TimeInterval, onPoll: (() -> Void)? = nil) throws -> Bool {
         let finished = DispatchSemaphore(value: 0)
         terminationHandler = { _ in finished.signal() }
         try run()
-        if finished.wait(timeout: .now() + timeout) == .success { return true }
+        let deadline = DispatchTime.now() + timeout
+        if let onPoll {
+            while true {
+                if finished.wait(timeout: min(deadline, .now() + .milliseconds(100))) == .success { return true }
+                if DispatchTime.now() >= deadline { break }
+                onPoll()
+            }
+        } else if finished.wait(timeout: deadline) == .success { return true }
         if isRunning { terminate() }
         if finished.wait(timeout: .now() + 1) == .timedOut {
             if isRunning { kill(processIdentifier, SIGKILL) }

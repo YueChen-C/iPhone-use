@@ -327,8 +327,8 @@ final class ControlConnectionOverlay: NSView {
     }
 
     @objc private func onEnableUSBClicked() {
-        guard usbPresentation?.offersUSBSetup == true else { return }
-        if setup?.isWorking == true { onCancelUSBSetup?(); return }
+        if setup?.canCancel == true { onCancelUSBSetup?(); return }
+        guard usbPresentation?.offersUSBSetup == true, setup?.isWorking != true else { return }
         onEnableUSB?()
     }
 
@@ -458,7 +458,8 @@ final class ControlConnectionOverlay: NSView {
         let table = StringsUSBControl.current
         setAccessibilityLabel(table.title)
         icon.image = NSImage(systemSymbolName: "cable.connector", accessibilityDescription: nil)
-        isHidden = !presentation.showsOverlay
+        let showingSetup = presentation.hasScreen && (presentation.showsOverlay || setup == .complete || setup?.isWorking == true)
+        isHidden = !showingSetup
         if !presentation.showsOverlay || !presentation.hasScreen { setDismissed(false) }
         instructionsField?.isHidden = true
         helpField?.isHidden = false
@@ -475,20 +476,29 @@ final class ControlConnectionOverlay: NSView {
             helpField?.stringValue += "\n\n" + StringsUSBSetup.current.consent
         }
         let working = setup?.isWorking == true
-        setupButton.title = working ? StringsUSBSetup.current.cancel
-            : (setup == .prepared ? StringsUSBSetup.current.review : StringsUSBSetup.current.enable)
-        setupButton.isHidden = !presentation.offersUSBSetup
-        setupButton.isEnabled = true
-        setupProgress.isHidden = !working
+        let cancellable = setup?.canCancel == true
+        setupButton.title = cancellable ? StringsUSBSetup.current.cancel : StringsUSBSetup.current.enable
+        setupButton.isHidden = !cancellable && (!presentation.offersUSBSetup || working
+            || setup == .connectionFailed)
+        setupButton.isEnabled = cancellable || !working
+        setupProgress.isHidden = !showingSetup || (!working && setup != .complete)
         viewOnlyButton.isEnabled = !working
-        if let setup, presentation.offersUSBSetup {
-            helpField?.stringValue = StringsUSBSetup.current.progress(setup)
+        if let setup, showingSetup {
+            let progress = StringsUSBSetup.current.progress(setup)
+            if working || setup == .complete {
+                message.stringValue = progress
+                helpField?.isHidden = true
+            } else {
+                helpField?.stringValue = progress
+            }
             if setup == .failed || setup == .cancelled {
                 helpField?.stringValue += "\n\n" + StringsUSBSetup.current.consent
             }
             setupProgress.isIndeterminate = setup.fraction == nil
             setupProgress.doubleValue = setup.fraction ?? 0
-            if working { setupProgress.startAnimation(nil) } else { setupProgress.stopAnimation(nil) }
+            if working && setup.fraction == nil { setupProgress.startAnimation(nil) } else { setupProgress.stopAnimation(nil) }
+        } else {
+            setupProgress.stopAnimation(nil)
         }
         viewOnlyButton.title = table.viewOnly
         pillLabel.stringValue = table.pill

@@ -7,7 +7,8 @@ final class DDIInputAdmissionTests: XCTestCase {
         [], ["--desktop"], ["mcp"], ["--usb-touch-worker", "DEVICE"],
         ["--ax-server", "DEVICE", "7392"],
         ["--ax-tree", "DEVICE", "/OUTPUT", "0"],
-        ["--capture-identity-screenshot", "DEVICE", "/OUTPUT"], ["unknown-entry"]
+        ["--capture-identity-screenshot", "DEVICE", "/OUTPUT"],
+        [DDIFirstMount.argument, "DEVICE", "PRODUCT", "OS", "BUILD"], ["unknown-entry"]
     ]
 
     private func controlDirectory() throws -> URL {
@@ -53,6 +54,24 @@ final class DDIInputAdmissionTests: XCTestCase {
             withExtendedLifetime(owner) {}
         }
         _ = try DDIProcessLease.testLease(exclusive: true, directory: directory)
+    }
+
+    func testInstallationLocksOnlyTheSelectedUSBDevice() throws {
+        let directory = try controlDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let owner = try DDIProcessLease.testLease(exclusive: false, directory: directory)
+        let device = "00008101-0018242C3400001E"
+        let peer = "00008101-001854243410001E"
+        do {
+            let worker = try owner.deviceService(physicalID: device, exclusive: false)
+            XCTAssertThrowsError(try owner.deviceService(physicalID: device.lowercased(), exclusive: true))
+            withExtendedLifetime(worker) {}
+        }
+        let install = try owner.deviceService(physicalID: device, exclusive: true)
+        XCTAssertThrowsError(try owner.deviceService(physicalID: device, exclusive: false))
+        XCTAssertThrowsError(try owner.deviceService(physicalID: device, exclusive: true))
+        let peerWorker = try owner.deviceService(physicalID: peer, exclusive: false)
+        withExtendedLifetime((install, peerWorker)) {}
     }
 
     func testLocalManagementBypassesOnlySharedInputAdmissionNotItsOwnAuthorization() throws {

@@ -23,6 +23,123 @@ final class DDIManagementTests: XCTestCase {
     }
     override func tearDownWithError() throws { if let root { try FileManager.default.removeItem(at: root) } }
 
+    private var target: DDIFirstMount.Target {
+        .init(physicalID: "00008101-0018242C3400001E", productType: product,
+              productVersion: "26.5", productBuild: "FIXTURE-OS")
+    }
+
+    private func phone(_ images: [NativeDDIInspection.MountedImage] = [], build: String? = nil) -> NativeDDIInspection.Report {
+        .init(physicalID: target.physicalID, productType: product, productVersion: target.productVersion,
+              productBuild: build ?? target.productBuild, mountedImages: images,
+              frameworkVersion: NativeDDIInspection.frameworkVersion)
+    }
+
+    private var installedImage: NativeDDIInspection.MountedImage {
+        .init(mountPath: "/System/Developer", isMounted: true, imageType: "Personalized",
+              build: "FIXTURE1", version: "651.32", imageSignature: Data(SHA384.hash(data: image)).base64EncodedString())
+    }
+
+    private var oldImage: NativeDDIInspection.MountedImage {
+        .init(mountPath: "/System/Developer", isMounted: true, imageType: "Personalized",
+              build: "OLD", version: "397.24", imageSignature: nil)
+    }
+
+    func testFirstMountInstallsOnceAndVerifiesReadback() throws {
+        let prepared = try inspect()
+        var events: [String] = []
+        var images: [NativeDDIInspection.MountedImage] = []
+        let outcome = try DDIFirstMount.install(target: target, image: prepared, mount: { guardMount in
+            events.append("guard mount")
+            if try guardMount(phone(images)) { events.append("mount"); images = [installedImage] }
+        }, unmount: { _ in XCTFail("Empty slot must not be unmounted") }, inspect: {
+            events.append("inspect")
+            return phone(images)
+        }, progress: { events.append($0.rawValue) })
+        XCTAssertEqual(outcome, .installed)
+        XCTAssertEqual(events, ["inspect", "guard mount", "installing", "mount", "verifyingInstallation", "inspect"])
+    }
+
+    func testFirstMountReplacesDifferentImageThenVerifiesReadback() throws {
+        let prepared = try inspect()
+        var events: [String] = []
+        var images = [oldImage]
+        let outcome = try DDIFirstMount.install(target: target, image: prepared, mount: { guardMount in
+            events.append("guard mount")
+            if try guardMount(phone(images)) { events.append("mount"); images = [installedImage] }
+        }, unmount: { guardUnmount in
+            events.append("guard unmount")
+            try guardUnmount(phone(images)); events.append("unmount"); images = []
+        }, inspect: {
+            events.append("inspect")
+            return phone(images)
+        }, progress: { events.append($0.rawValue) })
+        XCTAssertEqual(outcome, .replaced)
+        XCTAssertEqual(events, ["inspect", "guard unmount", "uninstalling", "unmount", "inspect", "guard mount",
+                                "installing", "mount", "verifyingInstallation", "inspect"])
+    }
+
+    func testFirstMountReusesExactMatchAndLeavesAmbiguousImagesInPlace() throws {
+        let prepared = try inspect()
+        let result = try DDIFirstMount.install(target: target, image: prepared,
+            mount: { _ in XCTFail("Exact match must be reused") }, unmount: { _ in XCTFail("Exact match must be reused") },
+            inspect: { phone([installedImage]) })
+        XCTAssertEqual(result, .alreadyInstalled)
+        let unidentified = NativeDDIInspection.MountedImage(mountPath: "/System/Developer", isMounted: true,
+            imageType: "Personalized", build: installedImage.build, version: installedImage.version, imageSignature: nil)
+        for images in [[unidentified], [installedImage, oldImage]] {
+            XCTAssertThrowsError(try DDIFirstMount.install(target: target, image: prepared,
+                mount: { _ in XCTFail("Ambiguous slot must not be overwritten") },
+                unmount: { _ in XCTFail("Ambiguous slot must not be unmounted") }, inspect: { phone(images) }))
+        }
+    }
+
+    func testFirstMountSkipsMutationIfDeviceOrSlotChanges() throws {
+        let prepared = try inspect()
+        for changed in [phone([oldImage], build: "ANOTHER-OS"), phone([installedImage])] {
+            XCTAssertThrowsError(try DDIFirstMount.install(target: target, image: prepared,
+                mount: { _ in XCTFail("Mount must not be attempted") }, unmount: { guardUnmount in
+                    try guardUnmount(changed)
+                    XCTFail("Unmount guard must reject a changed device or slot")
+                }, inspect: { phone([oldImage]) }))
+        }
+        XCTAssertThrowsError(try DDIFirstMount.install(target: target, image: prepared, mount: { guardMount in
+            _ = try guardMount(phone([oldImage]))
+            XCTFail("Mount guard must reject an occupied slot")
+        }, unmount: { _ in XCTFail("Initially empty slot must not be unmounted") }, inspect: { phone() }))
+    }
+
+    func testFirstMountDoesNotInstallWhenUninstallIsUnconfirmed() throws {
+        let prepared = try inspect()
+        var unmounts = 0
+        XCTAssertThrowsError(try DDIFirstMount.install(target: target, image: prepared,
+            mount: { _ in XCTFail("Unconfirmed unmount must not be followed by installation") }, unmount: { guardUnmount in
+                try guardUnmount(phone([oldImage])); unmounts += 1
+            }, inspect: { phone([oldImage]) }))
+        XCTAssertEqual(unmounts, 1)
+    }
+
+    func testFirstMountRejectsWrongSignatureAfterOneMountAttempt() throws {
+        let prepared = try inspect()
+        var mounts = 0
+        var images: [NativeDDIInspection.MountedImage] = []
+        let unverified = NativeDDIInspection.MountedImage(mountPath: "/System/Developer", isMounted: true,
+            imageType: "Personalized", build: installedImage.build, version: installedImage.version,
+            imageSignature: Data(repeating: 0, count: 48).base64EncodedString())
+        XCTAssertThrowsError(try DDIFirstMount.install(target: target, image: prepared, mount: { guardMount in
+            if try guardMount(phone(images)) { mounts += 1; images = [unverified] }
+        }, unmount: { _ in XCTFail("Empty slot must not be unmounted") }, inspect: { phone(images) }))
+        XCTAssertEqual(mounts, 1)
+    }
+
+    func testNativeChildDeliversCompleteProgressLinesOnceAndKeepsReply() throws {
+        var lines: [String] = []
+        let script = "printf 'uninstall'; /bin/sleep 0.15; printf 'ing\\n'; /bin/sleep 0.15; printf 'installing\\nreply\\n'"
+        let data = try DDINativeProcess.run(executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", script], timeout: 3, observeLine: { lines.append($0) })
+        XCTAssertEqual(lines, ["uninstalling", "installing", "reply"])
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), "uninstalling\ninstalling\nreply\n")
+    }
+
     private func hex<S: Sequence>(_ value: S) -> String where S.Element == UInt8 {
         value.map { String(format: "%02x", $0) }.joined()
     }

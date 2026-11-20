@@ -1,7 +1,7 @@
 # Native DDI management (experimental)
 
-DDI lifecycle management is separate from touch. Neither input preparation nor
-HTTP/MCP touch requests invoke this CLI. The app does not bundle Apple images,
+DDI lifecycle management is separate from touch. Neither background input
+preparation nor HTTP/MCP touch requests invoke the installer or offline CLI. The app does not bundle Apple images,
 run Python, or invoke a third-party mounting tool.
 
 ## USB setup from the phone overlay
@@ -11,32 +11,37 @@ DDI or typed unavailable HID-service/surface state offers **Enable USB control�
 An unavailable service alone does not diagnose a DDI problem. Trust, identity,
 host, display and other failures retain their separate instructions.
 
-The text beside the button explains the approximately 18 MB download,
-free-space/network requirements and possible replacement of the developer image.
-Clicking starts preparation immediately, without a confirmation sheet or save
-dialog. Downloads live in `~/Library/Caches/iPhoneUse/DDI/`; a cached revision is
-reused only after checking its embedded pins and product-specific preflight.
-Invalid entries are replaced without touching unrelated cache files. It does not
-upgrade iOS or automatically change Developer Mode.
-The existing overlay shows device inspection, transferred bytes/percentage,
-verification, cancellation, failure and **downloaded, not installed** completion.
-Source routing is intentionally not exposed in these user-facing messages.
+Clicking **Enable USB control…** runs setup in the same card: inspect → download
+(bytes and percentage) → verify → uninstall an older/different DDI if needed →
+install → verify the mounted image → verify USB control. Cached images skip the
+download. Device operations show activity without a fabricated percentage.
+USB control is reported ready
+only when the input session is independently ready; input is never replayed.
+No confirmation sheet or Plan & Review window opens.
 
-Native URLSession first tries the pinned Gitee `DDI-27B52` release attachment,
-then the exact upstream GitHub revision's raw payload files if necessary. Both
-paths verify independent embedded SHA256 pins and perform product-specific DDI
-preflight. Raw fallback uses local companion version metadata. No credentials
-are required. The release tag must not be resolved to a repository source ZIP.
-Cancellation, closing/disconnecting the window or explicit backend changes
-invalidate callbacks and never start a fallback, mount or input replay.
+The isolated installer binds the exact trusted physical USB device, rechecks
+its product and OS build, validates the app-pinned cache and verifies the
+mounted image by build/version/signature. An exact match is reused. A single
+identifiable, different personalized image is unmounted after candidate preflight;
+its removal must be confirmed independently before the pinned image is mounted.
+Ambiguous images are left in place. Same-device USB workers and the installation
+child cannot overlap; other devices keep their own sessions. Offline replacement
+and recovery with explicitly staged bundles remain separate.
 
-**Continue installation setup…** pre-fills the existing Plan & Review window's
-exact device, candidate and receipt. It does not install automatically: supply
-the actual current-image baseline, review a plan, cleanly stop all input owners,
-and separately confirm offline installation. This release does not yet provide
-one-click installation or automatically back up an unknown mounted image.
-Download success is not device compatibility, authenticated Apple provenance,
-permission to redistribute images, or proof that USB control is ready.
+The installer does not upgrade iOS, erase user data or enable Developer Mode.
+Keep the device connected, with internet access and about 60 MB of free space
+on the Mac. The card allows cancellation during download and cache preparation.
+Once the native installer starts it is not forcibly interrupted by switching views
+or backends; stale callbacks do not reselect USB. A failure after unmount can
+leave the slot empty. No device operation is automatically retried and no old
+image is automatically restored. An explicit setup retry reads the current
+state again before doing any device work.
+
+Downloads live in `~/Library/Caches/iPhoneUse/DDI/`. Native URLSession tries the
+pinned Gitee `DDI-27B52` release attachment, then the exact upstream GitHub
+revision's raw payload files if necessary. Both paths verify independent
+embedded SHA256 pins and perform product-specific DDI preflight. A verified
+download does not authenticate Apple provenance or grant distribution rights.
 
 ## Desktop plan and review
 
@@ -183,7 +188,7 @@ worker, MCP forwarding, AX listener/worker and capture-identity screenshot helpe
 The lease is retained for that process's lifetime. This closes the admission race
 where a new helper could start after the legacy-process scan. The fixed private
 per-user control directory is not configurable through MCP/environment state paths.
-Mutation requires an exclusive lease and also refuses
+Offline replacement/restore requires an exclusive lease and also refuses
 any other running `iphone-use` process, covering older binaries that do not take
 the lease. This is intentionally conservative: idle legacy MCP/AX processes block
 mutation as well. It is not a claim that arbitrary old binaries participate in

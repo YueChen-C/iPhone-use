@@ -299,8 +299,10 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     private var languageObserver: NSObjectProtocol?
     private var setupDownload: DDIDownload?
     private var setupGeneration = UUID()
-    private var preparedDDI: DDIDownload.Prepared?
-    private var ddiReview: DDIReviewWindowController?
+    private var installingDDI = false
+    private var awaitingUSBReadiness = false
+    private var lastUSBPresentation: ControlUSBPresentation?
+    private var setupConnectionRequest: USBBackendSelectionRequest?
     var onPresentationChanged: (() -> Void)?
     private(set) var availableShortcuts: Set<ControlShortcut> = []
     private(set) var inputStatus = StringsWorkbench.current.waitingInput
@@ -347,7 +349,11 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
             self.content.showBackendSelectionFailure(message)
         }
         content.onEnableUSB = { [weak self] in self?.beginUSBSetup() }
-        content.onCancelUSBSetup = { [weak self] in self?.cancelUSBSetup() }
+        content.onCancelUSBSetup = { [weak self] in
+            guard let self, self.setupDownload != nil else { return }
+            self.cancelUSBSetup()
+            self.content.updateUSBSetup(.cancelled)
+        }
         content.connectionOverlay.onRetryUSB = { [weak self] finished in
             guard let self, self.lastKnownDevice != nil, self.controlView.selectedBackend == .usb else {
                 finished(); return
@@ -367,8 +373,14 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
             content?.updateConnectionState(status)
         }
         controlView.onUSBPresentationChanged = { [weak self] presentation in
-            if presentation?.offersUSBSetup != true { self?.cancelUSBSetup() }
-            self?.content.updateUSBPresentation(presentation)
+            guard let self else { return }
+            self.lastUSBPresentation = presentation
+            self.content.updateUSBPresentation(presentation)
+            if presentation?.hasScreen != true || (self.setupDownload != nil && presentation?.offersUSBSetup != true) {
+                self.cancelUSBSetup()
+            } else {
+                self.finishUSBPreparationIfKnown()
+            }
         }
         controlView.onLockStateChanged = { [weak content] state in
             content?.updateLockState(state)
@@ -427,60 +439,113 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
 
     private func cancelUSBSetup() {
         setupGeneration = UUID()
-        guard setupDownload != nil else { return }
         setupDownload?.cancel(); setupDownload = nil
-        content.updateUSBSetup(.cancelled)
-    }
-
-    private func reviewPreparedDDI(_ prepared: DDIDownload.Prepared, physicalID: String) {
-        if ddiReview == nil { ddiReview = DDIReviewWindowController(language: AppLanguageStore.shared.language) }
-        ddiReview?.useDownloadedCandidate(prepared, physicalID: physicalID)
-        ddiReview?.showWindow(nil); ddiReview?.window?.makeKeyAndOrderFront(nil)
+        awaitingUSBReadiness = false
+        setupConnectionRequest?.cancel(); setupConnectionRequest = nil
+        content.updateUSBSetup(nil)
     }
 
     private func beginUSBSetup() {
-        guard setupDownload == nil, let device = lastKnownDevice, device.id == deviceID,
-              controlView.selectedBackend == .usb,
-              ControlUSBPresentation(snapshot: USBInputController.shared.status(device), inputReady: false,
-                                     hasScreen: true).offersUSBSetup else { return }
-        if let preparedDDI { reviewPreparedDDI(preparedDDI, physicalID: device.id); return }
+        guard setupDownload == nil, !installingDDI, !awaitingUSBReadiness,
+              let device = lastKnownDevice, device.id == deviceID, controlView.selectedBackend == .usb,
+              lastUSBPresentation?.offersUSBSetup == true,
+              ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen),
+              let executable = Bundle.main.executableURL else { return }
         let generation = UUID(); setupGeneration = generation
-        downloadDDI(for: device, generation: generation)
-    }
-
-    private func downloadDDI(for device: Device, generation: UUID) {
-        guard let executable = Bundle.main.executableURL else { return }
         let download = DDIDownload(); setupDownload = download
         content.updateUSBSetup(.inspecting)
         let update: (USBSetupPresentation) -> Void = { [weak self] state in
             DispatchQueue.main.async {
-                guard let self, self.setupGeneration == generation else { return }
+                guard let self, self.setupGeneration == generation, self.setupDownload === download else { return }
                 self.content.updateUSBSetup(state)
             }
         }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let outcome = Result { () throws -> DDIDownload.Prepared in
+            let outcome = Result { () throws -> DDIFirstMount.Target in
                 let inspected = try DDIReviewClient(executable: executable).run(.inspect(device.id))
-                guard let object = try JSONSerialization.jsonObject(with: Data(inspected.json.utf8)) as? [String: Any],
-                      let product = object["productType"] as? String else {
-                    throw DDIManagementError("Device inspection did not return a product type")
-                }
-                return try download.prepareCached(productType: product, progress: update)
+                let target = try JSONDecoder().decode(DDIFirstMount.Target.self, from: Data(inspected.json.utf8))
+                try USBBackendCompatibility.validate(version: target.productVersion)
+                _ = try download.prepareCached(productType: target.productType, progress: update)
+                return target
             }
             DispatchQueue.main.async {
                 guard let self, self.setupGeneration == generation else { return }
                 self.setupDownload = nil
-                guard self.lastKnownDevice?.screen === device.screen, self.controlView.selectedBackend == .usb else { return }
+                guard self.isCurrentUSBSetup(device) else { self.cancelUSBSetup(); return }
                 switch outcome {
-                case .success(let prepared):
-                    self.preparedDDI = prepared
-                    self.content.updateUSBSetup(.prepared)
+                case .success(let target): self.installDDI(target, executable: executable, device: device, generation: generation)
                 case .failure(let error):
-                    // Do not show server URLs, device identifiers or technical
-                    // source/fallback details in the user-facing progress text.
                     log("DDI preparation failed: \(error)")
                     self.content.updateUSBSetup(error is CancellationError ? .cancelled : .failed)
                 }
+            }
+        }
+    }
+
+    private func isCurrentUSBSetup(_ device: Device) -> Bool {
+        lastKnownDevice?.screen === device.screen && controlView.selectedBackend == .usb
+            && ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen)
+    }
+
+    private func installDDI(_ target: DDIFirstMount.Target, executable: URL, device: Device, generation: UUID) {
+        installingDDI = true
+        content.updateUSBSetup(.checkingImage)
+        let update: (DDIFirstMount.Stage) -> Void = { [weak self] stage in
+            DispatchQueue.main.async {
+                guard let self, self.setupGeneration == generation, self.installingDDI else { return }
+                switch stage {
+                case .uninstalling: self.content.updateUSBSetup(.uninstalling)
+                case .installing: self.content.updateUSBSetup(.installing)
+                case .verifyingInstallation: self.content.updateUSBSetup(.verifyingInstallation)
+                }
+            }
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let outcome = Result { try DDIFirstMount.install(executable: executable, target: target, progress: update) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.installingDDI = false
+                guard self.setupGeneration == generation else { return }
+                guard self.isCurrentUSBSetup(device) else { self.cancelUSBSetup(); return }
+                switch outcome {
+                case .success:
+                    self.content.updateUSBSetup(.connecting)
+                    let request = USBBackendSelectionRequest()
+                    self.setupConnectionRequest = request
+                    self.controlView.selectBackend(.usb, request: request) { [weak self] in
+                        guard let self, self.setupGeneration == generation, !request.isCancelled else { return }
+                        self.setupConnectionRequest = nil
+                        self.awaitingUSBReadiness = true
+                        self.finishUSBPreparationIfKnown()
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 50) { [weak self] in
+                        guard let self, self.setupGeneration == generation else { return }
+                        self.setupGeneration = UUID()
+                        self.awaitingUSBReadiness = false
+                        self.setupConnectionRequest?.cancel(); self.setupConnectionRequest = nil
+                        // A terminal result invalidates this timer immediately.
+                        self.content.updateUSBSetup(.connectionFailed)
+                    }
+                case .failure(let error):
+                    log("DDI installation failed: \(error)")
+                    self.content.updateUSBSetup(.installFailed)
+                }
+            }
+        }
+    }
+
+    private func finishUSBPreparationIfKnown() {
+        guard awaitingUSBReadiness, let presentation = lastUSBPresentation,
+              [.ready, .failed, .disconnected, .unsupportedHost, .unsupportedDevice,
+               .requiresTrust, .requiresDeveloperMode].contains(presentation.state) else { return }
+        awaitingUSBReadiness = false
+        let finished = UUID(); setupGeneration = finished
+        let ready = presentation.state == .ready
+        content.updateUSBSetup(ready ? .complete : .connectionFailed)
+        if ready {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, self.setupGeneration == finished else { return }
+                self.content.updateUSBSetup(nil)
             }
         }
     }
@@ -526,7 +591,7 @@ private final class ControlWindowContent: NSView {
         get { connectionOverlay.onCancelUSBSetup }
         set { connectionOverlay.onCancelUSBSetup = newValue }
     }
-    func updateUSBSetup(_ state: USBSetupPresentation) { connectionOverlay.updateSetup(state) }
+    func updateUSBSetup(_ state: USBSetupPresentation?) { connectionOverlay.updateSetup(state) }
 
     func showBackendSelectionFailure(_ message: String?) {
         phoneView.isBackendNoticeVisible = message != nil

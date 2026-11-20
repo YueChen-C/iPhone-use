@@ -99,13 +99,20 @@ final class DDIReviewClient {
     /// Call off the AppKit queue. A child deadline cannot terminate the GUI.
     /// stdout/stderr use private files to avoid pipe deadlock on large reports.
     func run(_ request: DDIReviewRequest) throws -> DDIReviewResult {
-        let arguments = try request.arguments()
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("iphone-use-ddi-review-" + UUID().uuidString)
+        let data = try DDINativeProcess.run(executable: executable, arguments: request.arguments(), timeout: request.timeout)
+        return try DDIReviewResult(data: data, request: request, executable: executable)
+    }
+}
+
+enum DDINativeProcess {
+    static func run(executable: URL, arguments: [String], timeout: TimeInterval,
+                    observeLine: ((String) -> Void)? = nil) throws -> Data {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("iphone-use-ddi-child-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: root) }
         func output(_ name: String) throws -> FileHandle {
             let fd = open(root.appendingPathComponent(name).path, O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
-            guard fd >= 0 else { throw DDIManagementError("Cannot create private DDI review output") }
+            guard fd >= 0 else { throw DDIManagementError("Cannot create private DDI child output") }
             return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         }
         let stdout = try output("stdout"), stderr = try output("stderr")
@@ -113,19 +120,34 @@ final class DDIReviewClient {
         let process = Process()
         process.executableURL = executable; process.arguments = arguments
         process.standardInput = FileHandle.nullDevice; process.standardOutput = stdout; process.standardError = stderr
-        guard try process.run(timeout: request.timeout) else {
-            throw DDIManagementError("Native DDI review timed out; no automatic retry. Inspect the local transaction before continuing")
+        var offset = 0
+        let poll: (() -> Void)? = observeLine.map { observe in
+            {
+                // The child shares the file offset. Only pread while it is running;
+                // do not consume a partial line or poll beyond this small prefix.
+                guard offset < 4096 else { return }
+                var buffer = [UInt8](repeating: 0, count: 4096 - offset)
+                let count = buffer.withUnsafeMutableBytes { pread(stdout.fileDescriptor, $0.baseAddress, $0.count, off_t(offset)) }
+                guard count > 0, let lastLine = buffer[..<count].lastIndex(of: 10) else { return }
+                for line in buffer[...lastLine].split(separator: 10) { observe(String(decoding: line, as: UTF8.self)) }
+                offset += lastLine + 1
+            }
+        }
+        let completed = try process.run(timeout: timeout, onPoll: poll)
+        poll?()
+        guard completed else {
+            throw DDIManagementError("Native DDI operation timed out; no automatic retry")
         }
         func read(_ handle: FileHandle, limit: Int) throws -> Data {
             try handle.seek(toOffset: 0)
             let bytes = try handle.read(upToCount: limit + 1) ?? Data()
-            guard bytes.count <= limit else { throw DDIManagementError("Native DDI review output exceeds limit") }
+            guard bytes.count <= limit else { throw DDIManagementError("Native DDI operation output exceeds limit") }
             return bytes
         }
         let data = try read(stdout, limit: 1024 * 1024), diagnostic = try read(stderr, limit: 256 * 1024)
         guard process.terminationReason == .exit, process.terminationStatus == 0 else {
-            throw DDIManagementError("Native DDI review failed (\(process.terminationStatus)): \(String(decoding: diagnostic, as: UTF8.self))")
+            throw DDIManagementError("Native DDI operation failed (\(process.terminationStatus)): \(String(decoding: diagnostic, as: UTF8.self))")
         }
-        return try DDIReviewResult(data: data, request: request, executable: executable)
+        return data
     }
 }

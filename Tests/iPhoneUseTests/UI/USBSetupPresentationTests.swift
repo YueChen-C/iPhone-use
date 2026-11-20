@@ -3,18 +3,25 @@ import XCTest
 
 final class USBSetupPresentationTests: XCTestCase {
     private let states: [USBSetupPresentation] = [.inspecting, .downloading(5, 10), .retrying, .verifying,
-                                                 .prepared, .cancelled, .failed]
+                                                 .checkingImage, .uninstalling, .installing, .verifyingInstallation,
+                                                 .connecting, .complete, .cancelled, .failed, .installFailed, .connectionFailed]
     func testWorkingStatesAndClampedOrUnknownProgress() {
-        XCTAssertEqual(states.map(\.isWorking), [true, true, true, true, false, false, false])
+        XCTAssertEqual(states.filter(\.isWorking), Array(states.prefix(9)))
+        XCTAssertEqual(states.filter(\.canCancel), Array(states.prefix(4)))
         XCTAssertEqual(USBSetupPresentation.downloading(5, 10).fraction, 0.5)
         XCTAssertEqual(USBSetupPresentation.downloading(-1, 10).fraction, 0)
         XCTAssertEqual(USBSetupPresentation.downloading(20, 10).fraction, 1)
         XCTAssertNil(USBSetupPresentation.downloading(0, -1).fraction)
         XCTAssertNil(USBSetupPresentation.verifying.fraction)
+        XCTAssertNil(USBSetupPresentation.uninstalling.fraction)
+        XCTAssertNil(USBSetupPresentation.installing.fraction)
+        XCTAssertNil(USBSetupPresentation.verifyingInstallation.fraction)
+        XCTAssertNil(USBSetupPresentation.connecting.fraction)
+        XCTAssertEqual(USBSetupPresentation.complete.fraction, 1)
     }
     func testBothLanguagesHideSourceRoutingAndExplainInstallationBoundary() {
         for table in [StringsUSBSetup.zh, .en] {
-            let values = [table.enable, table.consent, table.cancel, table.review]
+            let values = [table.enable, table.consent, table.cancel]
                 + states.map(table.progress)
             for text in values {
                 XCTAssertFalse(text.isEmpty)
@@ -29,7 +36,9 @@ final class USBSetupPresentationTests: XCTestCase {
         XCTAssertTrue(StringsUSBSetup.en.consent.contains("does not upgrade iOS"))
         XCTAssertTrue(StringsUSBSetup.zh.consent.contains("应用缓存"))
         XCTAssertTrue(StringsUSBSetup.en.consent.contains("app cache"))
-        XCTAssertTrue(StringsUSBSetup.zh.progress(.prepared).contains("尚未安装"))
-        XCTAssertTrue(StringsUSBSetup.en.progress(.prepared).contains("not installed"))
+        XCTAssertTrue(StringsUSBSetup.zh.progress(.uninstalling).contains("正在卸载"))
+        XCTAssertTrue(StringsUSBSetup.en.progress(.uninstalling).contains("Uninstalling"))
+        XCTAssertTrue(StringsUSBSetup.zh.progress(.installing).contains("正在安装"))
+        XCTAssertTrue(StringsUSBSetup.en.progress(.installing).contains("Installing"))
     }
 }
