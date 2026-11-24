@@ -215,9 +215,15 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     private var sources: [String: ScreenCaptureSource] = [:]
     private var screens: [String: ScreenCaptureSession] = [:]
     private var verifiedScreenIDs: Set<String> = []
-    // Learned only from independent physical-to-video verification. Hardware
-    // dimensions survive a peer disconnect, but not manager shutdown.
+    // Frame size can invalidate a route, never establish one.
     private var confirmedSizes: [String: CGSize] = [:]
+    private var usbTopology: USBValeriaConfigurator.IOSUSBTopologyObservation?
+    private var usbEntries: [String: UInt64] = [:]
+    private var sourceUSBEntries: [String: UInt64] = [:]
+    private var discoveryMissingSourceIDs: Set<String> = []
+    private var provenRoutes: [String: CaptureScreenMapping.USBRoute] = [:]
+    private var nextRefreshRevision: UInt64 = 0
+    private var appliedRefreshRevision: UInt64 = 0
     private var refreshTimer: Timer?
     private var loggedNoScreens = false
     private var emptyRefreshCount = 0
@@ -225,6 +231,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     private let identityQueue = DispatchQueue(label: "iphone-use.capture-identity", qos: .utility)
     private let shutdownQueue = DispatchQueue(label: "iphone-use.capture-shutdown", qos: .userInitiated)
     private var identityGeneration: UInt64 = 0
+    private var identityCheckSchedule = CaptureIdentityCheckSchedule()
     private var verificationState: ScreenCaptureIdentityState = .singleDevice
     // Once muxing has been observed, even the surviving single nominal source
     // may carry another phone's pixels during unplug/replug discovery.
@@ -410,6 +417,12 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             screens.removeAll()
             verifiedScreenIDs.removeAll()
             confirmedSizes.removeAll()
+            usbTopology = nil
+            usbEntries.removeAll()
+            sourceUSBEntries.removeAll()
+            discoveryMissingSourceIDs.removeAll()
+            provenRoutes.removeAll()
+            sourceRecovery = CaptureSourceRecovery()
             _ = valeriaRecovery.reset()
             identityGeneration &+= 1
             return (currentObservers, currentSources)
@@ -430,8 +443,9 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
             mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
         var allow: UInt32 = 1
-        CMIOObjectSetPropertyData(
+        let status = CMIOObjectSetPropertyData(
             CMIOObjectID(kCMIOObjectSystemObject), &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &allow)
+        log("allow screen capture devices status=0x\(String(status, radix: 16))")
     }
 
     private func observeDeviceChanges() {
@@ -471,6 +485,10 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
 
     var identityState: ScreenCaptureIdentityState { lock.withLock { verificationState } }
 
+    var observedUSBTopology: USBValeriaConfigurator.IOSUSBTopologyObservation {
+        lock.withLock { usbTopology ?? .unavailable }
+    }
+
     var permitsPointerAssociation: Bool {
         lock.withLock { screens.values.contains { $0.displayIdentityConfirmed } }
     }
@@ -509,7 +527,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             else { return nil }
             identityGeneration &+= 1
             verificationState = .pending
-            rebuildScreens(mapping: [:], verified: false)
+            rebuildScreens(mapping: [:])
             return (identityGeneration, sources)
         }
         guard let job else { return }
@@ -518,23 +536,49 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
     }
 
     private func refresh() {
-        let generation = lock.withLock { isStopped ? nil : lifecycleGeneration }
-        guard let generation else { return }
+        let request: (lifecycle: UInt64, revision: UInt64, confirmedEntries: [String: UInt64])? = lock.withLock {
+            guard !isStopped else { return nil }
+            nextRefreshRevision &+= 1
+            // Keep the nominal-source USB binding in the refresh query too.
+            // A stream can be unlisted by CoreMediaIO before identity has been
+            // proven, so `provenRoutes` alone is empty exactly when we need to
+            // verify that the physical USB device is still attached.
+            let entries = provenRoutes.mapValues(\.entryID).merging(sourceUSBEntries) {
+                _, retained in retained
+            }
+            return (lifecycleGeneration, nextRefreshRevision, entries)
+        }
+        guard let request else { return }
         let devices = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.external], mediaType: .muxed, position: .unspecified
-        ).devices.filter { $0.modelID.contains("iOS") && $0.isConnected }
+        ).devices
+            .filter { $0.modelID.contains("iOS") && $0.isConnected }
+            .sorted { $0.uniqueID < $1.uniqueID }
         let discoveredIDs = devices.map(\.uniqueID)
         let present = Set(discoveredIDs)
-        // Query IOKit single-device USB identity strictly OUTSIDE `lock` so
-        // `manager.lock -> USBValeriaConfigurator.queue` cycles are impossible.
+        // Read the registry outside the manager lock and never open USB interfaces here.
+        let topology = USBValeriaConfigurator.readIOSUSBTopology()
+        let observed: USBValeriaConfigurator.ConnectedIOSUSBTopology?
+        if case .observed(let current) = topology { observed = current } else { observed = nil }
+        let currentEntries = CaptureScreenMapping.refreshUSBEntries(
+            discoveredIDs: present, devices: observed?.devices, confirmedEntries: request.confirmedEntries,
+            readEntry: USBValeriaConfigurator.readIOSUSBEntry)
+        if present.isEmpty || present.count != request.confirmedEntries.count {
+            log(
+                "capture refresh discovery=\(discoveredIDs.sorted()) usbEntries=\(currentEntries) previousEntries=\(request.confirmedEntries)"
+            )
+        }
         let prequeriedPin = CaptureDiscoveryPinResolver.prequerySingleDevicePin(
             discoveredIDs: discoveredIDs,
             needsNewSourceForID: { id in
-                lock.withLock { !isStopped && sources[id] == nil }
+                lock.withLock {
+                    guard !isStopped else { return false }
+                    if sources[id] == nil { return true }
+                    guard let previous = sourceUSBEntries[id], let current = currentEntries[id] else { return false }
+                    return previous != current
+                }
             },
-            querySingleIOSDevice: {
-                USBValeriaConfigurator.currentSingleIOSDeviceIdentity()
-            })
+            querySingleIOSDevice: { observed?.singleDevice })
 
         var changed = false
         var shouldReallowCaptureDevices = false
@@ -546,25 +590,95 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         var refreshLifecycle: UInt64 = 0
         var job: (UInt64, [String: ScreenCaptureSource])?
         let didRun = lock.withLock { () -> Bool in
-            guard !isStopped, lifecycleGeneration == generation else { return false }
+            guard !isStopped, lifecycleGeneration == request.lifecycle,
+                request.revision > appliedRefreshRevision
+            else { return false }
+            appliedRefreshRevision = request.revision
             refreshLifecycle = lifecycleGeneration
-            // Source IDs alone are not physical identity. Keep only routes
-            // whose independently learned dimensions remain unambiguous.
-            if Set(sources.keys) != present {
-                let stable = stableMappings(physicalIDs: present)
+            let topologyChanged = usbTopology != topology || usbEntries != currentEntries
+            usbTopology = topology
+            let replacedAttachments = Set(sourceUSBEntries.compactMap { id, previous in
+                currentEntries[id].flatMap { $0 == previous ? nil : id }
+            })
+            usbEntries = currentEntries
+            // Registry attachment remains authoritative while CoreMediaIO's
+            // discovery list is transiently empty. This lets the existing
+            // source recover without treating the gap as a detach.
+            for (id, source) in sources {
+                source.setRegistryAttached(currentEntries[id] != nil)
+            }
+            let currentRoutes = currentUSBRoutes()
+            let before = provenRoutes.count
+            // AVFoundation's iOS capture UID carries the same serial that the
+            // USB registry exposes for these devices. When the serial-to-entry
+            // match is unique, USB itself is the identity proof: do not wait
+            // for a screenshot comparison before publishing the native frame.
+            // Opaque UIDs still fall through to the existing screenshot
+            // verifier, and pointer association remains gated by the route.
+            for (physicalID, route) in currentRoutes {
+                guard currentEntries[physicalID] == route.entryID,
+                    let size = sources[physicalID]?.size
+                else { continue }
+                provenRoutes[physicalID] = route
+                confirmedSizes[physicalID] = size
+            }
+            provenRoutes = provenRoutes.filter {
+                currentRoutes[$0.key] == $0.value && sources[$0.key]?.size == confirmedSizes[$0.key]
+            }
+            let stable = stableMappings()
+            // CoreMediaIO can briefly return an empty AVFoundation discovery
+            // snapshot while the assistant is restarting a stream. That is not
+            // a USB detach: keep the existing source when its exact registry
+            // entry is still present, so recovery can continue on the same
+            // session instead of deleting the screen and reporting a false
+            // "no iPhone" state.
+            let transientlyMissingSourceIDs = sources.compactMap { id, _ -> String? in
+                guard let previousEntry = sourceUSBEntries[id],
+                    currentEntries[id] == previousEntry
+                else { return nil }
+                return id
+            }
+            for (id, _) in sources where !present.contains(id) && currentEntries[id] != nil {
+                discoveryMissingSourceIDs.insert(id)
+            }
+            let reappearedFramelessSourceIDs: Set<String> = Set(sources.compactMap { id, source in
+                guard present.contains(id), discoveryMissingSourceIDs.contains(id), !source.hasFrame else {
+                    return nil
+                }
+                return id
+            })
+            discoveryMissingSourceIDs.subtract(present)
+            let activeIDs = present.union(stable.keys).union(transientlyMissingSourceIDs)
+            if activeIDs.count != sources.count || present.isEmpty {
+                log(
+                    "capture refresh active=\(activeIDs.sorted()) sources=\(sources.keys.sorted()) retainedMissing=\(transientlyMissingSourceIDs.sorted())"
+                )
+            }
+            let multiDevice = activeIDs.count > 1 || (observed?.attachedEntryIDs.count ?? 0) > 1
+            changed = topologyChanged || before != provenRoutes.count || (multiDevice && !requiresDisplayVerification)
+            if changed || Set(sources.keys) != activeIDs {
                 for screen in screens.values {
-                    screen.setDisplayIdentityConfirmed(
-                        stable[screen.id] == screen.sourceID && present.contains(screen.sourceID))
+                    screen.setDisplayIdentityConfirmed(stable[screen.id] == screen.sourceID)
                 }
             }
             var newlyClaimedSwitches: [CaptureValeriaRecoveryTracker.ScheduledPostSwitchCheck] = []
-            for (id, source) in sources where !present.contains(id) {
+            for (id, source) in sources
+            where !activeIDs.contains(id) || replacedAttachments.contains(id) || reappearedFramelessSourceIDs.contains(id)
+            {
                 source.stop()
                 sources[id] = nil
+                sourceUSBEntries[id] = nil
+                discoveryMissingSourceIDs.remove(id)
                 changed = true
                 log("screen gone: \(source.name)")
             }
+            // CoreMediaIO's iOS screen-capture assistant is process-wide. Do
+            // not create two AVCaptureSession inputs in the same discovery
+            // pass: let the first source settle (first frame or a concrete
+            // runtime error) before admitting its peer on the next refresh.
+            var mayCreateAnotherSource = sources.isEmpty || sources.values.allSatisfy(\.startupSettled)
             for device in devices where sources[device.uniqueID] == nil {
+                guard mayCreateAnotherSource else { break }
                 let pinnedUSBDevice: USBValeriaConfigurator.PinnedUSBDevice? =
                     if present.count == 1,
                         let prequeriedPin,
@@ -578,7 +692,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
                     let newSource = try ScreenCaptureSource(
                         device: device,
                         pinnedUSBDevice: pinnedUSBDevice,
-                        onFirstFrame: { [weak self] in self?.onScreensChanged?() },
+                        onFirstFrame: { [weak self] source in self?.captureFirstFrame(from: source) },
                         onNeedsValeriaRecovery: { [weak self] source, restartAfter in
                             self?.recoverValeriaIfNeeded(for: source, restartSource: restartAfter)
                         })
@@ -598,9 +712,16 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
                     }
                     changed = true
                     log("capturing \(device.localizedName) (\(device.uniqueID))")
+                    mayCreateAnotherSource = false
                 } catch {
                     log("capture failed for \(device.localizedName): \(error)")
                 }
+            }
+            for id in sources.keys where sourceUSBEntries[id] == nil {
+                sourceUSBEntries[id] = currentEntries[id]
+            }
+            for (id, source) in sources {
+                source.setRegistryAttached(currentEntries[id] != nil)
             }
             sourcesSnapshot = sources
             let activeSourceStates = sources.values.map {
@@ -614,7 +735,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
                 changed: changed,
                 newlyClaimedSwitches: newlyClaimedSwitches,
                 activeSources: activeSourceStates,
-                discoveredDeviceCount: devices.count)
+                discoveredDeviceCount: activeIDs.count)
             removedUSBEntries = valeriaReconciliation.removedUSBEntries
             shouldRecoverEmptyDiscovery = valeriaReconciliation.shouldRecoverEmptyDiscovery
             shouldReconcilePendingSwitch = valeriaReconciliation.shouldReconcilePendingSwitch
@@ -623,24 +744,35 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
                 associationIdentities.retain(physicalIDs: Set(sources.keys))
                 sourceRecovery.retain(sources: activeInstances)
                 identityGeneration &+= 1
-                if present.count > 1 { requiresDisplayVerification = true }
-                if present.count > 1 || (requiresDisplayVerification && !sources.isEmpty) {
-                    // A failed capture must not turn two discovered phones into
-                    // an assumed single-device identity.
-                    verificationState = sources.count == present.count ? .pending : .failed
-                } else {
+                if multiDevice { requiresDisplayVerification = true }
+                let canAssumeSingle = !requiresDisplayVerification && present.count == 1
+                    && observed?.singleDevice.map { pin in
+                        sources.values.contains {
+                            usbEntries[$0.id] == pin.registryEntryID || $0.pinnedUSBDevice == pin
+                        }
+                    } == true
+                if sources.isEmpty || canAssumeSingle {
                     verificationState = .singleDevice
+                } else {
+                    let retained = stableMappings()
+                    verificationState = retained.count == sources.count ? .verified
+                        : retained.isEmpty ? .pending : .partiallyVerified
+                    if verificationState != .verified { job = (identityGeneration, sources) }
                 }
-                rebuildScreens(mapping: [:], verified: false)
-                if verificationState == .pending { job = (identityGeneration, sources) }
+                rebuildScreens(mapping: [:])
             }
-            if sources.isEmpty {
+            // A retained source with no current discovery entry is still tied to
+            // an attached USB phone. Re-enabling CoreMediaIO is process-wide, so
+            // only retry it while every retained source is still frameless; a
+            // healthy peer must never be disturbed by this cold-start repair.
+            let hasHealthyFrame = sources.values.contains(where: \.hasFrame)
+            if sources.isEmpty || (present.isEmpty && !hasHealthyFrame) {
                 emptyRefreshCount &+= 1
                 if emptyRefreshCount % 5 == 0 {
                     shouldReallowCaptureDevices = true
                 }
                 if !loggedNoScreens {
-                    log("no iPhone screen yet (plug in over USB and trust this Mac)")
+                    log("no iPhone capture source currently visible (USB topology is checked separately)")
                     loggedNoScreens = true
                 }
             } else {
@@ -666,7 +798,10 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
                 sourcesByID: sourcesSnapshot,
                 expectedLifecycle: refreshLifecycle)
         }
-        if shouldReallowCaptureDevices { allowScreenCaptureDevices() }
+        if shouldReallowCaptureDevices {
+            log("re-enabling CoreMediaIO screen capture discovery after retained frameless source")
+            allowScreenCaptureDevices()
+        }
         if shouldRecoverEmptyDiscovery {
             CaptureValeriaRecoveryCoordinator.recoverEmptyDiscoveryIfNeeded(host: self)
         }
@@ -691,11 +826,15 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         body(&valeriaRecovery)
     }
 
-    func enterMultiDevicePendingForValeriaLocked() {
+    func enterMultiDevicePendingForValeriaLocked(target: CaptureValeriaIdentityTarget) {
         identityGeneration &+= 1
         verificationState = .pending
         requiresDisplayVerification = true
-        rebuildScreens(mapping: [:], verified: false)
+        switch target {
+        case .source(let id): provenRoutes[id] = nil
+        case .usbEntry(let entryID): provenRoutes = provenRoutes.filter { $0.value.entryID != entryID }
+        }
+        rebuildScreens(mapping: [:])
     }
 
     func notifyScreensChangedAfterValeriaGate() {
@@ -707,7 +846,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         sources: [String: ScreenCaptureSource]
     ) {
         scheduleIdentityVerification(
-            generation: generation, sources: sources, retryOnFailure: true, delay: 1.5)
+            generation: generation, sources: sources, delay: 1.5)
     }
 
     /// Coordinates USB Valeria configuration activation through the manager's
@@ -721,24 +860,28 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             restartSource: restartSource)
     }
 
-    private func stableMappings(physicalIDs: Set<String>? = nil) -> [String: String] {
+    private func currentUSBRoutes() -> [String: CaptureScreenMapping.USBRoute] {
+        sources.reduce(into: [:]) { result, pair in
+            // The AVFoundation object can briefly report disconnected while
+            // CoreMediaIO rebuilds its device list. The registry entry is the
+            // authoritative attachment signal during that window.
+            guard let entry = usbEntries[pair.key] else { return }
+            result[pair.key] = .init(entryID: entry, sourceInstance: pair.value.instanceID, run: pair.value.captureRun)
+        }
+    }
+
+    private func stableMappings() -> [String: String] {
         CaptureScreenMapping.continuing(
-            physicalIDs: physicalIDs ?? Set(sources.keys), expectedSizes: confirmedSizes,
+            proven: provenRoutes, current: currentUSBRoutes(), expectedSizes: confirmedSizes,
             sourceSizes: sources.compactMapValues(\.size))
     }
 
-    /// A peer failure must not erase a proven, dimension-unique route. Screen
-    /// objects and workers survive while the physical/source binding survives.
-    private func rebuildScreens(mapping: [String: String], verified: Bool) {
-        if verified {
-            for (id, sourceID) in mapping {
-                if let size = sources[sourceID]?.size { confirmedSizes[id] = size }
-            }
-        }
+    /// Keep confirmed screen objects and their input workers while the route survives.
+    private func rebuildScreens(mapping: [String: String]) {
         var proven = stableMappings()
-        // Fresh independent evidence wins, including same-resolution devices.
-        for (id, sourceID) in mapping where verified {
-            proven = proven.filter { $0.key == id || $0.value != sourceID }
+        for (id, sourceID) in mapping {
+            guard let size = sources[sourceID]?.size else { continue }
+            confirmedSizes[id] = size
             proven[id] = sourceID
         }
         let displayMapping = CaptureScreenMapping.previews(
@@ -751,9 +894,15 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
             guard let physical = sources[entry.key], let source = sources[entry.value] else { return }
             let displayConfirmed = proven[entry.key] == entry.value
                 || (verificationState == .singleDevice && !requiresDisplayVerification)
+            let expectedSize = proven[entry.key] == entry.value ? confirmedSizes[entry.key] : nil
+            let previous = previousScreens[entry.key]
+            if !displayConfirmed, let previous, !previous.displayIdentityConfirmed,
+                previous.sourceInstanceID == source.instanceID, previous.expectedSize == expectedSize {
+                result[entry.key] = previous
+                return
+            }
             let identity = associationIdentities.identity(physicalID: entry.key, isConfirmed: displayConfirmed)
-            let expectedSize = confirmedSizes[entry.key]
-            if let previous = previousScreens[entry.key], previous.sourceInstanceID == source.instanceID,
+            if let previous, previous.sourceInstanceID == source.instanceID,
                 previous.associationIdentity == identity, previous.expectedSize == expectedSize {
                 previous.setDisplayIdentityConfirmed(displayConfirmed)
                 result[entry.key] = previous
@@ -769,99 +918,162 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         }
     }
 
+    private func captureFirstFrame(from source: ScreenCaptureSource) {
+        onScreensChanged?()
+        let job: (UInt64, [String: ScreenCaptureSource])? = lock.withLock {
+            guard !isStopped, sources[source.id] === source,
+                verificationState != .singleDevice, verificationState != .verified
+            else { return nil }
+            return (identityGeneration, sources)
+        }
+        guard let job else { return }
+        // Coalesce near-simultaneous first frames and supersede any long backoff.
+        scheduleIdentityVerification(generation: job.0, sources: job.1, delay: 0.12)
+    }
+
     private func scheduleIdentityVerification(
-        generation: UInt64, sources: [String: ScreenCaptureSource], retryOnFailure: Bool = true,
+        generation: UInt64, sources: [String: ScreenCaptureSource],
         delay: TimeInterval = 0.5, recoveryAttempt: Int = 0
     ) {
-        // Wait for newly started streams to deliver their first complete frames.
-        identityQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
-            let isCurrent = { self.lock.withLock { !self.isStopped && self.identityGeneration == generation } }
-            guard isCurrent() else { return }
-            let alreadyResolved = self.lock.withLock { () -> Bool in
-                guard self.identityGeneration == generation else { return false }
-                let stable = self.stableMappings()
-                guard !stable.isEmpty, stable.count == self.sources.count else { return false }
-                self.rebuildScreens(mapping: stable, verified: true)
-                self.verificationState = .verified
-                return true
-            }
-            if alreadyResolved { self.onScreensChanged?(); return }
-            let result = CaptureIdentityVerifier.verify(
+        let deadline = DispatchTime.now() + delay
+        let ticket = lock.withLock { () -> UInt64? in
+            guard !isStopped, identityGeneration == generation else { return nil }
+            return identityCheckSchedule.request(generation: generation, deadline: deadline)
+        }
+        guard let ticket else { return }
+        identityQueue.asyncAfter(deadline: deadline) { [weak self] in
+            guard let self, self.lock.withLock({
+                !self.isStopped && self.identityGeneration == generation
+                    && self.identityCheckSchedule.take(ticket: ticket)
+            }) else { return }
+            self.verifyIdentity(generation: generation, sources: sources, recoveryAttempt: recoveryAttempt)
+        }
+    }
+
+    private func verifyIdentity(
+        generation: UInt64, sources: [String: ScreenCaptureSource], recoveryAttempt: Int
+    ) {
+        let isCurrent = { self.lock.withLock { !self.isStopped && self.identityGeneration == generation } }
+        let snapshot = lock.withLock { () -> ([String: String], USBValeriaConfigurator.IOSUSBTopologyObservation?)? in
+            guard !isStopped, identityGeneration == generation else { return nil }
+            return (stableMappings(), usbTopology)
+        }
+        guard let (retained, topology) = snapshot else { return }
+        let runs = sources.mapValues(\.captureRun)
+        let sizes = sources.compactMapValues(\.size)
+        let reserved = Set(retained.values)
+        var evidence = CaptureIdentityVerifier.Evidence()
+        let result: CaptureIdentityVerifier.Result
+        if sources.keys.allSatisfy({ retained[$0] != nil }) {
+            result = .verified(retained)
+        } else if sources.contains(where: { !reserved.contains($0.key) && $0.value.hasFrame }) {
+            result = CaptureIdentityVerifier.verify(
                 physicalIDs: sources.keys.sorted(),
                 sourceImages: { sources.compactMapValues { $0.identityImage() } },
-                isCurrent: isCurrent)
-            var shouldRetry = false
-            var shouldRecover = false
-            let applied = self.lock.withLock { () -> Bool in
-                guard self.identityGeneration == generation else { return false }
-                switch result {
-                case .verified(let mapping):
-                    self.rebuildScreens(mapping: mapping, verified: true)
-                    self.verificationState = .verified
-                    log("capture identity verified: \(mapping)")
-                case .partiallyVerified(let mapping):
-                    self.rebuildScreens(mapping: mapping, verified: true)
-                    self.verificationState = .partiallyVerified
-                    log("capture identity partially verified: \(mapping)")
-                    shouldRecover = true
-                case .unavailable:
-                    // Without an independent check, pointer discovery must
-                    // prove this mapping again before reusing Bluetooth input.
-                    self.rebuildScreens(mapping: [:], verified: false)
-                    self.verificationState = .unavailable
-                    log("capture identity unverified: native USB screenshot service unavailable")
-                case .failed:
-                    self.rebuildScreens(mapping: [:], verified: false)
-                    self.verificationState = .failed
-                    shouldRetry = retryOnFailure
-                    shouldRecover = !retryOnFailure
-                    log("capture identity verification failed: no unique complete USB-to-video mapping")
-                }
-                if shouldRecover {
-                    let empty = sources.values.filter { $0.frame() == nil }
-                    let selected = self.sourceRecovery.take(empty: Set(empty.map(\.instanceID)))
-                    shouldRecover = !selected.isEmpty
-                    if shouldRecover {
-                        // Starting/stopping one muxed stream can reroute another
-                        // stream's pixels. Keep Bluetooth proofs, but recheck
-                        // the complete video mapping before accepting input.
-                        self.verificationState = .pending
-                        self.rebuildScreens(mapping: [:], verified: false)
-                        for source in empty where selected.contains(source.instanceID) {
-                            log("restarting empty capture source: \(source.name) (\(source.id))")
-                            source.restart()
-                        }
-                    }
-                }
-                return true
+                isCurrent: isCurrent, retained: retained, reportEvidence: { evidence = $0 },
+                screenshotTimeout: recoveryAttempt == 0 ? 3 : 10)
+        } else {
+            // A screenshot cannot prove a stream that hasn't produced a frame.
+            result = retained.isEmpty ? .failed : .partiallyVerified(retained)
+        }
+        guard isCurrent() else { return }
+        if topology != USBValeriaConfigurator.readIOSUSBTopology() {
+            refresh()
+            if isCurrent() {
+                scheduleIdentityVerification(
+                    generation: generation, sources: sources,
+                    delay: CaptureIdentityRecovery.delay(attempt: recoveryAttempt),
+                    recoveryAttempt: min(2, recoveryAttempt + 1))
             }
-            if applied { self.onScreensChanged?() }
-            if applied, shouldRecover {
-                self.scheduleIdentityVerification(
-                    generation: generation, sources: sources, retryOnFailure: false, delay: 1.5,
-                    recoveryAttempt: recoveryAttempt)
-            } else if applied, shouldRetry {
-                // Capture and screenshotr can race during USB/service startup.
-                // Retry startup quickly, then use low-frequency recovery while
-                // the topology remains unchanged. Never move a pointer here.
-                self.scheduleIdentityVerification(
-                    generation: generation, sources: sources, retryOnFailure: false, delay: 3,
-                    recoveryAttempt: recoveryAttempt)
-            } else if applied {
-                let retry = self.lock.withLock {
-                    CaptureIdentityRecovery.permitsRetry(
-                        stopped: self.isStopped, expected: generation, current: self.identityGeneration,
-                        sourceCount: self.sources.count, state: self.verificationState)
+            return
+        }
+        var changed = false
+        let retry: (delay: TimeInterval, attempt: Int)? = lock.withLock {
+            guard !isStopped, identityGeneration == generation else { return nil }
+            let previousState = verificationState
+            let previousSessions = screens.mapValues(ObjectIdentifier.init)
+            let previousVerified = verifiedScreenIDs
+            defer {
+                changed = previousState != verificationState || previousVerified != verifiedScreenIDs
+                    || previousSessions != screens.mapValues(ObjectIdentifier.init)
+            }
+            guard sources.mapValues(\.captureRun) == runs, sources.compactMapValues(\.size) == sizes,
+                stableMappings() == retained
+            else {
+                // Never commit screenshots across a capture restart or a change
+                // in retained proof. No stale completion can reopen the gate.
+                rebuildScreens(mapping: [:])
+                verificationState = verifiedScreenIDs.isEmpty ? .pending : .partiallyVerified
+                return (CaptureIdentityRecovery.delay(attempt: recoveryAttempt), min(2, recoveryAttempt + 1))
+            }
+            let routes = currentUSBRoutes()
+            for id in evidence.contradicted { provenRoutes[id] = nil }
+            for (id, sourceID) in evidence.independent where id == sourceID {
+                provenRoutes[id] = routes[id]
+            }
+            let mapping: [String: String]
+            switch result {
+            case .verified(let found), .partiallyVerified(let found): mapping = found
+            case .failed, .unavailable: mapping = [:]
+            }
+            rebuildScreens(mapping: mapping)
+            if verifiedScreenIDs.count == sources.count {
+                verificationState = .verified
+            } else if !verifiedScreenIDs.isEmpty {
+                verificationState = .partiallyVerified
+            } else if case .unavailable = result {
+                verificationState = .unavailable
+            } else {
+                verificationState = .failed
+            }
+            if !evidence.contradicted.isEmpty {
+                log("capture identity contradicted on retained routes: \(evidence.contradicted.sorted())")
+            }
+            guard CaptureIdentityRecovery.permitsRetry(
+                stopped: isStopped, expected: generation, current: identityGeneration,
+                sourceCount: sources.count, state: verificationState)
+            else { return nil }
+
+            let active = Set(screens.values.filter(\.displayIdentityConfirmed).map(\.sourceInstanceID))
+            let now = ProcessInfo.processInfo.systemUptime
+            let empty = sources.values.filter {
+                !active.contains($0.instanceID) && !$0.hasFrame && $0.isDeviceConnected
+                    && $0.permitsInitialRecovery(now: now)
+            }
+            // The fallback replacement is scoped to this source's stopped
+            // session and runs through CaptureSessionOperationQueue. Do not
+            // defer it until this source is the only capture: one frameless
+            // peer must be able to recover while another phone keeps
+            // publishing frames.
+            // CoreMediaIO's assistant is process-wide even though each phone has
+            // its own AVCaptureSession. Restarting two empty sessions together
+            // causes one restart to invalidate the other phone's stream. Recover
+            // one source per pass and let the next identity check handle the rest.
+            let candidate = empty.sorted {
+                if $0.hasCaptureError != $1.hasCaptureError {
+                    return $0.hasCaptureError
                 }
-                if retry {
-                    let delay = CaptureIdentityRecovery.delay(attempt: recoveryAttempt)
-                    log("capture identity automatic recheck in \(delay)s; input remains gated per screen")
-                    self.scheduleIdentityVerification(
-                        generation: generation, sources: sources, retryOnFailure: false, delay: delay,
-                        recoveryAttempt: min(2, recoveryAttempt + 1))
+                return $0.id < $1.id
+            }.prefix(1)
+            let selected = sourceRecovery.take(
+                empty: Set(candidate.map(\.instanceID)),
+                now: now,
+                allowReopen: true)
+            for source in candidate {
+                guard let action = selected[source.instanceID] else { continue }
+                if source.recoverEmptyCapture(action) {
+                    log("\(action) for empty capture source: \(source.name) (\(source.id))")
                 }
             }
+            let pause = selected.isEmpty ? CaptureIdentityRecovery.delay(attempt: recoveryAttempt) : 1.5
+            log("capture identity \(verificationState.rawValue); rechecking unresolved routes in \(pause)s")
+            return (pause, selected.isEmpty ? min(2, recoveryAttempt + 1) : recoveryAttempt)
+        }
+        guard isCurrent() else { return }
+        if changed { onScreensChanged?() }
+        if let retry {
+            scheduleIdentityVerification(
+                generation: generation, sources: sources, delay: retry.delay, recoveryAttempt: retry.attempt)
         }
     }
 }
@@ -901,10 +1113,14 @@ final class ScreenCaptureSession {
     fileprivate func setDisplayIdentityConfirmed(_ confirmed: Bool) { displayIdentity.setConfirmed(confirmed) }
 
     func frame() -> CVPixelBuffer? {
-        displayIdentity.read {
+        let read: () -> CVPixelBuffer? = { [self] in
             guard let buffer = source.frame(), accepts(buffer) else { return nil }
             return buffer
         }
+        // Keep the preview visible while a multi-device identity check is
+        // pending. This is display-only; input admission still requires the
+        // confirmed identity gate below.
+        return displayIdentity.read(read) ?? read()
     }
 
     private func accepts(_ buffer: CVPixelBuffer) -> Bool {
@@ -913,22 +1129,32 @@ final class ScreenCaptureSession {
     }
 
     func observationFrame() -> ScreenCaptureFrameStore.Snapshot? {
-        displayIdentity.read {
+        let read: () -> ScreenCaptureFrameStore.Snapshot? = { [self] in
             guard let snapshot = source.observationFrame(), accepts(snapshot.buffer) else { return nil }
             return snapshot
         }
+        return displayIdentity.read(read) ?? read()
     }
 
     func snapshot(png: Bool, maxWidth: Int? = nil, maxEdge: Int? = nil) -> Data? {
-        displayIdentity.read { source.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge, expectedSize: expectedSize) }
+        let read = { [self] in
+            source.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge, expectedSize: expectedSize)
+        }
+        return displayIdentity.read(read) ?? read()
     }
 
     func snapshotObservation(png: Bool, maxEdge: Int? = nil) -> (data: Data, receivedAt: TimeInterval)? {
-        displayIdentity.read { source.snapshotObservation(png: png, maxEdge: maxEdge, expectedSize: expectedSize) }
+        let read = { [self] in
+            source.snapshotObservation(png: png, maxEdge: maxEdge, expectedSize: expectedSize)
+        }
+        return displayIdentity.read(read) ?? read()
     }
 
     func thumbnail(width: Int, height: Int) -> [UInt8]? {
-        displayIdentity.read { source.thumbnail(width: width, height: height, expectedSize: expectedSize) }
+        let read = { [self] in
+            source.thumbnail(width: width, height: height, expectedSize: expectedSize)
+        }
+        return displayIdentity.read(read) ?? read()
     }
 }
 
@@ -953,8 +1179,20 @@ final class ScreenCaptureFrameStore {
     private var sequence: UInt64 = 0
     private var stopped = false
 
-    func stop() {
-        lock.withLock { stopped = true }
+    func stop(discardLatest: Bool = false) {
+        lock.withLock {
+            stopped = true
+            if discardLatest { latest = nil }
+        }
+    }
+
+    /// Don't drop a first frame that arrived after discovery selected this source.
+    func pauseIfEmpty() -> Bool {
+        lock.withLock {
+            guard !stopped, latest == nil else { return false }
+            stopped = true
+            return true
+        }
     }
 
     func resume() {
@@ -969,9 +1207,10 @@ final class ScreenCaptureFrameStore {
             guard !stopped, receivedAt.isFinite, receivedAt >= 0, sequence < .max else {
                 return .rejected
             }
+            let first = latest == nil
             sequence += 1
             latest = Snapshot(buffer: buffer, sequence: sequence, receivedAt: receivedAt)
-            return sequence == 1 ? .firstFrame : .subsequentFrame
+            return first ? .firstFrame : .subsequentFrame
         }
     }
 
@@ -992,20 +1231,60 @@ protocol CaptureRunningSession: AnyObject {
 
 extension AVCaptureSession: CaptureRunningSession {}
 
+/// CoreMediaIO's iOS screen-capture assistant is a process-wide resource. In
+/// particular, overlapping start/stop calls from two independent AVCapture
+/// sessions can tear down the assistant while the other session is still
+/// being configured. Keep those calls ordered even though frame delivery stays
+/// on one queue per phone.
+private enum CaptureSessionOperationQueue {
+    static let queue = DispatchQueue(
+        label: "iphone-use.capture.session-operations", qos: .userInitiated)
+    private static var nextStartUptime: TimeInterval = 0
+    private static let minimumStartGap: TimeInterval = 1.0
+
+    static func sync<T>(_ operation: () throws -> T) rethrows -> T {
+        try queue.sync(execute: operation)
+    }
+
+    /// iOSScreenCaptureAssistant needs a short settle window between native
+    /// session starts. Without it, the second phone can fail with `-308` while
+    /// the first stream remains healthy.
+    static func start(_ session: CaptureRunningSession) {
+        queue.sync {
+            let now = ProcessInfo.processInfo.systemUptime
+            let wait = nextStartUptime - now
+            if wait > 0 { Thread.sleep(forTimeInterval: wait) }
+            session.startRunning()
+            nextStartUptime = ProcessInfo.processInfo.systemUptime + minimumStartGap
+        }
+    }
+}
+
 /// Coordinates asynchronous start, restart, and bounded-wait stop on a capture
 /// source's serial queue without holding `stateLock` across potentially blocking
 /// AVFoundation calls.
 final class CaptureSourceLifecycle {
     private let session: CaptureRunningSession
     private let frames: ScreenCaptureFrameStore
-    private let queue: DispatchQueue
+    private let operationQueue: DispatchQueue
+    private let shouldStartSession: () -> Bool
     private let stateLock = NSLock()
     private var stopped = false
+    private var run: UInt64 = 0
 
-    init(session: CaptureRunningSession, frames: ScreenCaptureFrameStore, queue: DispatchQueue) {
+    var captureRun: UInt64 { stateLock.withLock { run } }
+
+    init(
+        session: CaptureRunningSession,
+        frames: ScreenCaptureFrameStore,
+        queue: DispatchQueue,
+        operationQueue: DispatchQueue? = nil,
+        shouldStartSession: @escaping () -> Bool = { true }
+    ) {
         self.session = session
         self.frames = frames
-        self.queue = queue
+        self.operationQueue = operationQueue ?? queue
+        self.shouldStartSession = shouldStartSession
     }
 
     var isStopped: Bool {
@@ -1013,38 +1292,47 @@ final class CaptureSourceLifecycle {
     }
 
     func start() {
-        queue.async { [weak self] in
-            guard let self, !self.stateLock.withLock({ self.stopped }) else { return }
-            self.session.startRunning()
+        operationQueue.async { [weak self] in
+            guard let self,
+                !self.stateLock.withLock({ self.stopped }),
+                self.shouldStartSession()
+            else { return }
+            CaptureSessionOperationQueue.start(self.session)
             if self.stateLock.withLock({ self.stopped }) {
                 self.frames.stop()
-                self.session.stopRunning()
+                CaptureSessionOperationQueue.sync { self.session.stopRunning() }
             }
         }
     }
 
     @discardableResult
-    func restart(onBeforeStop: (() -> Void)? = nil) -> Bool {
+    func restart(onlyIfEmpty: Bool = false, reconfigure: (() -> Void)? = nil) -> Bool {
         let canRestart = stateLock.withLock { () -> Bool in
             guard !stopped else { return false }
-            onBeforeStop?()
-            frames.stop()
+            if onlyIfEmpty {
+                guard frames.pauseIfEmpty() else { return false }
+            } else {
+                frames.stop(discardLatest: true)
+            }
+            run &+= 1
             return true
         }
         guard canRestart else { return false }
-        queue.async { [weak self] in
+        operationQueue.async { [weak self] in
             guard let self else { return }
-            self.session.stopRunning()
+            CaptureSessionOperationQueue.sync { self.session.stopRunning() }
+            guard !self.isStopped else { return }
+            reconfigure?()
             let canResume = self.stateLock.withLock { () -> Bool in
                 guard !self.stopped else { return false }
                 self.frames.resume()
                 return true
             }
             guard canResume else { return }
-            self.session.startRunning()
+            CaptureSessionOperationQueue.start(self.session)
             if self.stateLock.withLock({ self.stopped }) {
                 self.frames.stop()
-                self.session.stopRunning()
+                CaptureSessionOperationQueue.sync { self.session.stopRunning() }
             }
         }
         return true
@@ -1058,9 +1346,13 @@ final class CaptureSourceLifecycle {
             frames.stop()
             onStopLocked?()
         }
-        queue.async {
+        operationQueue.async {
             frames.stop()
-            session.stopRunning()
+            // Always drain the native session, even after the virtual device
+            // reports disconnected. Skipping this leaves an active CMIO graph
+            // to be torn down by AVCaptureSession.dealloc, which is the path
+            // that has been crashing iOSScreenCaptureAssistant.
+            CaptureSessionOperationQueue.sync { session.stopRunning() }
             completion?()
         }
     }
@@ -1209,18 +1501,37 @@ final class ScreenCaptureSource:
     let pinnedUSBDevice: USBValeriaConfigurator.PinnedUSBDevice?
 
     private let session = AVCaptureSession()
+    private let startedAt = ProcessInfo.processInfo.systemUptime
     private let queue: DispatchQueue
+    private let sessionQueue: DispatchQueue
+    // `AVCaptureSession.startRunning()` may block while CoreMediaIO waits for
+    // the iOS screen-capture assistant. Keep the bounded Valeria recovery
+    // trigger off the frame/session queue so a stalled start cannot suppress
+    // the USB activation that is meant to unblock it.
+    private let recoveryQueue: DispatchQueue
     private let frames = ScreenCaptureFrameStore()
     private let lifecycle: CaptureSourceLifecycle
-    private let onFirstFrame: (() -> Void)?
+    private let onFirstFrame: ((ScreenCaptureSource) -> Void)?
     private let onNeedsValeriaRecovery: ((ScreenCaptureSource, Bool) -> Void)?
     private let errorTracker = CaptureSourceErrorTracker()
+    private let attachmentLock = NSLock()
+    private var registryAttached = false
     private let observerLock = NSLock()
     private var runtimeErrorObserver: NSObjectProtocol?
 
-    var isDeviceConnected: Bool { device.isConnected }
+    /// CoreMediaIO can temporarily remove a device from AVFoundation discovery
+    /// while the USB registry still proves that the phone is attached. Keep
+    /// recovery and session draining alive for that source during the gap.
+    var isDeviceConnected: Bool {
+        device.isConnected || attachmentLock.withLock { registryAttached }
+    }
+    var captureRun: UInt64 { lifecycle.captureRun }
     var hasFrame: Bool { frame() != nil }
     var hasCaptureError: Bool { errorTracker.hasError }
+    var startupSettled: Bool {
+        hasFrame || hasCaptureError
+            || ProcessInfo.processInfo.systemUptime - startedAt >= CaptureSourceRecovery.initialGrace
+    }
 
     var lastError: String? {
         errorTracker.lastError
@@ -1230,10 +1541,14 @@ final class ScreenCaptureSource:
         errorTracker.recordRecoveryError(message, isStopped: lifecycle.isStopped)
     }
 
+    func setRegistryAttached(_ attached: Bool) {
+        attachmentLock.withLock { registryAttached = attached }
+    }
+
     init(
         device: AVCaptureDevice,
         pinnedUSBDevice: USBValeriaConfigurator.PinnedUSBDevice? = nil,
-        onFirstFrame: (() -> Void)? = nil,
+        onFirstFrame: ((ScreenCaptureSource) -> Void)? = nil,
         onNeedsValeriaRecovery: ((ScreenCaptureSource, Bool) -> Void)? = nil
     ) throws {
         self.device = device
@@ -1244,10 +1559,17 @@ final class ScreenCaptureSource:
         name = device.localizedName
         let captureQueue = DispatchQueue(label: "iphone-use.capture.\(device.uniqueID)")
         queue = captureQueue
-        lifecycle = CaptureSourceLifecycle(session: session, frames: frames, queue: captureQueue)
+        sessionQueue = DispatchQueue(label: "iphone-use.capture-session.\(device.uniqueID)", qos: .userInitiated)
+        recoveryQueue = DispatchQueue(label: "iphone-use.capture-recovery.\(device.uniqueID)", qos: .utility)
+        lifecycle = CaptureSourceLifecycle(
+            session: session,
+            frames: frames,
+            queue: captureQueue,
+            operationQueue: sessionQueue,
+            shouldStartSession: { [weak device] in device?.isConnected ?? false })
         super.init()
 
-        try configureSession()
+        try CaptureSessionOperationQueue.sync { try configureSession() }
         observeRuntimeErrors()
         lifecycle.start()
         scheduleValeriaActivationCheck()
@@ -1281,8 +1603,12 @@ final class ScreenCaptureSource:
         }
     }
 
+    func permitsInitialRecovery(now: TimeInterval) -> Bool {
+        CaptureSourceRecovery.permitsInitialRecovery(startedAt: startedAt, now: now)
+    }
+
     private func scheduleValeriaActivationCheck() {
-        queue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+        recoveryQueue.asyncAfter(deadline: .now() + CaptureSourceRecovery.initialGrace) { [weak self] in
             guard let self,
                 !self.lifecycle.isStopped,
                 self.frames.snapshot() == nil
@@ -1302,7 +1628,15 @@ final class ScreenCaptureSource:
                     self.runtimeErrorObserver = nil
                 }
             },
-            completion: completion)
+            completion: { [self] in
+                // The manager removes a source as soon as USB discovery says it
+                // is gone. Retain the source until its session queue has drained
+                // so the output delegate and native input cannot disappear while
+                // CoreMediaIO is still unwinding the stream.
+                withExtendedLifetime(self) {
+                    completion?()
+                }
+            })
         if let observerToRemove {
             NotificationCenter.default.removeObserver(observerToRemove)
         }
@@ -1310,6 +1644,47 @@ final class ScreenCaptureSource:
 
     func restart() {
         lifecycle.restart()
+    }
+
+    @discardableResult
+    func recoverEmptyCapture(_ action: CaptureSourceRecovery.Action) -> Bool {
+        guard isDeviceConnected else { return false }
+        switch action {
+        case .restart:
+            return lifecycle.restart(onlyIfEmpty: true)
+        case .reopenInput:
+            return lifecycle.restart(onlyIfEmpty: true) { [weak self] in
+                guard let self, self.isDeviceConnected else { return }
+                do { try self.reopenNativeInput() }
+                catch {
+                    self.recordRecoveryError("could not reopen native capture input: \(error)")
+                    log("could not reopen native capture input for \(self.name): \(error)")
+                }
+            }
+        }
+    }
+
+    /// Replace only this session's input, on its serial queue while stopped.
+    private func reopenNativeInput() throws {
+        try CaptureSessionOperationQueue.sync {
+            guard let previous = session.inputs.compactMap({ $0 as? AVCaptureDeviceInput }).first,
+                previous.device.uniqueID == device.uniqueID
+            else { throw CaptureError("native capture input no longer matches \(name)") }
+            session.beginConfiguration()
+            defer { session.commitConfiguration() }
+            session.removeInput(previous)
+            do {
+                guard let refreshedDevice = AVCaptureDevice(uniqueID: device.uniqueID) else {
+                    throw CaptureError("capture device disappeared while reopening \(name)")
+                }
+                let replacement = try AVCaptureDeviceInput(device: refreshedDevice)
+                guard session.canAddInput(replacement) else { throw CaptureError("cannot reopen \(name)") }
+                session.addInput(replacement)
+            } catch {
+                if session.canAddInput(previous) { session.addInput(previous) }
+                throw error
+            }
+        }
     }
 
     var size: CGSize? {
@@ -1399,7 +1774,7 @@ final class ScreenCaptureSource:
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let outcome = errorTracker.publishFrameClearingPriorErrors(buffer, into: frames)
         if outcome == .firstFrame {
-            onFirstFrame?()
+            onFirstFrame?(self)
         }
     }
 

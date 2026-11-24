@@ -80,6 +80,20 @@ struct WorkbenchState {
         gridPage = min(gridPage, pageCount - 1)
     }
 
+    /// Remove presentation state only. A future exact-ID discovery can add it again.
+    @discardableResult
+    mutating func removeDisconnected(_ exactID: String) -> Bool {
+        guard let index = devices.firstIndex(where: { $0.id == exactID && !$0.connected }) else { return false }
+        devices.remove(at: index)
+        if selectedID == exactID {
+            let visible = matching
+            selectedID = visible.first(where: \.connected)?.id ?? visible.first?.id
+                ?? devices.first(where: \.connected)?.id ?? devices.first?.id
+        }
+        revealSelection()
+        return true
+    }
+
     @discardableResult
     mutating func select(_ exactID: String) -> Bool {
         guard devices.contains(where: { $0.id == exactID }) else { return false }

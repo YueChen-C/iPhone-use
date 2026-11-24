@@ -50,7 +50,7 @@ struct StringsAPI: LocalizedTable {
 
     static let zh = StringsAPI(
         pairHostRequired: "缺少 host（应为 unmatchedHosts 中的 UUID）",
-        noFrameFromDevice: { "尚未收到来自 \($0) 的画面：请先解锁" },
+        noFrameFromDevice: { "尚未收到来自 \($0) 的画面：采集流尚未就绪，锁屏状态未确认" },
         captureFailedFromDevice: { "来自 \($0) 的 USB 画面捕获失败：\($1)" },
         pointerNotReady: "指针未就绪：请等待蓝牙鼠标订阅与有效校准",
         textRequired: "缺少 text",
@@ -66,7 +66,7 @@ struct StringsAPI: LocalizedTable {
         coordinatesRequired: { "缺少 \($0) 与 \($1)" },
         noFrameFromScreen: { "尚未收到来自 \($0) 的画面" },
         noPhoneMatches: { "没有匹配 \"\($0)\" 的手机。\($1)" },
-        noScreen: "未发现 iPhone 画面：请用 USB 连接 iPhone 并解锁",
+        noScreen: "未发现 iPhone 画面：USB 采集流尚未就绪，请检查信任状态与采集服务",
         multiplePhones: { "已连接 \($0) 台手机，请传入 device。\($1)" },
         noBluetoothConnection: { name, peripheral in
             "\(name) 没有蓝牙连接：请开启辅助触控，然后在「设置 > 辅助功能 > 触控 > 辅助触控 > 设备 > 蓝牙设备」中配对 \"\(peripheral)\""
@@ -87,7 +87,7 @@ struct StringsAPI: LocalizedTable {
 
     static let en = StringsAPI(
         pairHostRequired: "host is required (a UUID from unmatchedHosts)",
-        noFrameFromDevice: { "no frame yet from \($0): unlock it" },
+        noFrameFromDevice: { "no frame yet from \($0): the capture stream is not ready; lock state is unconfirmed" },
         captureFailedFromDevice: { "USB screen capture failed for \($0): \($1)" },
         pointerNotReady: "pointer is not ready: wait for Bluetooth mouse subscription and a valid calibration",
         textRequired: "text is required",
@@ -103,7 +103,7 @@ struct StringsAPI: LocalizedTable {
         coordinatesRequired: { "\($0) and \($1) are required" },
         noFrameFromScreen: { "no frame yet from \($0)" },
         noPhoneMatches: { "no phone matches \"\($0)\". \($1)" },
-        noScreen: "no iPhone screen: plug the iPhone in over USB and unlock it",
+        noScreen: "no iPhone screen: the USB capture stream is not ready; check trust and capture services",
         multiplePhones: { "\($0) phones are connected, pass device. \($1)" },
         noBluetoothConnection: { name, peripheral in
             "\(name) has no Bluetooth connection: enable AssistiveTouch, then pair \"\(peripheral)\" in Settings > Accessibility > Touch > AssistiveTouch > Devices > Bluetooth Devices"

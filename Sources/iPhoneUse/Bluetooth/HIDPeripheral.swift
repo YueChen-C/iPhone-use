@@ -270,7 +270,9 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
 
     /// Initiates a bounded BLE link to saved bonded iPhones whose USB screens are
     /// present, waking their HOGP client without requiring manual Settings > Bluetooth taps.
-    func reconnectKnownHosts(_ hosts: Set<UUID>, resetExhausted: Bool = true) {
+    func reconnectKnownHosts(
+        _ hosts: Set<UUID>, resetHosts: Set<UUID> = [], attachments: [UUID: UInt64] = [:]
+    ) {
         queue.async {
             if !hosts.isEmpty {
                 self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
@@ -280,7 +282,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
             }
             let activeSessions = Set(self.connections.sessions.keys)
             let toCancel = self.reconnectTracker.updateTargets(
-                hosts, activeSessions: activeSessions, resetExhausted: resetExhausted)
+                hosts, activeSessions: activeSessions, resetHosts: resetHosts, attachments: attachments)
             for host in toCancel {
                 if let peripheral = self.reconnectingPeripherals[host] {
                     self.centralManager?.cancelPeripheralConnection(peripheral)
@@ -293,21 +295,14 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
         }
     }
 
-    /// Selects saved BLE hosts that should be woken for currently present, unmatched USB screens.
+    /// Never infer a saved BLE host from an unpaired or USB-only phone.
     static func hostsToReconnect(
-        pairings: [String: UUID],
-        presentScreenIDs: Set<String>,
-        matchedScreenIDs: Set<String>,
-        connectedHosts: Set<UUID>
+        pairings: [String: UUID], presentScreenIDs: Set<String>, isBLEEligible: (String) -> Bool
     ) -> Set<UUID> {
-        let unmatchedScreens = presentScreenIDs.subtracting(matchedScreenIDs)
-        guard !unmatchedScreens.isEmpty else { return [] }
-        let matchedHosts = Set(matchedScreenIDs.compactMap { pairings[$0] })
-        var candidates = Set(unmatchedScreens.compactMap { pairings[$0] })
-        if unmatchedScreens.contains(where: { pairings[$0] == nil }) {
-            candidates.formUnion(Set(pairings.values).subtracting(matchedHosts))
-        }
-        return candidates.subtracting(connectedHosts)
+        Set(presentScreenIDs.compactMap { id in
+            guard let host = pairings[id], isBLEEligible(id) else { return nil }
+            return host
+        })
     }
 
     /// Phones subscribed to at least one input report.

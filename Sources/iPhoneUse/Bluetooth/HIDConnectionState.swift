@@ -181,6 +181,7 @@ struct HIDReconnectTracker {
     private(set) var targets: Set<UUID> = []
     private(set) var phases: [UUID: Phase] = [:]
     private(set) var attemptsUsed: [UUID: Int] = [:]
+    private var knownAttachments: [UUID: UInt64] = [:]
     private var nextToken: UInt64 = 0
 
     /// Updates target hosts and returns any hosts whose active outbound peripheral
@@ -188,17 +189,18 @@ struct HIDReconnectTracker {
     mutating func updateTargets(
         _ newTargets: Set<UUID>,
         activeSessions: Set<UUID>,
-        resetExhausted: Bool
+        resetHosts: Set<UUID> = [],
+        attachments: [UUID: UInt64] = [:]
     ) -> [UUID] {
-        let added = newTargets.subtracting(targets)
-        for host in added {
-            attemptsUsed[host] = 0
-        }
-        if resetExhausted {
-            for host in newTargets {
-                attemptsUsed[host] = 0
+        // A preview may vanish or be rebuilt without unplugging the phone.
+        // Remember the last exact USB entry, not the presence of a screen card.
+        var renewed = resetHosts
+        for (host, entry) in attachments where entry != 0 {
+            if let previous = knownAttachments.updateValue(entry, forKey: host), previous != entry {
+                renewed.insert(host)
             }
         }
+        for host in renewed { attemptsUsed[host] = 0 }
         targets = newTargets
 
         var toCancel: [UUID] = []
@@ -213,7 +215,9 @@ struct HIDReconnectTracker {
                 case .cancelling(let attempt, _):
                     phases[host] = .cancelling(attempt: attempt, retryDesired: false)
                 case .backoff:
-                    phases[host] = nil
+                    // Its timer checks the target again; a discovery gap must
+                    // not shorten the delay if the same phone reappears.
+                    if renewed.contains(host) { phases[host] = nil }
                 }
             } else if !activeSessions.contains(host) {
                 switch phase {
@@ -223,13 +227,11 @@ struct HIDReconnectTracker {
                     phases[host] = .cancelling(attempt: attempt, retryDesired: true)
                     toCancel.append(host)
                 case .cancelling(let attempt, let retryDesired):
-                    if !retryDesired, (attemptsUsed[host] ?? 0) < Self.maxAutomaticAttempts {
+                    if !retryDesired, renewed.contains(host) {
                         phases[host] = .cancelling(attempt: attempt, retryDesired: true)
                     }
                 case .backoff:
-                    if resetExhausted {
-                        phases[host] = nil
-                    }
+                    if renewed.contains(host) { phases[host] = nil }
                 case .connecting:
                     break
                 }
@@ -238,23 +240,13 @@ struct HIDReconnectTracker {
         return toCancel
     }
 
-    /// Hosts ready for a fresh `retrievePeripherals` + `connect` right now.
-    /// Hosts still `.cancelling` mark `retryDesired = true` and wait for their
-    /// disconnect callback so a late callback never deletes the next attempt.
-    mutating func connectableHosts(activeSessions: Set<UUID>) -> Set<UUID> {
-        var ready: Set<UUID> = []
-        for host in targets where !activeSessions.contains(host) {
-            guard (attemptsUsed[host] ?? 0) < Self.maxAutomaticAttempts else { continue }
-            switch phases[host] {
-            case nil:
-                ready.insert(host)
-            case .cancelling(let attempt, false):
-                phases[host] = .cancelling(attempt: attempt, retryDesired: true)
-            case .connecting, .established, .cancelling(_, true), .backoff:
-                break
-            }
+    /// Reading eligibility must not turn a timeout cancellation into an
+    /// immediate retry. Only explicit requests or exact reattachment do that.
+    func connectableHosts(activeSessions: Set<UUID>) -> Set<UUID> {
+        targets.filter {
+            !activeSessions.contains($0) && phases[$0] == nil
+                && (attemptsUsed[$0] ?? 0) < Self.maxAutomaticAttempts
         }
-        return ready
     }
 
     mutating func beginConnecting(_ host: UUID) -> UInt64 {
@@ -333,7 +325,7 @@ struct HIDReconnectTracker {
         for (host, phase) in phases where !activeSessions.contains(host) {
             switch phase {
             case .connecting, .backoff:
-                result.insert(host)
+                if targets.contains(host) { result.insert(host) }
             case .cancelling(_, true):
                 result.insert(host)
             case .cancelling(_, false):
@@ -360,6 +352,7 @@ struct HIDReconnectTracker {
 
     mutating func cancelAllForStop() -> [UUID] {
         targets.removeAll()
+        knownAttachments.removeAll()
         return suspendForLifecycleTeardown()
     }
 

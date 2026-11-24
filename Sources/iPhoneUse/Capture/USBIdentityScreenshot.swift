@@ -17,7 +17,7 @@ enum USBIdentityScreenshot {
         UInt32(bitPattern: code) == 0xe800_0022
     }
 
-    static func capture(physicalID: String) -> CaptureIdentityVerifier.Screenshot {
+    static func capture(physicalID: String, timeout: TimeInterval) -> CaptureIdentityVerifier.Screenshot {
         guard let executable = Bundle.main.executableURL else { return .failed }
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("iphone-use-capture-identity-\(UUID().uuidString)")
@@ -33,7 +33,7 @@ enum USBIdentityScreenshot {
         defer { try? handle.close() }
         let status = run(
             executable: executable, arguments: [workerArgument, physicalID, output.path],
-            timeout: 10, diagnostic: handle)
+            timeout: timeout, diagnostic: handle)
         if status == unavailableExitCode {
             let detail = (try? String(contentsOf: diagnostic, encoding: .utf8)) ?? ""
             log(

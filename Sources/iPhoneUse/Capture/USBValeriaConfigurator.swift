@@ -141,18 +141,25 @@ enum USBValeriaConfigurator {
         let attachedEntryIDs: Set<UInt64>
         /// Non-nil only when exactly one iOS USB device is attached and has a non-zero registry entry ID.
         let singleDevice: PinnedUSBDevice?
+        let devices: [PinnedUSBDevice]
+
+        init(attachedEntryIDs: Set<UInt64>, singleDevice: PinnedUSBDevice?, devices: [PinnedUSBDevice]? = nil) {
+            self.attachedEntryIDs = attachedEntryIDs
+            self.singleDevice = singleDevice
+            self.devices = devices ?? singleDevice.map { [$0] } ?? []
+        }
     }
 
     enum IOSUSBTopologyObservation: Equatable {
         case unavailable
         case observed(ConnectedIOSUSBTopology)
 
-        var hasAttachedDevices: Bool {
-            if case .observed(let topology) = self {
-                return !topology.attachedEntryIDs.isEmpty
-            }
-            return false
+        var attachedDeviceCount: Int? {
+            if case .observed(let topology) = self { return topology.attachedEntryIDs.count }
+            return nil
         }
+
+        var hasAttachedDevices: Bool { (attachedDeviceCount ?? 0) > 0 }
 
         var confirmsNoAttachedDevices: Bool {
             if case .observed(let topology) = self {
@@ -735,8 +742,7 @@ enum USBValeriaConfigurator {
         serviceObservations: S
     ) -> IOSUSBTopologyObservation where S.Element == USBServicePropertyObservation {
         var attachedEntryIDs: Set<UInt64> = []
-        var iosDeviceCount = 0
-        var firstDevice: PinnedUSBDevice?
+        var devices: [PinnedUSBDevice] = []
         for observation in serviceObservations {
             switch observation {
             case .unreadable:
@@ -745,16 +751,14 @@ enum USBValeriaConfigurator {
                 continue
             case .iosDevice(let device):
                 guard device.registryEntryID != 0 else { return .unavailable }
-                iosDeviceCount += 1
                 attachedEntryIDs.insert(device.registryEntryID)
-                if iosDeviceCount == 1 {
-                    firstDevice = device
-                }
+                devices.append(device)
             }
         }
-        let single = (iosDeviceCount == 1) ? firstDevice : nil
         return .observed(
-            ConnectedIOSUSBTopology(attachedEntryIDs: attachedEntryIDs, singleDevice: single))
+            ConnectedIOSUSBTopology(
+                attachedEntryIDs: attachedEntryIDs, singleDevice: devices.count == 1 ? devices.first : nil,
+                devices: devices.sorted { $0.registryEntryID < $1.registryEntryID }))
     }
 
     private static func readObservedUSBServiceProperties(
@@ -782,29 +786,45 @@ enum USBValeriaConfigurator {
     /// `IOUserClient` plugin interfaces. MUST be called outside `ScreenCaptureManager`'s
     /// lock so `manager.lock -> USBValeriaConfigurator.queue` edges never exist.
     static func currentIOSUSBTopology() -> IOSUSBTopologyObservation {
-        queue.sync {
-            guard let matching = IOServiceMatching(kIOUSBDeviceClassName) else {
-                return .unavailable
-            }
-            var iterator: io_iterator_t = 0
-            guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
-                return .unavailable
-            }
-            defer { IOObjectRelease(iterator) }
+        queue.sync { readIOSUSBTopology() }
+    }
 
-            var observations: [USBServicePropertyObservation] = []
-            while true {
-                let service = IOIteratorNext(iterator)
-                guard service != 0 else { break }
-                defer { IOObjectRelease(service) }
-                let observation = readObservedUSBServiceProperties(of: service)
-                if observation == .unreadable {
-                    return .unavailable
-                }
-                observations.append(observation)
-            }
-            return observeIOSUSBTopology(serviceObservations: observations)
+    /// Read-only registry snapshot; independent of the configuration mutation queue.
+    static func readIOSUSBTopology() -> IOSUSBTopologyObservation {
+        guard let matching = IOServiceMatching(kIOUSBDeviceClassName) else {
+            return .unavailable
         }
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+            return .unavailable
+        }
+        defer { IOObjectRelease(iterator) }
+
+        var observations: [USBServicePropertyObservation] = []
+        while true {
+            let service = IOIteratorNext(iterator)
+            guard service != 0 else { break }
+            defer { IOObjectRelease(service) }
+            let observation = readObservedUSBServiceProperties(of: service)
+            if observation == .unreadable {
+                return .unavailable
+            }
+            observations.append(observation)
+        }
+        return observeIOSUSBTopology(serviceObservations: observations)
+    }
+
+    /// Read only one known registry entry when an unrelated device races the bus scan.
+    /// This never opens a USB interface and never searches by name or port.
+    static func readIOSUSBEntry(_ entryID: UInt64) -> PinnedUSBDevice? {
+        guard entryID != 0, let query = IORegistryEntryIDMatching(entryID) else { return nil }
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, query)
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard case .iosDevice(let pin) = readObservedUSBServiceProperties(of: service),
+            pin.registryEntryID == entryID
+        else { return nil }
+        return pin
     }
 
     /// Queries the sole connected iOS USB device's identity. MUST be called outside
@@ -826,11 +846,21 @@ enum USBValeriaConfigurator {
         shouldProceed: () -> Bool = { true }
     ) -> ActivationOutcome {
         queue.sync {
-            guard shouldProceed() else { return .notActivated }
-            guard ensureLedgerHealthyLocked() else { return .notActivated }
-            guard let matching = IOServiceMatching(kIOUSBDeviceClassName) else { return .notActivated }
+            guard shouldProceed() else {
+                log("USB Valeria activation skipped: recovery topology guard rejected before USB scan")
+                return .notActivated
+            }
+            guard ensureLedgerHealthyLocked() else {
+                log("USB Valeria activation skipped: switch ledger is not healthy")
+                return .notActivated
+            }
+            guard let matching = IOServiceMatching(kIOUSBDeviceClassName) else {
+                log("USB Valeria activation skipped: IOServiceMatching returned nil")
+                return .notActivated
+            }
             var iterator: io_iterator_t = 0
             guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+                log("USB Valeria activation skipped: IOServiceGetMatchingServices failed")
                 return .notActivated
             }
             defer { IOObjectRelease(iterator) }
@@ -864,14 +894,21 @@ enum USBValeriaConfigurator {
                         serial: serial))
             }
 
-            guard
-                let selected = selectCandidateIndex(
-                    devices: candidates,
-                    preferredSerial: preferredSerial,
-                    allowSingleIOSFallback: allowSingleIOSFallback,
-                    pinnedSingleDevice: pinnedSingleDevice),
-                shouldProceed()
-            else { return .notActivated }
+            guard let selected = selectCandidateIndex(
+                devices: candidates,
+                preferredSerial: preferredSerial,
+                allowSingleIOSFallback: allowSingleIOSFallback,
+                pinnedSingleDevice: pinnedSingleDevice)
+            else {
+                log(
+                    "USB Valeria activation skipped: no candidate (iosCandidates=\(candidates.count), preferredSerial=\(preferredSerial ?? "nil"), pinnedEntry=\(pinnedSingleDevice?.registryEntryID.description ?? "nil"))"
+                )
+                return .notActivated
+            }
+            guard shouldProceed() else {
+                log("USB Valeria activation skipped: recovery topology changed after USB scan")
+                return .notActivated
+            }
 
             return activateDormantValeriaOnServiceLocked(
                 service: services[selected], shouldProceed: shouldProceed)
@@ -1300,7 +1337,10 @@ enum USBValeriaConfigurator {
             var numConfigs: UInt8 = 0
             guard vtable.GetNumberOfConfigurations(device, &numConfigs) == kIOReturnSuccess,
                 numConfigs > 1
-            else { return .notActivated }
+            else {
+                log("USB Valeria activation skipped for entry 0x\(String(entryID, radix: 16)): no alternate USB configuration")
+                return .notActivated
+            }
 
             var descriptors: [ConfigurationDescriptorInfo] = []
             descriptors.reserveCapacity(Int(numConfigs))
@@ -1358,8 +1398,13 @@ enum USBValeriaConfigurator {
                 )
             case .blockedByActiveUSBNetwork:
                 log("skipping USB Valeria activation: iPhone USB network is protected by active route policy")
-            case .blockedByUSBResourceShortage, .notActivated:
+            case .blockedByUSBResourceShortage:
                 break
+            case .notActivated:
+                let summary = descriptors.map {
+                    "\($0.value):\($0.name ?? "<unnamed>")/\($0.networkCapability)"
+                }.joined(separator: ",")
+                log("USB Valeria activation did not switch entry 0x\(String(entryID, radix: 16)); configurations=\(summary)")
             }
             return outcome
         }
@@ -1713,12 +1758,37 @@ struct USBSwitchLedger {
         ),
         shouldProceed: () -> Bool
     ) -> USBValeriaConfigurator.ActivationOutcome {
-        guard reloadIfFaulted() else { return .notActivated }
-        guard let initialConfig = session.getConfiguration(),
-            let precheckCurrent = descriptors.first(where: { $0.value == initialConfig }),
-            let precheckTarget = USBValeriaConfigurator.dormantValeriaConfiguration(
-                currentConfiguration: initialConfig, configurations: descriptors)
-        else { return .notActivated }
+        guard reloadIfFaulted() else {
+            log("USB Valeria activation skipped for entry 0x\(String(session.registryEntryID, radix: 16)): ledger reload failed")
+            return .notActivated
+        }
+        guard let initialConfig = session.getConfiguration() else {
+            log("USB Valeria activation skipped for entry 0x\(String(session.registryEntryID, radix: 16)): cannot read current configuration")
+            return .notActivated
+        }
+        guard let precheckCurrent = descriptors.first(where: { $0.value == initialConfig }) else {
+            log("USB Valeria activation skipped for entry 0x\(String(session.registryEntryID, radix: 16)): current configuration \(initialConfig) has no descriptor")
+            return .notActivated
+        }
+        let precheckTarget: USBValeriaConfigurator.ConfigurationDescriptorInfo
+        if precheckCurrent.advertisesValeria {
+            // The device is already on Valeria. Re-applying the same
+            // configuration is not a transport reset and can tear down
+            // CoreFoundation run-loop state in the native USB stack.
+            log(
+                "USB Valeria activation skipped for entry 0x\(String(session.registryEntryID, radix: 16)): current configuration \(initialConfig) already advertises Valeria"
+            )
+            return .notActivated
+        } else if let dormant = USBValeriaConfigurator.dormantValeriaConfiguration(
+            currentConfiguration: initialConfig, configurations: descriptors)
+        {
+            precheckTarget = dormant
+        } else {
+            log(
+                "USB Valeria activation skipped for entry 0x\(String(session.registryEntryID, radix: 16)): no Valeria target from current configuration \(initialConfig)"
+            )
+            return .notActivated
+        }
 
         let initialEnv = inspectEnvironment()
         guard
@@ -1730,14 +1800,37 @@ struct USBSwitchLedger {
                 allowPrimaryNetworkPreemption: allowPrimaryNetworkPreemption)
         else { return .blockedByActiveUSBNetwork }
 
-        guard shouldProceed(), session.openSafely() else { return .notActivated }
+        guard shouldProceed() else {
+            log("USB Valeria activation skipped for entry 0x\(String(session.registryEntryID, radix: 16)): topology guard rejected before open")
+            return .notActivated
+        }
+        guard session.openSafely() else {
+            log("USB Valeria activation skipped for entry 0x\(String(session.registryEntryID, radix: 16)): USBDeviceOpen failed")
+            return .notActivated
+        }
         defer { session.close() }
 
-        guard let activeConfig = session.getConfiguration(),
-            let activeInfo = descriptors.first(where: { $0.value == activeConfig }),
-            let targetInfo = USBValeriaConfigurator.dormantValeriaConfiguration(
-                currentConfiguration: activeConfig, configurations: descriptors)
-        else { return .notActivated }
+        guard let activeConfig = session.getConfiguration() else {
+            log("USB Valeria activation skipped for entry 0x\(String(session.registryEntryID, radix: 16)): cannot read configuration after open")
+            return .notActivated
+        }
+        guard let activeInfo = descriptors.first(where: { $0.value == activeConfig }) else {
+            log("USB Valeria activation skipped for entry 0x\(String(session.registryEntryID, radix: 16)): active configuration \(activeConfig) has no descriptor")
+            return .notActivated
+        }
+        let targetInfo: USBValeriaConfigurator.ConfigurationDescriptorInfo
+        if activeInfo.advertisesValeria {
+            targetInfo = activeInfo
+        } else if let dormant = USBValeriaConfigurator.dormantValeriaConfiguration(
+            currentConfiguration: activeConfig, configurations: descriptors)
+        {
+            targetInfo = dormant
+        } else {
+            log(
+                "USB Valeria activation skipped for entry 0x\(String(session.registryEntryID, radix: 16)): no Valeria target from active configuration \(activeConfig)"
+            )
+            return .notActivated
+        }
 
         let activeEnv = inspectEnvironment()
         guard
@@ -1775,6 +1868,9 @@ struct USBSwitchLedger {
         }
 
         guard session.setConfiguration(targetInfo.value) else {
+            log(
+                "USB Valeria activation failed for entry 0x\(String(session.registryEntryID, radix: 16)): SetConfiguration(\(targetInfo.value)) returned failure"
+            )
             persistEntry(priorEntry, for: session.registryEntryID, fallback: preSwitchIntent)
             return .notActivated
         }

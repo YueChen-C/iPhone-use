@@ -97,7 +97,7 @@ final class DeviceRegistry {
         ScreenCaptureManager.shared.onScreensChanged = { [weak self] in
             USBInputController.shared.captureDidChange()
             self?.matchQueue.async {
-                self?.syncBluetoothForCurrentScreens(resetExhausted: true)
+                self?.syncBluetoothForCurrentScreens()
             }
             self?.scheduleMatch()
         }
@@ -110,7 +110,7 @@ final class DeviceRegistry {
                 self.lock.withLock {
                     self.promoteVerifiedAssociationsLocked(screens: screens, sessions: sessions)
                 }
-                self.reconnectSavedBluetoothHosts(for: screens, resetExhausted: false)
+                self.reconnectSavedBluetoothHosts(for: screens)
             }
             self?.scheduleMatch()
         }
@@ -132,11 +132,11 @@ final class DeviceRegistry {
         calibrationRetryTimer = timer
         timer.resume()
         matchQueue.async { [weak self] in
-            self?.syncBluetoothForCurrentScreens(resetExhausted: true)
+            self?.syncBluetoothForCurrentScreens()
         }
     }
 
-    private func syncBluetoothForCurrentScreens(resetExhausted: Bool) {
+    private func syncBluetoothForCurrentScreens() {
         dispatchPrecondition(condition: .onQueue(matchQueue))
         let snapshot = ScreenCaptureManager.shared.sampleScreensWithRevision()
         let sessions = currentHostSessions()
@@ -144,7 +144,7 @@ final class DeviceRegistry {
             promoteVerifiedAssociationsLocked(screens: snapshot.screens, sessions: sessions)
         }
         HIDPeripheral.shared.setUSBScreenDemand(snapshot.retainsUSBDemand, revision: snapshot.revision)
-        reconnectSavedBluetoothHosts(for: snapshot.screens, resetExhausted: resetExhausted)
+        reconnectSavedBluetoothHosts(for: snapshot.screens)
     }
 
     /// Public trigger to force immediate BLE reconnect attempt for saved paired hosts.
@@ -152,7 +152,7 @@ final class DeviceRegistry {
         matchQueue.async { [weak self] in
             guard let self else { return }
             let screens = ScreenCaptureManager.shared.all
-            self.reconnectSavedBluetoothHosts(for: screens, resetExhausted: resetExhausted)
+            self.reconnectSavedBluetoothHosts(for: screens, manualRetry: resetExhausted)
         }
     }
 
@@ -164,14 +164,11 @@ final class DeviceRegistry {
     ) {
         matchQueue.async { [weak self] in
             guard let self else { return }
-            guard observeUSBTopology().hasAttachedDevices else { return }
-            let pairings = self.lock.withLock { self.pairings }
-            guard !pairings.isEmpty else { return }
+            let topology = observeUSBTopology()
+            guard topology.hasAttachedDevices else { return }
             let revision = ScreenCaptureManager.shared.mintUSBDemandRevision()
             HIDPeripheral.shared.setUSBScreenDemand(true, revision: revision)
-            let connected = Set(HIDPeripheral.shared.connectedHosts)
-            let targets = Set(pairings.values).subtracting(connected)
-            HIDPeripheral.shared.reconnectKnownHosts(targets, resetExhausted: true)
+            self.reconnectSavedBluetoothHosts(for: [], prewakeTopology: topology)
         }
     }
 
@@ -417,7 +414,7 @@ final class DeviceRegistry {
 
     func pair(_ device: Device, host: UUID) {
         store([device.id: host], motionVerified: false)
-        reconnectSavedBluetoothHostsIfNeeded(resetExhausted: true)
+        bluetoothRouteDidChange(device.id, retry: true)
         scheduleMatch()
     }
 
@@ -610,7 +607,7 @@ final class DeviceRegistry {
     @discardableResult
     func match(force: Bool = false, probe: Bool = false, allowProbing: Bool = true) -> [String: UUID] {
         if allowProbing {
-            reconnectSavedBluetoothHostsIfNeeded(resetExhausted: true)
+            reconnectBluetooth()
             ScreenCaptureManager.shared.retryIdentityVerification()
         }
         return matchQueue.sync {
@@ -618,23 +615,41 @@ final class DeviceRegistry {
         }
     }
 
-    private func reconnectSavedBluetoothHostsIfNeeded(resetExhausted: Bool) {
-        reconnectSavedBluetoothHosts(for: ScreenCaptureManager.shared.all, resetExhausted: resetExhausted)
+    /// Recompute targets after the selection changes, not only on capture updates.
+    func bluetoothRouteDidChange(_ id: String, retry: Bool) {
+        matchQueue.async { [weak self] in
+            guard let self else { return }
+            self.reconnectSavedBluetoothHosts(for: ScreenCaptureManager.shared.all, retryDevice: retry ? id : nil)
+            if retry { self.scheduleMatch() }
+        }
     }
 
     private func reconnectSavedBluetoothHosts(
-        for screens: [ScreenCaptureSession], resetExhausted: Bool
+        for screens: [ScreenCaptureSession], manualRetry: Bool = false, retryDevice: String? = nil,
+        prewakeTopology: USBValeriaConfigurator.IOSUSBTopologyObservation? = nil
     ) {
+        dispatchPrecondition(condition: .onQueue(matchQueue))
         let pairings = lock.withLock { self.pairings }
-        guard !pairings.isEmpty else { return }
-        let devices = buildDevices(from: screens)
-        let presentIDs = Set(devices.map(\.id))
-        let matchedIDs = Set(devices.filter { $0.host != nil }.map(\.id))
-        let connected = Set(HIDPeripheral.shared.connectedHosts)
-        let targets = HIDPeripheral.hostsToReconnect(
-            pairings: pairings, presentScreenIDs: presentIDs,
-            matchedScreenIDs: matchedIDs, connectedHosts: connected)
-        HIDPeripheral.shared.reconnectKnownHosts(targets, resetExhausted: resetExhausted)
+        let topology = prewakeTopology ?? ScreenCaptureManager.shared.observedUSBTopology
+        let entries: [String: UInt64]
+        if case .observed(let attached) = topology {
+            entries = CaptureScreenMapping.usbEntries(sourceIDs: Set(pairings.keys), devices: attached.devices)
+        } else {
+            entries = [:]
+        }
+        // Quiet resume has no capture objects yet, so only exact USB registry
+        // matches can wake a bonded host. Never sweep the historical pairings.
+        let screenIDs = Set(screens.map(\.id))
+        let presentIDs = screenIDs.union(entries.keys)
+        let targets = HIDPeripheral.hostsToReconnect(pairings: pairings, presentScreenIDs: presentIDs) { id in
+            USBInputController.shared.permitsBluetoothReconnect(id, requiresKnownBackend: !screenIDs.contains(id))
+        }
+        let attachments = entries.reduce(into: [UUID: UInt64]()) { result, entry in
+            if let host = pairings[entry.key] { result[host] = entry.value }
+        }
+        var resetHosts = manualRetry ? targets : []
+        if let retryDevice, let host = pairings[retryDevice], targets.contains(host) { resetHosts.insert(host) }
+        HIDPeripheral.shared.reconnectKnownHosts(targets, resetHosts: resetHosts, attachments: attachments)
     }
 
     /// USB-selected captures cannot be targets of background BLE motion probes.

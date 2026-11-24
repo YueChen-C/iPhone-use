@@ -1098,6 +1098,8 @@ final class USBValeriaConfiguratorTests: XCTestCase {
 
         XCTAssertEqual(observedFallbackFlag, false)
         XCTAssertEqual(sourceA.restartCount, 1)
+        XCTAssertEqual(sourceB.restartCount, 0)
+        XCTAssertEqual(host.identityTargets, [.source(sourceA.id)])
         XCTAssertEqual(host.scheduledVerifications.count, 1)
 
         // Simulate source B completing partial verification while source A remains frameless.
@@ -1115,6 +1117,8 @@ final class USBValeriaConfiguratorTests: XCTestCase {
         XCTAssertEqual(host.recoveryLock.withLock { host.verificationState }, .pending)
         let latestScheduledGen = host.scheduledVerifications.last ?? 0
         XCTAssertGreaterThan(latestScheduledGen, generationBeforeRestore)
+        XCTAssertEqual(host.identityTargets, [.source(sourceA.id), .usbEntry(88), .usbEntry(88)])
+        XCTAssertEqual(sourceB.restartCount, 0)
     }
 
     func testNoOpProbeAndInFlightProbePreserveBoundedRuntimeErrorRestart() {
@@ -2775,6 +2779,7 @@ private final class MockValeriaRecoveryHost: CaptureValeriaRecoveryHost {
     var verificationState: ScreenCaptureIdentityState = .singleDevice
     var tracker = CaptureValeriaRecoveryTracker()
     var gateNotifications = 0
+    var identityTargets: [CaptureValeriaIdentityTarget] = []
     var scheduledVerifications: [UInt64] = []
 
     init(queue: DispatchQueue) {
@@ -2791,7 +2796,8 @@ private final class MockValeriaRecoveryHost: CaptureValeriaRecoveryHost {
         body(&tracker)
     }
 
-    func enterMultiDevicePendingForValeriaLocked() {
+    func enterMultiDevicePendingForValeriaLocked(target: CaptureValeriaIdentityTarget) {
+        identityTargets.append(target)
         identityGeneration &+= 1
         verificationState = .pending
     }

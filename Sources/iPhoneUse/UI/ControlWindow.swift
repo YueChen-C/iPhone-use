@@ -105,6 +105,7 @@ final class ControlWindowCoordinator {
     private var cascadePoint: NSPoint?
     var automaticPresentationEnabled = true
     var hasCompanionWindow: () -> Bool = { false }
+    var onDeviceWindowClosed: (() -> Void)?
     var hasOpenWindows: Bool { !controllers.isEmpty || waitingController != nil }
     var openDeviceIDs: Set<String> { Set(controllers.keys) }
 
@@ -118,6 +119,10 @@ final class ControlWindowCoordinator {
         controllers[device.id]?.window?.deminiaturize(nil)
         controllers[device.id]?.window?.makeKeyAndOrderFront(nil)
         QuietModeActivityController.shared.setOpenWindows(true)
+    }
+
+    func closeDevice(id: String) {
+        controllers[id]?.window?.close()
     }
 
     init(modeStore: AppRunModeStore = .shared) {
@@ -287,6 +292,7 @@ final class ControlWindowCoordinator {
         }
         QuietModeActivityController.shared.setOpenWindows(hasOpenWindows || hasCompanionWindow())
         if state.close(deviceID: deviceID), !hasCompanionWindow() { NSApplication.shared.terminate(nil) }
+        if deviceID != nil { onDeviceWindowClosed?() }
     }
 }
 

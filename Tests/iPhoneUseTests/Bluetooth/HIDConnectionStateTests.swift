@@ -313,42 +313,63 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertNil(state.nextPendingReport())
     }
 
-    func testHostsToReconnectSelectsSavedHostForUnmatchedScreenWhileIgnoringUnrelatedWatch() {
-        let phoneA = UUID()
-        let phoneB = UUID()
-        let watch = UUID()
-        let pairings = ["screen-a": phoneA, "screen-b": phoneB]
-
-        // Unrelated CloudPaired Watch connected, phoneA still dormant over BLE.
+    func testHostsToReconnectOnlyTargetsPresentPairedBLEPhones() {
+        let ble = UUID(), usb = UUID(), offline = UUID()
+        let pairings = ["ble": ble, "usb": usb, "offline": offline]
         XCTAssertEqual(
             HIDPeripheral.hostsToReconnect(
-                pairings: pairings, presentScreenIDs: ["screen-a"],
-                matchedScreenIDs: [], connectedHosts: [watch]),
-            [phoneA])
+                pairings: pairings, presentScreenIDs: ["ble", "usb", "unpaired"], isBLEEligible: { $0 != "usb" }),
+            [ble])
+        XCTAssertTrue(
+            HIDPeripheral.hostsToReconnect(
+                pairings: pairings, presentScreenIDs: ["usb", "unpaired"], isBLEEligible: { $0 != "usb" }).isEmpty)
+    }
 
-        // Once phoneA connects or matches, or when no USB screen is present, no wake is needed.
-        XCTAssertTrue(
-            HIDPeripheral.hostsToReconnect(
-                pairings: pairings, presentScreenIDs: ["screen-a"],
-                matchedScreenIDs: [], connectedHosts: [watch, phoneA]
-            ).isEmpty)
-        XCTAssertTrue(
-            HIDPeripheral.hostsToReconnect(
-                pairings: pairings, presentScreenIDs: ["screen-a"],
-                matchedScreenIDs: ["screen-a"], connectedHosts: []
-            ).isEmpty)
-        XCTAssertTrue(
-            HIDPeripheral.hostsToReconnect(
-                pairings: pairings, presentScreenIDs: [],
-                matchedScreenIDs: [], connectedHosts: []
-            ).isEmpty)
+    func testBLEReconnectFollowsAutomaticUSBRouteAndDoesNotPrewakeUnknownDevice() {
+        let input = USBInputController()
+        XCTAssertFalse(input.permitsBluetoothReconnect("new", requiresKnownBackend: true))
+        XCTAssertTrue(input.permitsBluetoothReconnect("new"))
+        XCTAssertTrue(input.applyDefault(physicalID: "new", version: "26.0"))
+        XCTAssertFalse(input.permitsBluetoothReconnect("new"))
+        XCTAssertTrue(input.permitsBluetoothReconnect("other"))
+    }
 
-        // Replaced USB screen ID wakes saved hosts not already matched to another live screen.
-        XCTAssertEqual(
-            HIDPeripheral.hostsToReconnect(
-                pairings: pairings, presentScreenIDs: ["screen-b", "screen-replaced"],
-                matchedScreenIDs: ["screen-b"], connectedHosts: [phoneB]),
-            [phoneA])
+    func testReconnectTrackerIgnoresPreviewFlapsAndRenewsOnlyReattachedPhone() {
+        let a = UUID(), b = UUID()
+        var tracker = HIDReconnectTracker()
+        _ = tracker.updateTargets([a, b], activeSessions: [], attachments: [a: 1, b: 2])
+        for index in 0..<HIDReconnectTracker.maxAutomaticAttempts {
+            for host in [a, b] {
+                let attempt = tracker.beginConnecting(host)
+                XCTAssertTrue(tracker.markTimedOut(host: host, attempt: attempt, hasActiveSession: false))
+                _ = tracker.updateTargets([a, b], activeSessions: [], attachments: [a: 1, b: 2])
+                _ = tracker.connectableHosts(activeSessions: [])
+                let followUp = tracker.handleTermination(host: host, hasActiveSession: false)
+                if index < HIDReconnectTracker.retryDelays.count {
+                    guard case .scheduleBackoff(let token, let delay) = followUp else {
+                        return XCTFail("passive refresh must not skip timeout backoff")
+                    }
+                    XCTAssertEqual(delay, HIDReconnectTracker.retryDelays[index])
+                    _ = tracker.updateTargets([host == a ? b : a], activeSessions: [])
+                    _ = tracker.updateTargets([a, b], activeSessions: [])
+                    XCTAssertEqual(tracker.phases[host], .backoff(token: token))
+                    XCTAssertTrue(tracker.completeBackoff(host: host, token: token, hasActiveSession: false))
+                } else {
+                    XCTAssertEqual(followUp, .notifyChanged)
+                }
+            }
+        }
+        _ = tracker.updateTargets([], activeSessions: [])
+        _ = tracker.updateTargets([a, b], activeSessions: [], attachments: [a: 1, b: 2])
+        XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
+        // The new USB entry may arrive before its replacement capture source.
+        _ = tracker.updateTargets([b], activeSessions: [], attachments: [a: 3, b: 2])
+        XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
+        _ = tracker.updateTargets([a, b], activeSessions: [], attachments: [a: 3, b: 2])
+        XCTAssertEqual(tracker.connectableHosts(activeSessions: []), [a])
+        XCTAssertEqual(tracker.attemptsUsed[b], HIDReconnectTracker.maxAutomaticAttempts)
+        _ = tracker.updateTargets([a, b], activeSessions: [], resetHosts: [b])
+        XCTAssertEqual(tracker.connectableHosts(activeSessions: []), [a, b])
     }
 
     func testReconnectTrackerQueuesRetryAcrossAsyncCancelWithoutDroppingNewAttempt() {
@@ -356,7 +377,7 @@ final class HIDConnectionStateTests: XCTestCase {
         var tracker = HIDReconnectTracker()
 
         XCTAssertTrue(
-            tracker.updateTargets([saved], activeSessions: [], resetExhausted: true).isEmpty)
+            tracker.updateTargets([saved], activeSessions: [], resetHosts: [saved]).isEmpty)
         XCTAssertEqual(tracker.connectableHosts(activeSessions: []), [saved])
         let attempt1 = tracker.beginConnecting(saved)
         XCTAssertEqual(tracker.reconnectingHosts(activeSessions: []), [saved])
@@ -368,7 +389,7 @@ final class HIDConnectionStateTests: XCTestCase {
         // A fresh request arrives before didDisconnectPeripheral fires; it must defer connect
         // until cancellation finishes so the late callback cannot delete Attempt 2.
         XCTAssertTrue(
-            tracker.updateTargets([saved], activeSessions: [], resetExhausted: true).isEmpty)
+            tracker.updateTargets([saved], activeSessions: [], resetHosts: [saved]).isEmpty)
         XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
         XCTAssertEqual(tracker.phases[saved], .cancelling(attempt: attempt1, retryDesired: true))
         XCTAssertEqual(tracker.reconnectingHosts(activeSessions: []), [saved])
@@ -386,7 +407,7 @@ final class HIDConnectionStateTests: XCTestCase {
     func testReconnectTrackerBoundsRetriesAndRecoversMidSessionDisconnect() {
         let saved = UUID()
         var tracker = HIDReconnectTracker()
-        _ = tracker.updateTargets([saved], activeSessions: [], resetExhausted: true)
+        _ = tracker.updateTargets([saved], activeSessions: [], resetHosts: [saved])
 
         XCTAssertEqual(HIDReconnectTracker.attemptTimeout, 20)
         XCTAssertEqual(HIDReconnectTracker.maxAutomaticAttempts, 6)
@@ -412,19 +433,19 @@ final class HIDConnectionStateTests: XCTestCase {
         XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
 
         // Passive host-change re-evaluation keeps the exhausted budget quiet.
-        _ = tracker.updateTargets([saved], activeSessions: [], resetExhausted: false)
+        _ = tracker.updateTargets([saved], activeSessions: [])
         XCTAssertTrue(tracker.connectableHosts(activeSessions: []).isEmpty)
 
         // Explicit /match or USB event resets budget; active session also resets budget for
         // later mid-session BLE drops while USB stays online.
-        _ = tracker.updateTargets([saved], activeSessions: [], resetExhausted: true)
+        _ = tracker.updateTargets([saved], activeSessions: [], resetHosts: [saved])
         _ = tracker.beginConnecting(saved)
         tracker.noteSessionEstablished(saved)
         XCTAssertEqual(tracker.attemptsUsed[saved], 0)
         XCTAssertTrue(tracker.reconnectingHosts(activeSessions: [saved]).isEmpty)
 
         // Mid-session BLE unsubscribe before central disconnect cancels stale link and retries.
-        let toCancel = tracker.updateTargets([saved], activeSessions: [], resetExhausted: false)
+        let toCancel = tracker.updateTargets([saved], activeSessions: [])
         XCTAssertEqual(toCancel, [saved])
         XCTAssertEqual(
             tracker.handleTermination(host: saved, hasActiveSession: false),
@@ -478,7 +499,7 @@ final class HIDConnectionStateTests: XCTestCase {
     func testRecordSubscriptionEstablishesSessionWithoutEnqueuingUnsolicitedPointerOrInputReports() throws {
         var connections = HIDConnectionState()
         var tracker = HIDReconnectTracker()
-        _ = tracker.updateTargets([host], activeSessions: [], resetExhausted: true)
+        _ = tracker.updateTargets([host], activeSessions: [], resetHosts: [host])
         let attempt = tracker.beginConnecting(host)
 
         // Non-input GATT channels do not establish an input session or queue reports.
@@ -790,7 +811,7 @@ final class HIDConnectionStateTests: XCTestCase {
 
     func testReconnectTrackerSuspendForLifecycleTeardownPreservesTargetsAndResetsRetryBudget() {
         var tracker = HIDReconnectTracker()
-        _ = tracker.updateTargets([host, other], activeSessions: [], resetExhausted: true)
+        _ = tracker.updateTargets([host, other], activeSessions: [], resetHosts: [host, other])
 
         // `host` fails twice into backoff; `other` is actively connecting when sleep occurs.
         _ = tracker.beginConnecting(host)

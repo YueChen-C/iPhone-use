@@ -56,21 +56,56 @@ enum CaptureScreenMapping {
         let instance: UUID
     }
 
-    /// Reuse a proven route only when current raw dimensions uniquely identify
-    /// that physical phone among every present phone. Unknown and equal-sized
-    /// peers require independent verification; never infer them by elimination.
-    static func continuing(
-        physicalIDs: Set<String>, expectedSizes: [String: CGSize], sourceSizes: [String: CGSize]
-    ) -> [String: String] {
-        guard physicalIDs.allSatisfy({ expectedSizes[$0] != nil }) else { return [:] }
-        var result: [String: String] = [:]
-        for id in physicalIDs {
-            guard let expected = expectedSizes[id], expected.width > 0, expected.height > 0,
-                expectedSizes.values.filter({ $0 == expected }).count == 1 else { continue }
-            let candidates = sourceSizes.filter { $0.value == expected }
-            if candidates.count == 1 { result[id] = candidates.first!.key }
+    /// A registry entry proves a USB attachment, not what is in an AVFoundation
+    /// buffer. Retain an independently verified exact route only on the same run.
+    struct USBRoute: Equatable {
+        let entryID: UInt64
+        let sourceInstance: UUID
+        let run: UInt64
+    }
+
+    static func usbEntries(
+        sourceIDs: Set<String>, devices: [USBValeriaConfigurator.PinnedUSBDevice]
+    ) -> [String: UInt64] {
+        let normalized = USBValeriaConfigurator.normalizedSerial
+        let sources = Dictionary(grouping: sourceIDs.compactMap { id in normalized(id).map { ($0, id) } }) { $0.0 }
+        let attached = Dictionary(grouping: devices.compactMap { device in
+            normalized(device.serial).map { ($0, device.registryEntryID) }
+        }) { $0.0 }
+        let entryCounts = Dictionary(grouping: devices, by: \.registryEntryID)
+        return sources.reduce(into: [:]) { result, group in
+            guard group.value.count == 1, let matches = attached[group.key], matches.count == 1,
+                let entry = matches.first?.1, entry != 0, entryCounts[entry]?.count == 1
+            else { return }
+            result[group.value[0].1] = entry
         }
-        return result
+    }
+
+    /// Bulk enumeration and AVFoundation discovery are independent snapshots.
+    /// A missing AV listing is not a detach if the old capture is still live;
+    /// when the bulk read fails, use positive per-entry evidence, never cached presence.
+    static func refreshUSBEntries(
+        discoveredIDs: Set<String>, devices: [USBValeriaConfigurator.PinnedUSBDevice]?,
+        confirmedEntries: [String: UInt64], readEntry: (UInt64) -> USBValeriaConfigurator.PinnedUSBDevice?
+    ) -> [String: UInt64] {
+        let candidates = discoveredIDs.union(confirmedEntries.keys)
+        if let devices { return usbEntries(sourceIDs: candidates, devices: devices) }
+        let exact = Set(confirmedEntries.values).compactMap { entryID in
+            readEntry(entryID).flatMap { $0.registryEntryID == entryID ? $0 : nil }
+        }
+        return usbEntries(sourceIDs: candidates, devices: exact).filter { confirmedEntries[$0.key] == $0.value }
+    }
+
+    static func continuing(
+        proven: [String: USBRoute], current: [String: USBRoute],
+        expectedSizes: [String: CGSize], sourceSizes: [String: CGSize]
+    ) -> [String: String] {
+        proven.reduce(into: [:]) { result, pair in
+            guard current[pair.key] == pair.value, let expected = expectedSizes[pair.key],
+                sourceSizes[pair.key] == expected
+            else { return }
+            result[pair.key] = pair.key
+        }
     }
 
     static func previews(

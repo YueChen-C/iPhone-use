@@ -1,18 +1,40 @@
 import Foundation
 
-/// A newly attached AVFoundation stream can remain empty after startRunning.
-/// Recover only empty streams, once per source instance, without a timer loop.
+/// Recover only still-empty sources. If restarting the original AVCaptureSession
+/// cannot produce frames, give that source one fresh native input after a cooldown.
 struct CaptureSourceRecovery {
-    private var attempted: Set<UUID> = []
+    enum Action: Equatable { case restart, reopenInput }
+    // The native CMIO start may spend several seconds waiting for its stream.
+    static let initialGrace: TimeInterval = 6
+    static let reopenDelay: TimeInterval = 10
 
-    mutating func take(empty: Set<UUID>) -> Set<UUID> {
-        let fresh = empty.subtracting(attempted)
-        attempted.formUnion(fresh)
-        return fresh
+    static func permitsInitialRecovery(startedAt: TimeInterval, now: TimeInterval) -> Bool {
+        now - startedAt >= initialGrace
+    }
+    private var firstAttempt: [UUID: TimeInterval] = [:]
+    private var reopened: Set<UUID> = []
+
+    mutating func take(
+        empty: Set<UUID>,
+        now: TimeInterval,
+        allowReopen: Bool = true
+    ) -> [UUID: Action] {
+        empty.reduce(into: [:]) { actions, id in
+            guard !reopened.contains(id) else { return }
+            if let first = firstAttempt[id] {
+                guard allowReopen, now - first >= Self.reopenDelay else { return }
+                reopened.insert(id)
+                actions[id] = .reopenInput
+            } else {
+                firstAttempt[id] = now
+                actions[id] = .restart
+            }
+        }
     }
 
     mutating func retain(sources: Set<UUID>) {
-        attempted.formIntersection(sources)
+        firstAttempt = firstAttempt.filter { sources.contains($0.key) }
+        reopened.formIntersection(sources)
     }
 }
 
@@ -455,6 +477,11 @@ protocol CaptureValeriaRecoverySource: AnyObject {
     func recordRecoveryError(_ message: String)
 }
 
+enum CaptureValeriaIdentityTarget: Equatable {
+    case source(String)
+    case usbEntry(UInt64)
+}
+
 protocol CaptureValeriaRecoveryHost: AnyObject {
     associatedtype Source: CaptureValeriaRecoverySource
     var recoveryLock: NSLock { get }
@@ -465,7 +492,7 @@ protocol CaptureValeriaRecoveryHost: AnyObject {
     var recoveryIdentityGenerationLocked: UInt64 { get }
     var recoveryVerificationStateLocked: ScreenCaptureIdentityState { get }
     func withValeriaTrackerLocked<T>(_ body: (inout CaptureValeriaRecoveryTracker) -> T) -> T
-    func enterMultiDevicePendingForValeriaLocked()
+    func enterMultiDevicePendingForValeriaLocked(target: CaptureValeriaIdentityTarget)
     func notifyScreensChangedAfterValeriaGate()
     func scheduleValeriaIdentityVerification(generation: UInt64, sources: [String: Source])
 }
@@ -1042,7 +1069,7 @@ enum CaptureValeriaRecoveryCoordinator {
         let preState: (shouldProceed: Bool, closedGate: Bool) = host.recoveryLock.withLock {
             guard !host.isRecoveryStoppedLocked else { return (false, false) }
             if host.recoverySourcesLocked.count > 1 {
-                host.enterMultiDevicePendingForValeriaLocked()
+                host.enterMultiDevicePendingForValeriaLocked(target: .usbEntry(entryID))
                 return (true, true)
             }
             return (true, false)
@@ -1059,7 +1086,7 @@ enum CaptureValeriaRecoveryCoordinator {
                 guard !host.isRecoveryStoppedLocked,
                     host.recoverySourcesLocked.count > 1
                 else { return (false, nil) }
-                host.enterMultiDevicePendingForValeriaLocked()
+                host.enterMultiDevicePendingForValeriaLocked(target: .usbEntry(entryID))
                 return (true, (host.recoveryIdentityGenerationLocked, host.recoverySourcesLocked))
             }
         if postVerify.closedGate {
@@ -1093,7 +1120,7 @@ enum CaptureValeriaRecoveryCoordinator {
                 return nil
             case .start(let tryUSB):
                 if host.recoverySourcesLocked.count > 1 {
-                    host.enterMultiDevicePendingForValeriaLocked()
+                    host.enterMultiDevicePendingForValeriaLocked(target: .source(source.id))
                 }
                 return (snapshotLocked(host: host, source: source), tryUSB)
             }
@@ -1121,11 +1148,15 @@ enum CaptureValeriaRecoveryCoordinator {
             var switchedEntryID: UInt64?
             var unconfirmedEntryID: UInt64?
             if plan.tryUSB, isEligibleToMutateUSB() {
+                log(
+                    "USB Valeria recovery attempt source=\(plan.snapshot.sourceID) multi=\(plan.snapshot.isMultiDevice)"
+                )
                 let outcome = activateUSB(
                     plan.snapshot.sourceID,
                     !plan.snapshot.isMultiDevice,
                     source.pinnedUSBDevice,
                     isEligibleToMutateUSB)
+                log("USB Valeria recovery outcome source=\(plan.snapshot.sourceID): \(String(describing: outcome))")
                 switch outcome {
                 case .switched(let record):
                     switchedEntryID = record.registryEntryID
@@ -1137,8 +1168,11 @@ enum CaptureValeriaRecoveryCoordinator {
                 case .blockedByUSBResourceShortage:
                     source.recordRecoveryError(usbResourceShortageMessage)
                 case .notActivated:
+                    source.recordRecoveryError("USB Valeria configuration was not activated")
                     break
                 }
+            } else if plan.tryUSB {
+                log("USB Valeria recovery skipped because topology changed before activation: \(plan.snapshot.sourceID)")
             }
 
             let postAction = host.recoveryLock.withLock {

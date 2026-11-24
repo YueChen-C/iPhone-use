@@ -88,6 +88,43 @@ final class WorkbenchStateTests: XCTestCase {
         XCTAssertEqual(state.devices.count, 3)
     }
 
+    func testRemoveDisconnectedRequiresExactIDAndKeepsFilteredSelectionValid() {
+        var state = WorkbenchState()
+        let a = device("phone-a", "iPhone")
+        let b = device("phone-ab", "iPhone")
+        let c = device("other", "Other")
+        state.reconcile([a, b, c])
+        state.layout = .focus
+        state.query = "iPhone"
+        XCTAssertTrue(state.select(a.id))
+        XCTAssertFalse(state.removeDisconnected(a.id), "a connected device cannot be removed")
+        state.reconcile([b, c])
+        XCTAssertFalse(state.removeDisconnected("phone"), "partial IDs do not target any card")
+        XCTAssertTrue(state.removeDisconnected(a.id))
+        XCTAssertEqual(state.selectedID, b.id)
+        XCTAssertEqual(state.visible.map(\.id), [b.id])
+        state.reconcile([b, c])
+        XCTAssertEqual(Set(state.devices.map(\.id)), [b.id, c.id])
+        state.reconcile([a, b, c])
+        XCTAssertEqual(Set(state.devices.map(\.id)), [a.id, b.id, c.id])
+        XCTAssertEqual(state.selectedID, b.id)
+    }
+
+    func testRemoveLastDisconnectedCardResetsSelectionAndPage() {
+        var state = WorkbenchState()
+        state.reconcile([device("a"), device("b")])
+        state.setPageCapacity(1)
+        XCTAssertTrue(state.select("b"))
+        XCTAssertEqual(state.pageIndex, 1)
+        state.reconcile([])
+        XCTAssertTrue(state.removeDisconnected("b"))
+        XCTAssertEqual(state.pageIndex, 0)
+        XCTAssertEqual(state.selectedID, "a")
+        XCTAssertTrue(state.removeDisconnected("a"))
+        XCTAssertTrue(state.visible.isEmpty)
+        XCTAssertNil(state.selectedID)
+    }
+
     func testSearchAndFocusDoNotMutateInputIdentity() {
         var state = WorkbenchState()
         state.reconcile([device("a", "Office"), device("b", "Lab")])
@@ -670,6 +707,74 @@ final class WorkbenchNativeViewTests: XCTestCase {
         XCTAssertEqual(text.stringValue, "draft for a")
         root.select("b")
         XCTAssertEqual(text.stringValue, "draft for b")
+    }
+
+    func testCardClosesOnlyItsIndependentWindowAndReturnsToExpand() throws {
+        _ = NSApplication.shared
+        let root = WorkbenchRootView(frame: NSRect(x: 0, y: 0, width: 1440, height: 850), preview: true)
+        let a = WorkbenchDevice(id: "phone-a", name: "iPhone", connected: true, backend: .usb, status: "ready")
+        let b = WorkbenchDevice(id: "phone-ab", name: "iPhone", connected: true, backend: .usb, status: "ready")
+        let devices = [a, b]
+        var openIDs: Set<String> = [a.id, b.id]
+        var closed: [String] = []
+        root.loadPreview(devices, independentIDs: openIDs)
+        root.select(b.id)
+        root.onCloseIndependent = { [weak root] id in
+            closed.append(id)
+            openIDs.remove(id)
+            root?.loadPreview(devices, independentIDs: openIDs)
+        }
+        func action(_ id: String) -> WorkbenchActionButton? {
+            descendants(root).compactMap { $0 as? WorkbenchActionButton }.first { $0.accessibilityIdentifier() == id }
+        }
+        let closeA = try XCTUnwrap(action("card-close-window:\(a.id)"))
+        XCTAssertEqual(closeA.symbolName, "xmark")
+        XCTAssertEqual(closeA.accessibilityLabel(), StringsWorkbench.current.closeIndependent)
+        closeA.performClick(nil)
+        XCTAssertEqual(closed, [a.id])
+        XCTAssertEqual(openIDs, [b.id])
+        XCTAssertNotNil(action("card-close-window:\(b.id)"))
+        XCTAssertEqual(root.state.selectedID, b.id)
+        let expandA = try XCTUnwrap(action("card-expand:\(a.id)"))
+        var reopened: [String] = []
+        root.onIndependent = { reopened.append($0) }
+        expandA.performClick(nil)
+        XCTAssertEqual(reopened, [a.id])
+    }
+
+    func testRemoveOfflineCardClosesOnlyItsWindowPreservesOtherDraftAndAllowsRediscovery() throws {
+        _ = NSApplication.shared
+        let root = WorkbenchRootView(frame: NSRect(x: 0, y: 0, width: 1440, height: 850), preview: true)
+        let a = WorkbenchDevice(id: "phone-a", name: "iPhone", connected: true, backend: .usb, status: "ready")
+        let b = WorkbenchDevice(id: "phone-ab", name: "iPhone", connected: true, backend: .usb, status: "ready")
+        root.loadPreview([a, b], independentIDs: [a.id, b.id])
+        root.select(b.id)
+        let draft = try XCTUnwrap(descendants(root).compactMap { $0 as? NSTextField }.first {
+            $0.isEditable && !($0 is NSSearchField)
+        })
+        draft.stringValue = "draft for remaining phone"
+        root.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: draft))
+        root.select(a.id)
+        root.loadPreview([b], independentIDs: [a.id, b.id])
+        var closed: [String] = []
+        root.onCloseIndependent = { closed.append($0) }
+        let remove = try XCTUnwrap(descendants(root).compactMap { $0 as? WorkbenchActionButton }.first {
+            $0.accessibilityIdentifier() == "card-remove:\(a.id)"
+        })
+        XCTAssertEqual(remove.symbolName, "trash")
+        XCTAssertEqual(remove.accessibilityLabel(), StringsWorkbench.current.removeDeviceCard)
+        remove.performClick(nil)
+        XCTAssertNil(remove.superview?.superview, "the removed card is no longer mounted")
+        XCTAssertEqual(closed, [a.id])
+        XCTAssertEqual(root.state.devices.map(\.id), [b.id])
+        XCTAssertEqual(root.state.selectedID, b.id)
+        XCTAssertEqual(draft.stringValue, "draft for remaining phone")
+        root.loadPreview([b], independentIDs: [b.id])
+        XCTAssertEqual(root.state.devices.map(\.id), [b.id])
+        root.loadPreview([a, b], independentIDs: [b.id])
+        XCTAssertEqual(Set(root.state.devices.map(\.id)), [a.id, b.id])
+        XCTAssertEqual(root.state.selectedID, b.id)
+        XCTAssertFalse(descendants(root).contains { $0.accessibilityIdentifier() == "card-remove:\(a.id)" })
     }
 
     func testNativeEditMenuStandardSelectAllActionEditsOnlyLocalField() throws {

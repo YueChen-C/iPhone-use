@@ -89,36 +89,54 @@ enum CaptureIdentityMatcher {
             Set(physical.keys).isSubset(of: physicalIDs), unavailable.isSubset(of: physicalIDs),
             Set(physical.keys).isDisjoint(with: unavailable)
         else { return [:] }
-        var candidates: [String: String] = [:]
-        for (id, image) in physical where image.hasVisibleContent {
-            let sparse = !image.isInformative
-            let scores = sources.compactMap { sourceID, candidate -> (String, Double)? in
-                guard sparse ? candidate.hasVisibleContent : candidate.isInformative else { return nil }
-                return image.distance(to: candidate).map { (sourceID, $0) }
-            }.sorted { $0.1 < $1.1 }
-            // Sparse pages can still match an independent screenshot when all
-            // streams exist and only one has the same aspect ratio. Require a
-            // much closer image match; never identify a blank or same-size
-            // ambiguous pair by brightness or the nominal AVFoundation UID.
-            if sparse {
-                let compatible = sources.values.filter { abs($0.aspectRatio - image.aspectRatio) <= 0.03 }
-                guard Set(sources.keys) == physicalIDs, compatible.count == 1 else { continue }
-            }
-            guard let best = scores.first, best.1 <= (sparse ? 0.025 : 0.10),
-                scores.count == 1 || scores[1].1 - best.1 >= 0.04
-            else { continue }
-            candidates[id] = best.0
+        let candidates = physical.compactMapValues {
+            matchingSource(for: $0, sources: sources, physicalIDs: physicalIDs)
         }
-        var mapping = candidates.filter { entry in
-            candidates.values.filter { $0 == entry.value }.count == 1
+        return completingUnavailable(
+            mapping: uniqueMappings(candidates), physicalIDs: physicalIDs,
+            sources: sources, unavailable: unavailable)
+    }
+
+    static func matchingSource(
+        for image: CaptureIdentityImage, sources: [String: CaptureIdentityImage], physicalIDs: Set<String>
+    ) -> String? {
+        guard image.hasVisibleContent, Set(sources.keys).isSubset(of: physicalIDs) else { return nil }
+        let sparse = !image.isInformative
+        let scores = sources.compactMap { sourceID, candidate -> (String, Double)? in
+            guard sparse ? candidate.hasVisibleContent : candidate.isInformative else { return nil }
+            return image.distance(to: candidate).map { (sourceID, $0) }
+        }.sorted { $0.1 < $1.1 }
+        // Sparse pages can still match an independent screenshot when all
+        // streams exist and only one has the same aspect ratio. Require a
+        // much closer image match; never identify a blank or same-size
+        // ambiguous pair by brightness or the nominal AVFoundation UID.
+        if sparse {
+            let compatible = sources.values.filter { abs($0.aspectRatio - image.aspectRatio) <= 0.03 }
+            guard Set(sources.keys) == physicalIDs, compatible.count == 1 else { return nil }
         }
+        guard let best = scores.first, best.1 <= (sparse ? 0.025 : 0.10),
+            scores.count == 1 || scores[1].1 - best.1 >= 0.04
+        else { return nil }
+        return best.0
+    }
+
+    static func uniqueMappings(_ candidates: [String: String]) -> [String: String] {
+        let counts = Dictionary(grouping: candidates.values, by: { $0 })
+        return candidates.filter { counts[$0.value]?.count == 1 }
+    }
+
+    static func completingUnavailable(
+        mapping: [String: String], physicalIDs: Set<String>,
+        sources: [String: CaptureIdentityImage], unavailable: Set<String>
+    ) -> [String: String] {
+        guard !mapping.isEmpty, Set(sources.keys).isSubset(of: physicalIDs) else { return mapping }
         let remainingPhysical = physicalIDs.subtracting(mapping.keys)
         let remainingSources = Set(sources.keys).subtracting(mapping.values)
-        if !mapping.isEmpty, remainingPhysical.count == 1, remainingSources.count == 1,
+        if remainingPhysical.count == 1, remainingSources.count == 1,
             let id = remainingPhysical.first, unavailable.contains(id),
             let source = remainingSources.first, sources[source]?.hasVisibleContent == true
         {
-            mapping[id] = source
+            return mapping.merging([id: source]) { old, _ in old }
         }
         return mapping
     }

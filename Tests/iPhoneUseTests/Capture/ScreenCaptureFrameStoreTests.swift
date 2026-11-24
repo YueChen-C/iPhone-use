@@ -83,6 +83,44 @@ final class ScreenCaptureFrameStoreTests: XCTestCase {
         XCTAssertFalse(store.publish(try buffer(width: 24), receivedAt: 13))
     }
 
+    func testRestartAdvancesRunAndDiscardsPriorPixelsWithoutResettingFrameSequence() throws {
+        let store = ScreenCaptureFrameStore()
+        let queue = DispatchQueue(label: "capture-lifecycle-tests.run")
+        let session = MockCaptureRunningSession(onStart: {})
+        let lifecycle = CaptureSourceLifecycle(session: session, frames: store, queue: queue)
+        XCTAssertTrue(store.publish(try buffer(), receivedAt: 10))
+        XCTAssertEqual(lifecycle.captureRun, 0)
+        XCTAssertTrue(lifecycle.restart())
+        queue.sync {}
+        XCTAssertEqual(lifecycle.captureRun, 1)
+        XCTAssertNil(store.snapshot(), "previous run's pixels cannot be identity evidence")
+        XCTAssertTrue(store.publish(try buffer(), receivedAt: 11))
+        XCTAssertEqual(store.snapshot()?.sequence, 2)
+    }
+
+    func testEmptyRecoveryReconfiguresWhileStoppedAndDoesNotDropAFirstFrame() throws {
+        let store = ScreenCaptureFrameStore()
+        let queue = DispatchQueue(label: "capture-lifecycle-tests.reopen")
+        let session = MockCaptureRunningSession()
+        let lifecycle = CaptureSourceLifecycle(session: session, frames: store, queue: queue)
+        let pixel = try buffer()
+        lifecycle.start()
+        queue.sync {}
+
+        XCTAssertTrue(lifecycle.restart(onlyIfEmpty: true) {
+            XCTAssertFalse(session.isRunning)
+            XCTAssertEqual(store.publishOutcome(pixel), .rejected)
+        })
+        queue.sync {}
+        XCTAssertEqual(lifecycle.captureRun, 1)
+        XCTAssertEqual(session.startCount, 2)
+        XCTAssertEqual(session.stopCount, 1)
+        XCTAssertEqual(store.publishOutcome(pixel), .firstFrame)
+        XCTAssertFalse(lifecycle.restart(onlyIfEmpty: true) { XCTFail("healthy stream was restarted") })
+        XCTAssertEqual(lifecycle.captureRun, 1)
+        XCTAssertEqual(store.snapshot()?.sequence, 1)
+    }
+
     func testLifecycleStopAndWaitDrainsInFlightRestartAndPreventsFramePublication() throws {
         let store = ScreenCaptureFrameStore()
         let queue = DispatchQueue(label: "capture-lifecycle-tests.interleave")

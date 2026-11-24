@@ -3,7 +3,9 @@ import Foundation
 /// Full physical identity owns selection and retirement. Switching is off the
 /// AppKit thread; neither backend may send while the previous one is retiring.
 final class USBInputController {
-    static let shared = USBInputController(preferences: .shared)
+    static let shared = USBInputController(preferences: .shared) { id, retry in
+        DeviceRegistry.shared.bluetoothRouteDidChange(id, retry: retry)
+    }
     private let lock = NSLock()
     private var transitions: [String: DispatchQueue] = [:]
     private var entries: [String: USBDeviceInput] = [:]
@@ -12,17 +14,21 @@ final class USBInputController {
     private var selectionRequests: [String: UUID] = [:]
     private var refreshing: Set<String> = []
     private var defaultInspections: [String: UUID] = [:]
+    private var inspectingDefault: [String: UUID] = [:]
     private let transitionWork = DispatchGroup()
     private var stopped = false
     private var shutdownWork: DispatchGroup?
     private var shutdownReleased = false
     private let requireUSB: (String) throws -> Void
     private let preferences: InputBackendPreferences?
+    private let bluetoothRouteChanged: (String, Bool) -> Void
 
     init(requireUSB: @escaping (String) throws -> Void = USBBackendCompatibility.require,
-         preferences: InputBackendPreferences? = nil) {
+         preferences: InputBackendPreferences? = nil,
+         bluetoothRouteChanged: @escaping (String, Bool) -> Void = { _, _ in }) {
         self.requireUSB = requireUSB
         self.preferences = preferences
+        self.bluetoothRouteChanged = bluetoothRouteChanged
         for (id, backend) in preferences?.load() ?? [:] {
             var state = InputBackendSelection()
             let generation = state.begin(backend)
@@ -52,7 +58,7 @@ final class USBInputController {
     @discardableResult
     func applyDefault(physicalID: String, version: String) -> Bool {
         guard InputBackendKind.defaultForIOSVersion(version) == .usb else { return false }
-        return lock.withLock {
+        let changed = lock.withLock {
             guard !stopped, selectionRequests[physicalID] == nil,
                   entries[physicalID] == nil, selections[physicalID]?.backend != .usb else { return false }
             var state = selections[physicalID] ?? InputBackendSelection()
@@ -61,6 +67,8 @@ final class USBInputController {
             selections[physicalID] = state
             return true
         }
+        if changed { bluetoothRouteChanged(physicalID, false) }
+        return changed
     }
     func generation(_ id: String) -> UUID { lock.withLock {
         if selections[id] == nil { selections[id] = InputBackendSelection() }
@@ -68,6 +76,16 @@ final class USBInputController {
     } }
     func permitsBLE(_ id: String, generation: UUID?) -> Bool {
         lock.withLock { !stopped && (selections[id]?.permits(.ble, generation: generation) ?? (generation == nil)) }
+    }
+    /// Do not wake BLE during version detection, just before discovering that
+    /// a new phone defaults to USB. A saved or explicit choice wins.
+    func permitsBluetoothReconnect(_ id: String, requiresKnownBackend: Bool = false) -> Bool {
+        lock.withLock {
+            let explicit = selectionRequests[id] != nil
+            guard !stopped, inspectingDefault[id] == nil || explicit else { return false }
+            if requiresKnownBackend, !explicit, defaultInspections[id] == nil { return false }
+            return selections[id]?.permits(.ble) ?? true
+        }
     }
     func input(_ device: Device) -> USBDeviceInput? {
         lock.withLock {
@@ -129,6 +147,7 @@ final class USBInputController {
         guard let (generation, previous, transitionQueue) = admitted else {
             throw USBInputFailure(.staleSession, "USB selection cancelled or superseded; no replay")
         }
+        if expectedGeneration == nil { bluetoothRouteChanged(device.id, false) }
         previous?.retire() // EOF interrupts a synchronous worker gesture too.
         DeviceRegistry.shared.cancelBackgroundMotion(for: device)
         transitionQueue.async { [self] in
@@ -151,7 +170,10 @@ final class USBInputController {
                 if let input { entries[device.id] = input }
                 return true
             }
-            if accepted { input?.prepare() } else { input?.retire() }
+            if accepted {
+                input?.prepare()
+                if backend == .ble { bluetoothRouteChanged(device.id, true) }
+            } else { input?.retire() }
         }
     }
     func refresh(_ device: Device) {
@@ -213,10 +235,19 @@ final class USBInputController {
                 guard !stopped, selectionRequests[screen.id] == nil,
                       defaultInspections[screen.id] != screen.associationIdentity else { return false }
                 defaultInspections[screen.id] = screen.associationIdentity
+                inspectingDefault[screen.id] = screen.associationIdentity
                 return true
             }
             guard inspect else { continue }
             DispatchQueue.global(qos: .utility).async { [self] in
+                defer {
+                    let current = lock.withLock {
+                        guard inspectingDefault[screen.id] == screen.associationIdentity else { return false }
+                        inspectingDefault[screen.id] = nil
+                        return !stopped
+                    }
+                    if current { bluetoothRouteChanged(screen.id, false) }
+                }
                 guard let version = try? USBBackendCompatibility.version(physicalID: screen.id),
                       ScreenCaptureManager.shared.isCurrent(screen),
                       applyDefault(physicalID: screen.id, version: version),

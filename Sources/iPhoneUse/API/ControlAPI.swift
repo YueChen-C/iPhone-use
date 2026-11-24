@@ -248,6 +248,7 @@ enum ControlAPI {
         return [
             "idleSuspended": QuietModeActivityController.shared.isSuspended,
             "identityState": manager.identityState.rawValue,
+            "usbAttachedCount": manager.observedUSBTopology.attachedDeviceCount.map { $0 as Any } ?? NSNull(),
             "permitsPointerAssociation": manager.permitsPointerAssociation,
             "screens": manager.all.map { screen -> [String: Any] in
                 var info: [String: Any] = [

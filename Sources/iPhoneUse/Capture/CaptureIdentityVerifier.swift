@@ -56,7 +56,27 @@ struct CaptureIdentityRecovery {
         sourceCount: Int, state: ScreenCaptureIdentityState
     ) -> Bool {
         !stopped && expected == current && sourceCount > 0
-            && [.failed, .partiallyVerified].contains(state)
+            && [.failed, .partiallyVerified, .unavailable].contains(state)
+    }
+}
+
+/// A new frame can move a backed-off check earlier without leaving two jobs
+/// for the same generation. A topology change always gets a fresh ticket.
+struct CaptureIdentityCheckSchedule {
+    private var nextTicket: UInt64 = 0
+    private var pending: (generation: UInt64, deadline: DispatchTime, ticket: UInt64)?
+
+    mutating func request(generation: UInt64, deadline: DispatchTime) -> UInt64? {
+        if let pending, pending.generation == generation, pending.deadline <= deadline { return nil }
+        nextTicket &+= 1
+        pending = (generation, deadline, nextTicket)
+        return nextTicket
+    }
+
+    mutating func take(ticket: UInt64) -> Bool {
+        guard pending?.ticket == ticket else { return false }
+        pending = nil
+        return true
     }
 }
 
@@ -76,46 +96,125 @@ enum CaptureIdentityVerifier {
         case failed
     }
 
-    /// Injectable screenshot collection keeps missing screenshotr services and
-    /// mixed-device verification covered without requiring physical phones.
+    struct Evidence {
+        var independent: [String: String] = [:]
+        var contradicted: Set<String> = []
+    }
+
+    private struct Round {
+        var candidates: [String: String] = [:]
+        var unavailable: Set<String> = []
+    }
+
+    /// Bound the number of USB screenshot workers, not the number of phones.
+    /// Sample immediately after each shot so a slow peer cannot age the image.
+    private static func collectRound(
+        pending: [String], ids: Set<String>, maxConcurrentScreenshots: Int,
+        sourceImages: () -> [String: CaptureIdentityImage], isCurrent: () -> Bool,
+        screenshot: (String) -> Screenshot
+    ) -> Round {
+        let workLock = NSLock()
+        // CI rendering is much more memory intensive than comparing signatures.
+        let frameLock = NSLock()
+        var next = 0
+        var round = Round()
+        let workerCount = min(pending.count, max(1, maxConcurrentScreenshots))
+        func work(_: Int) {
+            while isCurrent() {
+                let id = workLock.withLock { () -> String? in
+                    guard next < pending.count else { return nil }
+                    defer { next += 1 }
+                    return pending[next]
+                }
+                guard let id, isCurrent() else { return }
+                let shot = screenshot(id)
+                guard isCurrent() else { return }
+                switch shot {
+                case .image(let image):
+                    guard let frames = frameLock.withLock({ isCurrent() ? sourceImages() : nil }) else { return }
+                    let candidate = CaptureIdentityMatcher.matchingSource(for: image, sources: frames, physicalIDs: ids)
+                    workLock.withLock { round.candidates[id] = candidate }
+                case .unavailable:
+                    _ = workLock.withLock { round.unavailable.insert(id) }
+                case .failed:
+                    break
+                }
+            }
+        }
+        if workerCount == 1 { work(0) }
+        else { DispatchQueue.concurrentPerform(iterations: workerCount, execute: work) }
+        return round
+    }
+
+    /// Compare each screenshot with the latest frames immediately after its
+    /// own capture, not after all the other devices have finished taking theirs.
     static func verify(
         physicalIDs: [String], sourceImages: () -> [String: CaptureIdentityImage],
-        isCurrent: () -> Bool, waitForRetry: () -> Void = {}, screenshot: (String) -> Screenshot
+        isCurrent: () -> Bool, waitForRetry: () -> Void = {}, retained: [String: String] = [:],
+        reportEvidence: (Evidence) -> Void = { _ in }, maxConcurrentScreenshots: Int = 1,
+        screenshot: (String) -> Screenshot
     ) -> Result {
+        guard !physicalIDs.isEmpty, isCurrent() else { return .failed }
+        let pending = physicalIDs.filter { retained[$0] == nil }
+        guard !pending.isEmpty else { return .verified(retained) }
+        let ids = Set(physicalIDs)
         var previous: [String: String]?
+        var previousIndependent: [String: String] = [:]
+        var previousConflicts: Set<String> = []
         for attempt in 0..<3 {
             if attempt > 0 { waitForRetry() }
             guard isCurrent() else { return .failed }
-            var physical: [String: CaptureIdentityImage] = [:]
-            var unavailable: Set<String> = []
-            for id in physicalIDs {
-                guard isCurrent() else { return .failed }
-                switch screenshot(id) {
-                case .image(let image): physical[id] = image
-                case .unavailable: unavailable.insert(id)
-                case .failed: break
+            let round = collectRound(
+                pending: pending, ids: ids, maxConcurrentScreenshots: maxConcurrentScreenshots,
+                sourceImages: sourceImages, isCurrent: isCurrent, screenshot: screenshot)
+            guard isCurrent() else { return .failed }
+            let candidates = round.candidates
+            let unavailable = round.unavailable
+            if unavailable.count == pending.count {
+                return retained.isEmpty ? .unavailable : .partiallyVerified(retained)
+            }
+            let claimedSources = Set(candidates.values)
+            let conflicts = Set(retained.filter { claimedSources.contains($0.value) }.keys)
+            if !conflicts.isEmpty {
+                // A repeated independent contradiction suspends only the affected
+                // retained route. Never use it to infer another phone by exclusion.
+                let repeated = conflicts.intersection(previousConflicts)
+                if !repeated.isEmpty {
+                    reportEvidence(.init(contradicted: repeated))
+                    return .failed
                 }
+                previousConflicts = conflicts
+                previous = nil
+                previousIndependent = [:]
+                continue
+            }
+            previousConflicts = []
+            let independent = CaptureIdentityMatcher.uniqueMappings(candidates)
+            var mapping = retained.merging(independent) { old, _ in old }
+            if !independent.isEmpty, unavailable.count == 1, mapping.count + 1 == ids.count {
+                mapping = CaptureIdentityMatcher.completingUnavailable(
+                    mapping: mapping, physicalIDs: ids, sources: sourceImages(), unavailable: unavailable)
             }
             guard isCurrent() else { return .failed }
-            if unavailable.count == physicalIDs.count { return .unavailable }
-            let mapping = CaptureIdentityMatcher.verifiedMappings(
-                physicalIDs: Set(physicalIDs), physical: physical,
-                sources: sourceImages(), unavailable: unavailable)
             if !mapping.isEmpty, previous == mapping {
-                return mapping.count == physicalIDs.count ? .verified(mapping) : .partiallyVerified(mapping)
+                reportEvidence(.init(independent: independent.filter { previousIndependent[$0.key] == $0.value }))
+                return mapping.count == ids.count ? .verified(mapping) : .partiallyVerified(mapping)
             }
             previous = mapping
+            previousIndependent = independent
         }
-        return .failed
+        return retained.isEmpty ? .failed : .partiallyVerified(retained)
     }
 
     static func verify(
         physicalIDs: [String], sourceImages: () -> [String: CaptureIdentityImage],
-        isCurrent: () -> Bool
+        isCurrent: () -> Bool, retained: [String: String], reportEvidence: (Evidence) -> Void,
+        screenshotTimeout: TimeInterval = 3
     ) -> Result {
-        return verify(
+        verify(
             physicalIDs: physicalIDs, sourceImages: sourceImages, isCurrent: isCurrent,
-            waitForRetry: { Thread.sleep(forTimeInterval: 0.5) },
-            screenshot: { USBIdentityScreenshot.capture(physicalID: $0) })
+            waitForRetry: { Thread.sleep(forTimeInterval: 0.5) }, retained: retained,
+            reportEvidence: reportEvidence, maxConcurrentScreenshots: 4,
+            screenshot: { USBIdentityScreenshot.capture(physicalID: $0, timeout: screenshotTimeout) })
     }
 }

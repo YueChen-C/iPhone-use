@@ -19,6 +19,7 @@ final class WorkbenchWindowCoordinator {
         legacyOnly = environment["IPHONE_USE_LEGACY_UI"] == "1"
         legacy.automaticPresentationEnabled = legacyOnly
         legacy.hasCompanionWindow = { [weak self] in self?.visibility.isOpen == true }
+        legacy.onDeviceWindowClosed = { [weak self] in self?.refresh() }
     }
 
     func start() {
@@ -71,6 +72,7 @@ final class WorkbenchWindowCoordinator {
             self.legacy.showDevice(device)
             self.refresh()
         }
+        controller.root.onCloseIndependent = { [weak self] id in self?.legacy.closeDevice(id: id) }
         refresh()
         controller.showWindow(nil)
     }
@@ -147,6 +149,7 @@ final class WorkbenchWindowController: NSWindowController, NSWindowDelegate {
 /// The view can also render explicit offline fixtures without instantiating any hardware owner.
 final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFieldDelegate {
     var onIndependent: ((String) -> Void)?
+    var onCloseIndependent: ((String) -> Void)?
     var active = false { didSet { updateActivity() } }
     private(set) var state = WorkbenchState()
     private let preview: Bool
@@ -444,9 +447,10 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
 
     func loadPreview(
         _ devices: [WorkbenchDevice], images: [String: NSImage] = [:], rawScreens: Bool = false,
-        connectionStatuses: [String: ControlConnectionStatus] = [:]
+        connectionStatuses: [String: ControlConnectionStatus] = [:], independentIDs: Set<String> = []
     ) {
         guard preview else { return }
+        self.independentIDs = independentIDs
         state.reconcile(devices)
         previewImages = images
         previewOrder = devices.map(\.id)
@@ -472,12 +476,43 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
             self?.select(id)
             self?.setLayout(.focus)
         }
-        card.onIndependent = { [weak self] in
-            self?.controllers[id]?.stop()
-            self?.onIndependent?(id)
-        }
+        card.onWindowAction = { [weak self] in self?.performCardAction(id) }
         document.addSubview(card)
         return card
+    }
+
+    private func performCardAction(_ id: String) {
+        guard let device = state.devices.first(where: { $0.id == id }) else { return }
+        if !device.connected {
+            removeDisconnectedCard(id)
+        } else if independentIDs.contains(id) {
+            onCloseIndependent?(id)
+        } else {
+            controllers[id]?.stop()
+            onIndependent?(id)
+        }
+    }
+
+    private func removeDisconnectedCard(_ id: String) {
+        // A rediscovery can land between the timer snapshot and a click.
+        guard preview || !ScreenCaptureManager.shared.all.contains(where: { $0.id == id }) else { return }
+        let wasSelected = state.selectedID == id
+        guard state.removeDisconnected(id) else { return }
+        if let controller = controllers.removeValue(forKey: id) {
+            controller.onPresentationChanged = nil
+            controller.stop()
+        }
+        cards.removeValue(forKey: id)?.removeFromSuperview()
+        hardwareLookups.removeValue(forKey: id)
+        hardwareIdentities.removeValue(forKey: id)
+        previewGuidance.removeValue(forKey: id)
+        if wasSelected {
+            window?.makeFirstResponder(nil)
+            text.stringValue = state.selectedID.flatMap { drafts[$0] } ?? ""
+            message = ""
+        }
+        if independentIDs.contains(id) { onCloseIndependent?(id) }
+        render()
     }
 
     private func refreshPresentation() {
@@ -503,12 +538,16 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
             }
         }
         for device in state.devices {
-            cards[device.id]?.update(device, selected: device.id == state.selectedID)
+            cards[device.id]?.update(
+                device, selected: device.id == state.selectedID, inSeparateWindow: independentIDs.contains(device.id))
             cards[device.id]?.isHidden = !state.visible.contains { $0.id == device.id }
         }
+        let physicalCount = preview ? nil : ScreenCaptureManager.shared.observedUSBTopology.attachedDeviceCount
         empty.isHidden = !state.visible.isEmpty
         empty.stringValue =
-            state.devices.isEmpty ? StringsWorkbench.current.noDevice : StringsWorkbench.current.noMatches
+            state.devices.isEmpty
+            ? ((physicalCount ?? 0) > 0 ? StringsWorkbench.current.waitingNativeCapture : StringsWorkbench.current.noDevice)
+            : StringsWorkbench.current.noMatches
         selectedTitle.stringValue = state.selected?.name ?? "—"
         selectedTitle.toolTip = state.selectedID
         let t = StringsWorkbench.current
@@ -523,11 +562,13 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         status.isHidden = true
         status.stringValue =
             state.selected.map { independentIDs.contains($0.id) ? t.independent : $0.status } ?? t.waitingInput
-        let count = state.devices.filter(\.connected).count
+        let captureCount = state.devices.filter(\.connected).count
+        let count = physicalCount ?? captureCount
         workspace.badge = "\(count)"
         deviceTitle.stringValue = "\(StringsWorkbench.current.devices)  \(count)"
-        connectionCount.stringValue =
-            AppLanguageStore.shared.language == .zh ? "●  \(count) 台 USB 已连接" : "●  \(count) USB connected"
+        let summary = zh ? "●  \(count) 台 USB 已连接" : "●  \(count) USB connected"
+        connectionCount.stringValue = count > 0 && captureCount == 0
+            ? summary + (zh ? " · 等待画面" : " · Waiting for capture") : summary
         backend.selectedSegment = state.selected?.backend == .usb ? 1 : 0
         pagePrevious.isHidden = state.pageCount <= 1
         pageNext.isHidden = state.pageCount <= 1
@@ -1066,11 +1107,11 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
     var onSelect: (() -> Void)?
     var onScreenshot: (() -> Void)?
     var onFocus: (() -> Void)?
-    var onIndependent: (() -> Void)?
+    var onWindowAction: (() -> Void)?
     private(set) var deviceName = ""
     private let title = WorkbenchActionButton()
     private let status = WorkbenchStyle.label(size: 10, secondary: true)
-    private let expand = WorkbenchActionButton()
+    private let windowAction = WorkbenchActionButton()
     private let screenshot = WorkbenchActionButton()
     private let independent = WorkbenchActionButton()
     private let content: NSView
@@ -1081,7 +1122,7 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         self.content = content
         phoneShell = showsShell ? WorkbenchPhoneShell(content: content) : nil
         super.init(frame: .zero)
-        [phoneShell ?? content, title, status, screenshot, independent, expand].forEach(addSubview)
+        [phoneShell ?? content, title, status, screenshot, independent, windowAction].forEach(addSubview)
         title.appearanceStyle = .plain
         title.alignment = .left
         title.font = .systemFont(ofSize: 12, weight: .semibold)
@@ -1096,9 +1137,8 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         independent.alignment = .left
         screenshot.invoke = { [weak self] in self?.onScreenshot?() }
         independent.invoke = { [weak self] in self?.onFocus?() }
-        expand.appearanceStyle = .plain
-        expand.symbolName = "arrow.up.left.and.arrow.down.right"
-        expand.invoke = { [weak self] in self?.onIndependent?() }
+        windowAction.appearanceStyle = .plain
+        windowAction.invoke = { [weak self] in self?.onWindowAction?() }
     }
     required init?(coder: NSCoder) { fatalError() }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -1115,7 +1155,7 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         return self
     }
 
-    func update(_ device: WorkbenchDevice, selected: Bool) {
+    func update(_ device: WorkbenchDevice, selected: Bool, inSeparateWindow: Bool) {
         deviceName = device.name
         self.selected = selected
         connected = device.connected
@@ -1136,9 +1176,21 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         independent.title = zh ? "聚焦设备" : "Focus device"
         independent.toolTip = independent.title
         independent.setAccessibilityLabel(independent.title)
-        expand.toolTip = zh ? "扩大" : "Expand"
-        expand.setAccessibilityLabel(expand.toolTip)
-        expand.isEnabled = device.connected
+        let texts = StringsWorkbench.current
+        if !device.connected {
+            windowAction.symbolName = "trash"
+            windowAction.toolTip = texts.removeDeviceCard
+            windowAction.setAccessibilityIdentifier("card-remove:\(device.id)")
+        } else if inSeparateWindow {
+            windowAction.symbolName = "xmark"
+            windowAction.toolTip = texts.closeIndependent
+            windowAction.setAccessibilityIdentifier("card-close-window:\(device.id)")
+        } else {
+            windowAction.symbolName = "arrow.up.left.and.arrow.down.right"
+            windowAction.toolTip = texts.expand
+            windowAction.setAccessibilityIdentifier("card-expand:\(device.id)")
+        }
+        windowAction.setAccessibilityLabel(windowAction.toolTip)
         screenshot.isEnabled = device.connected
         independent.isEnabled = device.connected
         needsDisplay = true
@@ -1169,7 +1221,7 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         super.layout()
         let w = bounds.width
         let h = bounds.height
-        expand.frame = NSRect(x: w - 35, y: 9, width: 28, height: 28)
+        windowAction.frame = NSRect(x: w - 35, y: 9, width: 28, height: 28)
         title.frame = NSRect(x: 16, y: 9, width: w - 59, height: 28)
         status.frame = NSRect(x: 16, y: 44, width: w - 30, height: 18)
         if let phoneShell {
