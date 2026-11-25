@@ -1174,19 +1174,16 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         title.alignment = .left
         title.font = .systemFont(ofSize: 12, weight: .semibold)
         title.invoke = { [weak self] in self?.onSelect?() }
-        screenshot.appearanceStyle = .plain
+        for action in [screenshot, record, independent] {
+            action.appearanceStyle = .plain
+            action.font = .systemFont(ofSize: 10)
+            action.alignment = .left
+            action.centersTitleVertically = true
+        }
         screenshot.symbolName = "camera"
-        screenshot.font = .systemFont(ofSize: 10)
-        screenshot.alignment = .left
-        record.appearanceStyle = .plain
-        record.font = .systemFont(ofSize: 10)
-        record.alignment = .left
-        record.invoke = { [weak self] in self?.onRecording?() }
-        independent.appearanceStyle = .plain
         independent.symbolName = "arrow.up.forward.square"
-        independent.font = .systemFont(ofSize: 10)
-        independent.alignment = .left
         screenshot.invoke = { [weak self] in self?.onScreenshot?() }
+        record.invoke = { [weak self] in self?.onRecording?() }
         independent.invoke = { [weak self] in self?.onFocus?() }
         windowAction.appearanceStyle = .plain
         windowAction.invoke = { [weak self] in self?.onWindowAction?() }
@@ -1275,12 +1272,6 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         NSRect(x: 1, y: bounds.height - 48, width: bounds.width - 2, height: 1).fill()
         (connected ? WorkbenchTheme.green : WorkbenchTheme.faint).setFill()
         NSBezierPath(ovalIn: NSRect(x: 16, y: 22, width: 5, height: 5)).fill()
-        let fitFrame = NSRect(x: bounds.width - 54, y: bounds.height - 29, width: 45, height: 18)
-        if independent.frame.maxX + 4 <= fitFrame.minX {
-            WorkbenchTheme.text(
-                AppLanguageStore.shared.language == .zh ? "适应  ⌄" : "Fit  ⌄", in: fitFrame, size: 9,
-                color: WorkbenchTheme.faint)
-        }
     }
     override func layout() {
         super.layout()
@@ -1297,12 +1288,14 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         } else {
             content.frame = NSRect(x: 1, y: 69, width: w - 2, height: h - 117)
         }
-        let screenshotWidth = max(64, screenshot.requiredContentWidth)
-        screenshot.frame = NSRect(x: 2, y: h - 39, width: screenshotWidth, height: 28)
-        record.frame = NSRect(x: screenshot.frame.maxX, y: h - 39, width: max(64, record.requiredContentWidth), height: 28)
-        independent.frame = NSRect(
-            x: record.frame.maxX, y: h - 39,
-            width: independent.requiredContentWidth, height: 28)
+        let actionHeight: CGFloat = 28
+        let actionY = h - (48 + actionHeight) / 2
+        var actionX: CGFloat = 4
+        for action in [screenshot, record, independent] {
+            let width = action.requiredContentWidth
+            action.frame = NSRect(x: actionX, y: actionY, width: width, height: actionHeight)
+            actionX += width
+        }
     }
 }
 

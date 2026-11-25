@@ -68,6 +68,7 @@ class WorkbenchActionButton: NSButton {
     var appearanceStyle: Appearance = .system { didSet { needsDisplay = true } }
     var symbolName: String? { didSet { needsDisplay = true } }
     var drawsDisabledAsReady = false { didSet { needsDisplay = true } }
+    var centersTitleVertically = false { didSet { needsDisplay = true } }
     var badge = "" { didSet { needsDisplay = true } }
     /// Only actual selection controls may retain .on; commands are always momentary.
     var retainsSelection = false
@@ -170,8 +171,8 @@ class WorkbenchActionButton: NSButton {
         }
         let nav = appearanceStyle == .navigation
         let iconSize: CGFloat = nav ? 17 : 14
-        let measured = (title as NSString).size(withAttributes: [.font: contentFont]).width
-        let total = min(bounds.width - 16, measured + (symbolName == nil ? 0 : iconSize + 8))
+        let titleSize = (title as NSString).size(withAttributes: [.font: contentFont])
+        let total = min(bounds.width - 16, titleSize.width + (symbolName == nil ? 0 : iconSize + 8))
         let x: CGFloat = alignment == .left || nav ? 12 : max(8, (bounds.width - total) / 2)
         if let symbolName {
             WorkbenchTheme.symbol(
@@ -179,10 +180,11 @@ class WorkbenchActionButton: NSButton {
                 color: foreground)
         }
         let textX = x + (symbolName == nil ? 0 : iconSize + 8)
+        let titleY = (bounds.height - (centersTitleVertically ? titleSize.height : 17)) / 2
         WorkbenchTheme.text(
             title,
             in: NSRect(
-                x: textX, y: (bounds.height - 17) / 2, width: bounds.width - textX - (badge.isEmpty ? 8 : 43),
+                x: textX, y: titleY, width: bounds.width - textX - (badge.isEmpty ? 8 : 43),
                 height: 20), size: font?.pointSize ?? 12,
             weight: selected || appearanceStyle == .solid ? .medium : .regular, color: foreground)
         if !badge.isEmpty {
