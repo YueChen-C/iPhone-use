@@ -508,6 +508,18 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
         lock.withLock { screens[screen.id] === screen && verifiedScreenIDs.contains(screen.id) }
     }
 
+    func startRecording(
+        screen: ScreenCaptureSession, destination: URL,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) throws -> ScreenVideoRecording {
+        try lock.withLock {
+            guard screens[screen.id] === screen, screen.displayIdentityConfirmed else {
+                throw ScreenVideoRecording.Failure.identityUnverified
+            }
+            return try screen.startRecording(destination: destination, completion: completion)
+        }
+    }
+
     var associationScreens: [ScreenCaptureSession] {
         lock.withLock {
             screens.values.filter {
@@ -1110,7 +1122,18 @@ final class ScreenCaptureSession {
         self.expectedSize = expectedSize
     }
 
-    fileprivate func setDisplayIdentityConfirmed(_ confirmed: Bool) { displayIdentity.setConfirmed(confirmed) }
+    fileprivate func setDisplayIdentityConfirmed(_ confirmed: Bool) {
+        if !confirmed { source.finishRecording(owner: ObjectIdentifier(self)) }
+        displayIdentity.setConfirmed(confirmed)
+    }
+
+    fileprivate func startRecording(
+        destination: URL, completion: @escaping (Result<URL, Error>) -> Void
+    ) throws -> ScreenVideoRecording {
+        guard let size else { throw ScreenVideoRecording.Failure.noFrames }
+        return try source.startRecording(
+            owner: ObjectIdentifier(self), size: size, destination: destination, completion: completion)
+    }
 
     func frame() -> CVPixelBuffer? {
         let read: () -> CVPixelBuffer? = { [self] in
@@ -1510,6 +1533,9 @@ final class ScreenCaptureSource:
     // the USB activation that is meant to unblock it.
     private let recoveryQueue: DispatchQueue
     private let frames = ScreenCaptureFrameStore()
+    private let recordingLock = NSLock()
+    private weak var recording: ScreenVideoRecording?
+    private var recordingOwner: ObjectIdentifier?
     private let lifecycle: CaptureSourceLifecycle
     private let onFirstFrame: ((ScreenCaptureSource) -> Void)?
     private let onNeedsValeriaRecovery: ((ScreenCaptureSource, Bool) -> Void)?
@@ -1617,7 +1643,31 @@ final class ScreenCaptureSource:
         }
     }
 
+    func startRecording(
+        owner: ObjectIdentifier, size: CGSize, destination: URL,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) throws -> ScreenVideoRecording {
+        try recordingLock.withLock {
+            // Only the current association can tap this source. Finish an older export before rebinding.
+            let next = try ScreenVideoRecording(destination: destination, size: size, completion: completion)
+            recording?.finish()
+            recording = next
+            recordingOwner = owner
+            return next
+        }
+    }
+
+    func finishRecording(owner: ObjectIdentifier? = nil) {
+        recordingLock.withLock {
+            guard owner == nil || recordingOwner == owner else { return }
+            recording?.finish()
+            recording = nil
+            recordingOwner = nil
+        }
+    }
+
     func stop(completion: (() -> Void)? = nil) {
+        finishRecording()
         var observerToRemove: NSObjectProtocol?
         lifecycle.stop(
             onStopLocked: { [weak self] in
@@ -1772,7 +1822,11 @@ final class ScreenCaptureSource:
         _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection
     ) {
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let outcome = errorTracker.publishFrameClearingPriorErrors(buffer, into: frames)
+        let outcome = recordingLock.withLock {
+            let outcome = errorTracker.publishFrameClearingPriorErrors(buffer, into: frames)
+            if outcome.isAccepted { recording?.offer(sampleBuffer, buffer: buffer) }
+            return outcome
+        }
         if outcome == .firstFrame {
             onFirstFrame?(self)
         }

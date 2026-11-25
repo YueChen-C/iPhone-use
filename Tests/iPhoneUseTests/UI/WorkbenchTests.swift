@@ -272,6 +272,23 @@ final class WorkbenchStateTests: XCTestCase {
 }
 
 final class WorkbenchNativeViewTests: XCTestCase {
+    func testRecordingButtonSitsNextToScreenshotInNarrowWorkbench() throws {
+        _ = NSApplication.shared
+        let root = WorkbenchRootView(frame: NSRect(x: 0, y: 0, width: 1080, height: 700), preview: true)
+        root.loadPreview([WorkbenchDevice(id: "phone", name: "iPhone", connected: true, backend: .ble, status: "ready")])
+        renderLayout(root)
+        let buttons = descendants(root).compactMap { $0 as? NSButton }
+        let recorder = try XCTUnwrap(buttons.first { $0.accessibilityIdentifier() == "card-record:phone" })
+        let screenshot = try XCTUnwrap(buttons.first {
+            $0.superview === recorder.superview && $0.title == StringsWorkbench.current.screenshot
+        })
+        XCTAssertEqual(recorder.title, StringsWorkbench.current.record)
+        XCTAssertEqual(recorder.frame.minX, screenshot.frame.maxX)
+        XCTAssertEqual(recorder.frame.minY, screenshot.frame.minY)
+        XCTAssertTrue(recorder.superview?.bounds.contains(recorder.frame) == true)
+        XCTAssertFalse(recorder.isEnabled, "The offline preview has no stream to record")
+    }
+
     func testHeaderLanguageSwitchUpdatesImmediatelyAndPersists() throws {
         _ = NSApplication.shared
         let store = AppLanguageStore.shared

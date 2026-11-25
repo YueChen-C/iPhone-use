@@ -71,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runModeObserver = nil
         QuietModeActivityController.shared.stop()
         windows.stop()
+        Application.finishScreenRecordings()
         let inputReleased = USBInputController.shared.stop(waitTimeout: Application.inputShutdownWaitTimeout)
         if !inputReleased { log("USB input shutdown incomplete: release/worker exit unconfirmed") }
         let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Application.shutdownWaitTimeout)
@@ -243,6 +244,12 @@ enum AppEditMenu {
 /// MCP mode bypasses this path entirely and never starts AppKit or hardware.
 enum Application {
     static let shutdownWaitTimeout: TimeInterval = 3.0
+
+    static func finishScreenRecordings() {
+        if !ScreenVideoRecording.finishAll(waitTimeout: 5) {
+            log("timed out while saving screen recordings")
+        }
+    }
     static let inputShutdownWaitTimeout: TimeInterval = 4.0
 
     static func terminationExitCode(for stopResult: ScreenCaptureStopResult, usbInputReleased: Bool = true) -> Int32 {
@@ -331,6 +338,7 @@ enum Application {
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler {
                 server.stop()
+                Self.finishScreenRecordings()
                 let inputReleased = USBInputController.shared.stop(waitTimeout: Self.inputShutdownWaitTimeout)
                 log(inputReleased
                     ? "USB input shutdown confirmed: release/worker exit barrier passed"

@@ -156,6 +156,8 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
     private var controllers: [String: ControlWindowController] = [:]
     private var cards: [String: WorkbenchPhoneCard] = [:]
     private var liveDevices: [String: Device] = [:]
+    private var recordings: [String: ScreenVideoRecording] = [:]
+    private var isStopped = false
     private var independentIDs: Set<String> = []
     private var previewImages: [String: NSImage] = [:]
     private var previewOrder: [String] = []
@@ -472,6 +474,7 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         let card = WorkbenchPhoneCard(content: content, showsShell: showsShell)
         card.onSelect = { [weak self] in self?.select(id) }
         card.onScreenshot = { [weak self] in self?.saveScreenshot(id) }
+        card.onRecording = { [weak self] in self?.toggleRecording(id) }
         card.onFocus = { [weak self] in
             self?.select(id)
             self?.setLayout(.focus)
@@ -539,7 +542,8 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         }
         for device in state.devices {
             cards[device.id]?.update(
-                device, selected: device.id == state.selectedID, inSeparateWindow: independentIDs.contains(device.id))
+                device, selected: device.id == state.selectedID, inSeparateWindow: independentIDs.contains(device.id),
+                recording: recordings[device.id], canRecord: !preview && device.connected)
             cards[device.id]?.isHidden = !state.visible.contains { $0.id == device.id }
         }
         let physicalCount = preview ? nil : ScreenCaptureManager.shared.observedUSBTopology.attachedDeviceCount
@@ -754,6 +758,45 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         }
     }
 
+    private func toggleRecording(_ id: String) {
+        if let recording = recordings[id] {
+            recording.finish()
+            render()
+            return
+        }
+        guard !preview, !isStopped, let device = liveDevices[id], let window, window.attachedSheet == nil else { return }
+        cancelInteractions()
+        let manager = ScreenCaptureManager.shared
+        guard manager.permitsPointerAssociation(for: device.screen) else {
+            message = StringsWorkbench.current.recordingIdentityUnverified
+            render()
+            return
+        }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.mpeg4Movie]
+        panel.nameFieldStringValue = "iPhoneUse-\(id)-\(Int(Date().timeIntervalSince1970)).mp4"
+        panel.beginSheetModal(for: window) { [weak self] result in
+            guard let self, !self.isStopped, result == .OK, let url = panel.url else { return }
+            do {
+                self.recordings[id] = try manager.startRecording(screen: device.screen, destination: url) { [weak self] result in
+                    guard let self else { return }
+                    self.recordings.removeValue(forKey: id)
+                    guard !self.isStopped else { return }
+                    let text = StringsWorkbench.current
+                    switch result {
+                    case .success(let saved): self.message = "\(text.recordingSaved) · \(saved.lastPathComponent)"
+                    case .failure(let error): self.message = "\(text.recordingFailed) · \(error.localizedDescription)"
+                    }
+                    self.render()
+                }
+                self.message = ""
+            } catch {
+                self.message = "\(StringsWorkbench.current.recordingFailed) · \(error.localizedDescription)"
+            }
+            self.render()
+        }
+    }
+
     func cancelInteractions() {
         for controller in controllers.values { controller.controlView.cancelInteraction() }
     }
@@ -772,6 +815,8 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         }
     }
     func stop() {
+        isStopped = true
+        recordings.values.forEach { $0.finish() }
         dismissInfo()
         for controller in controllers.values { controller.stop() }
     }
@@ -1106,6 +1151,7 @@ private final class WorkbenchDeviceRow: WorkbenchActionButton {
 private final class WorkbenchPhoneCard: WorkbenchSurface {
     var onSelect: (() -> Void)?
     var onScreenshot: (() -> Void)?
+    var onRecording: (() -> Void)?
     var onFocus: (() -> Void)?
     var onWindowAction: (() -> Void)?
     private(set) var deviceName = ""
@@ -1113,6 +1159,7 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
     private let status = WorkbenchStyle.label(size: 10, secondary: true)
     private let windowAction = WorkbenchActionButton()
     private let screenshot = WorkbenchActionButton()
+    private let record = WorkbenchActionButton()
     private let independent = WorkbenchActionButton()
     private let content: NSView
     private let phoneShell: WorkbenchPhoneShell?
@@ -1122,7 +1169,7 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         self.content = content
         phoneShell = showsShell ? WorkbenchPhoneShell(content: content) : nil
         super.init(frame: .zero)
-        [phoneShell ?? content, title, status, screenshot, independent, windowAction].forEach(addSubview)
+        [phoneShell ?? content, title, status, screenshot, record, independent, windowAction].forEach(addSubview)
         title.appearanceStyle = .plain
         title.alignment = .left
         title.font = .systemFont(ofSize: 12, weight: .semibold)
@@ -1131,6 +1178,10 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         screenshot.symbolName = "camera"
         screenshot.font = .systemFont(ofSize: 10)
         screenshot.alignment = .left
+        record.appearanceStyle = .plain
+        record.font = .systemFont(ofSize: 10)
+        record.alignment = .left
+        record.invoke = { [weak self] in self?.onRecording?() }
         independent.appearanceStyle = .plain
         independent.symbolName = "arrow.up.forward.square"
         independent.font = .systemFont(ofSize: 10)
@@ -1155,7 +1206,10 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         return self
     }
 
-    func update(_ device: WorkbenchDevice, selected: Bool, inSeparateWindow: Bool) {
+    func update(
+        _ device: WorkbenchDevice, selected: Bool, inSeparateWindow: Bool,
+        recording: ScreenVideoRecording?, canRecord: Bool
+    ) {
         deviceName = device.name
         self.selected = selected
         connected = device.connected
@@ -1177,6 +1231,15 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         independent.toolTip = independent.title
         independent.setAccessibilityLabel(independent.title)
         let texts = StringsWorkbench.current
+        let isFinishing = recording?.isFinishing == true
+        record.title = isFinishing ? texts.recordingSaving : (recording == nil ? texts.record : texts.recordingStop)
+        record.symbolName = recording == nil ? "record.circle" : "stop.circle.fill"
+        record.appearanceStyle = recording != nil && !isFinishing ? .link : .plain
+        record.toolTip = record.title
+        record.setAccessibilityLabel(record.title)
+        record.setAccessibilityIdentifier("card-record:\(device.id)")
+        record.isEnabled = !isFinishing && (recording != nil || canRecord)
+        needsLayout = true
         if !device.connected {
             windowAction.symbolName = "trash"
             windowAction.toolTip = texts.removeDeviceCard
@@ -1212,10 +1275,12 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         NSRect(x: 1, y: bounds.height - 48, width: bounds.width - 2, height: 1).fill()
         (connected ? WorkbenchTheme.green : WorkbenchTheme.faint).setFill()
         NSBezierPath(ovalIn: NSRect(x: 16, y: 22, width: 5, height: 5)).fill()
-        WorkbenchTheme.text(
-            AppLanguageStore.shared.language == .zh ? "适应  ⌄" : "Fit  ⌄",
-            in: NSRect(x: bounds.width - 54, y: bounds.height - 29, width: 45, height: 18), size: 9,
-            color: WorkbenchTheme.faint)
+        let fitFrame = NSRect(x: bounds.width - 54, y: bounds.height - 29, width: 45, height: 18)
+        if independent.frame.maxX + 4 <= fitFrame.minX {
+            WorkbenchTheme.text(
+                AppLanguageStore.shared.language == .zh ? "适应  ⌄" : "Fit  ⌄", in: fitFrame, size: 9,
+                color: WorkbenchTheme.faint)
+        }
     }
     override func layout() {
         super.layout()
@@ -1234,9 +1299,10 @@ private final class WorkbenchPhoneCard: WorkbenchSurface {
         }
         let screenshotWidth = max(64, screenshot.requiredContentWidth)
         screenshot.frame = NSRect(x: 2, y: h - 39, width: screenshotWidth, height: 28)
+        record.frame = NSRect(x: screenshot.frame.maxX, y: h - 39, width: max(64, record.requiredContentWidth), height: 28)
         independent.frame = NSRect(
-            x: screenshot.frame.maxX, y: h - 39,
-            width: max(120, independent.requiredContentWidth), height: 28)
+            x: record.frame.maxX, y: h - 39,
+            width: independent.requiredContentWidth, height: 28)
     }
 }
 

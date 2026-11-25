@@ -18,6 +18,15 @@ struct StringsWorkbench: LocalizedTable {
     let screenshot: String
     let screenshotIdentityUnverified: String
     let screenshotNotReady: String
+    let record: String
+    let recordingStop: String
+    let recordingSaving: String
+    let recordingSaved: String
+    let recordingFailed: String
+    let recordingIdentityUnverified: String
+    let recordingNoFrames: String
+    let recordingDestinationBusy: String
+    let recordingEncodingFailed: String
     let independent: String
     let expand: String
     let closeIndependent: String
@@ -46,7 +55,11 @@ struct StringsWorkbench: LocalizedTable {
         waitingNativeCapture: "iPhone 已通过 USB 连接，正在等待画面",
         guide: "USB 连接并信任此 Mac，允许相机权限用于投屏。iOS 17.3 及以上默认 USB 触控；旧系统默认蓝牙，需完成配对与辅助触控设置。", inputBackend: "输入后端", experimental: "USB Touch · 实验性",
         screenshot: "截图", screenshotIdentityUnverified: "画面与设备身份尚未确认，未保存截图；请先重新匹配原设备。",
-        screenshotNotReady: "画面尚未就绪，未保存截图。", independent: "独立窗口", expand: "扩大",
+        screenshotNotReady: "画面尚未就绪，未保存截图。",
+        record: "录制", recordingStop: "结束录制", recordingSaving: "正在保存…", recordingSaved: "录制已保存", recordingFailed: "录制失败",
+        recordingIdentityUnverified: "画面与设备身份尚未确认，暂时无法录制。", recordingNoFrames: "未收到可录制的视频帧。",
+        recordingDestinationBusy: "另一段录制正在使用此保存位置。", recordingEncodingFailed: "无法完成视频编码。",
+        independent: "独立窗口", expand: "扩大",
         closeIndependent: "关闭小窗口", removeDeviceCard: "移除设备卡片",
         textInput: "文本输入", send: "发送文本", pasteHint: "手机端粘贴发送 Cmd-V，不读取 Mac 剪贴板。",
         ai: "AI 接入", api: "脚本与 API", mcpHint: "通过外部 MCP 客户端使用截图、点击、滑动与输入工具。", local: "HTTP 仅监听本机回环地址",
@@ -65,6 +78,12 @@ struct StringsWorkbench: LocalizedTable {
         inputBackend: "Input backend", experimental: "USB Touch · Experimental", screenshot: "Screenshot",
         screenshotIdentityUnverified: "Display identity is unverified. Screenshot not saved; rematch the original device first.",
         screenshotNotReady: "Display not ready. Screenshot not saved.",
+        record: "Record", recordingStop: "Stop recording", recordingSaving: "Saving…",
+        recordingSaved: "Recording saved", recordingFailed: "Recording failed",
+        recordingIdentityUnverified: "Display identity is unverified. Match the device before recording.",
+        recordingNoFrames: "No video frames were received.",
+        recordingDestinationBusy: "Another recording is using this destination.",
+        recordingEncodingFailed: "The video could not be encoded.",
         independent: "Separate window", expand: "Expand", closeIndependent: "Close separate window",
         removeDeviceCard: "Remove device card", textInput: "Text input", send: "Send text",
         pasteHint: "Phone paste sends Cmd-V; it does not read the Mac clipboard.", ai: "AI connection",
