@@ -54,7 +54,9 @@ class MockApp(BaseHTTPRequestHandler):
             self.server.before_post(body)
         if self.path == "/launch_app":
             if self.server.fail_actions:
-                self.send(503, b'{"error":"launch result is unknown","outcome":"unknown","replayAllowed":false}')
+                self.send(503, json.dumps({"error": "launch result is unknown", "device": body["device"],
+                                           "code": "app_management_failed", "outcome": "unknown",
+                                           "replayAllowed": False}).encode())
             else:
                 result = {"device": body["device"], "bundle_id": body["bundle_id"], "pid": 42,
                           "outcome": "acknowledged", "foreground_verified": False}
