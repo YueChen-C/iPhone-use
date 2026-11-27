@@ -66,6 +66,17 @@ enum ControlAPI {
                 let device = try DeviceRegistry.shared.find(deviceQuery)
                 try USBInputController.shared.select(backend, device: device)
                 return .json(["ok": true, "device": device.id, "input": USBInputController.shared.status(device)])
+            case ("POST", "/list_apps"), ("GET", "/list_apps"),
+                 ("POST", "/get_foreground_app"), ("GET", "/get_foreground_app"), ("POST", "/launch_app"),
+                 ("POST", "/terminate_app"):
+                guard let operation = NativeAppManagement.Operation(rawValue: String(request.path.dropFirst())) else {
+                    return .error("not found", status: 404)
+                }
+                return AppManagementEndpoint.response(request, operation: operation, resolve: { selector in
+                    try AppManagementEndpoint.resolve(selector, devices: DeviceRegistry.shared.all().map { ($0.id, $0.screen.name) })
+                }, perform: { operation, id, bundleID, payloadURL in
+                    try NativeAppManagement.perform(operation, device: id, bundleID: bundleID, payloadURL: payloadURL)
+                })
             case ("GET", "/ax_tree"), ("POST", "/ax_tree"):
                 return AXTreeEndpoint.response(request,
                     resolve: { try DeviceRegistry.shared.find($0).id }, capture: axCapture)

@@ -52,6 +52,16 @@ class MockApp(BaseHTTPRequestHandler):
         self.server.events.append(("POST", self.path, body))
         if self.server.before_post:
             self.server.before_post(body)
+        if self.path == "/launch_app":
+            if self.server.fail_actions:
+                self.send(503, b'{"error":"launch result is unknown","outcome":"unknown","replayAllowed":false}')
+            else:
+                result = {"device": body["device"], "bundle_id": body["bundle_id"], "pid": 42,
+                          "outcome": "acknowledged", "foreground_verified": False}
+                if "url" in body:
+                    result["url_requested"] = True
+                self.send(200, json.dumps(result).encode())
+            return
         if self.path == "/ax_tree":
             if self.server.fail_actions:
                 self.send(503, b'{"error":"native AX unavailable"}')
@@ -222,7 +232,7 @@ class MCPStdioTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=15,
             )
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertIn("20 tools", process.stdout)
+        self.assertIn("24 tools", process.stdout)
         # The checker's initialize fetches /config; tools/list reuses the value.
         self.assertEqual(self.server.events, [("GET", "/config")])
 
@@ -269,6 +279,30 @@ class MCPStdioTests(unittest.TestCase):
             ("POST", "/tap", {"x": 120.5, "y": 400, "device": "phone-1", "maxEdge": 1000}),
             ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
         ])
+
+    def test_launch_app_forwards_explicit_url_and_does_not_observe_or_retry(self):
+        bundle = "com.apple.mobilesafari"
+        url = "https://example.com/path?name=a%2Fb#fragment"
+        options = {"device_id": "First", "bundle_id": bundle, "url": url}
+        forwarded = ("POST", "/launch_app", {"device": "phone-1", "bundle_id": bundle, "url": url})
+        result = self.exchange([("launch_app", options)])[0]
+        self.assertNotIn("isError", result)
+        self.assertEqual(len(result["content"]), 1)
+        self.assertEqual(json.loads(result["content"][0]["text"]), {
+            "device": "phone-1", "bundle_id": bundle, "pid": 42, "outcome": "acknowledged",
+            "foreground_verified": False, "url_requested": True,
+        })
+        self.assertEqual(self.server.events, [("GET", "/config"), ("GET", "/devices"), forwarded])
+        self.assertEqual(self.server.stability_events, [])
+        self.server.events.clear()
+        self.server.fail_actions = True
+        failure = self.exchange([("launch_app", options)])[0]
+        self.assertTrue(failure["isError"])
+        evidence = json.loads(failure["content"][0]["text"])
+        self.assertEqual(evidence["outcome"], "unknown")
+        self.assertIs(evidence["replayAllowed"], False)
+        self.assertEqual(self.server.events, [("GET", "/config"), ("GET", "/devices"), forwarded])
+        self.assertEqual(self.server.stability_events, [])
 
     def test_ax_tree_returns_native_json_without_screenshot_or_input(self):
         result = self.exchange([("get_ax_tree", {"device": "First", "include_offscreen": True})])[0]
@@ -646,7 +680,7 @@ class MCPStdioTests(unittest.TestCase):
         self.assertIn("控制真实 iPhone", replies[0]["result"]["instructions"])
         tools = replies[1]["result"]["tools"]
         # Tool and parameter names are the client contract and stay English.
-        self.assertEqual(len(tools), 20)
+        self.assertEqual(len(tools), 24)
         backend = next(tool for tool in tools if tool["name"] == "set_input_backend")
         self.assertEqual(backend["inputSchema"]["required"], ["backend"])
         self.assertEqual(backend["inputSchema"]["properties"]["backend"]["enum"], ["ble", "usb"])

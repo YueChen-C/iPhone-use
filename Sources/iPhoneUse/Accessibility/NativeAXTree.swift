@@ -7,6 +7,14 @@ enum NativeAXTree {
     static let workerArgument = "--ax-tree"
 
     static func capture(device: String, includeOffscreen: Bool) throws -> [String: Any] {
+        try capture(device: device, mode: includeOffscreen ? "1" : "0")
+    }
+
+    static func captureForeground(device: String) throws -> [String: Any] {
+        try capture(device: device, mode: "foreground")
+    }
+
+    private static func capture(device: String, mode: String) throws -> [String: Any] {
         guard let executable = Bundle.main.executableURL else { throw AXDTX.Failure("AX executable unavailable") }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("iphone-use-ax-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
@@ -18,7 +26,7 @@ enum NativeAXTree {
         let handle = try FileHandle(forWritingTo: diagnostic)
         defer { try? handle.close() }
         let status = try runWorker(executable: executable,
-            arguments: [workerArgument, device, output.path, includeOffscreen ? "1" : "0"], diagnostic: handle)
+            arguments: [workerArgument, device, output.path, mode], diagnostic: handle)
         guard status == 0 else {
             let detail = (try? String(contentsOf: diagnostic, encoding: .utf8)) ?? ""
             throw AXDTX.Failure(status == nil ? "AX worker timed out (25s); check developer services and UI Automation"
@@ -32,7 +40,9 @@ enum NativeAXTree {
         return result
     }
 
-    private static func runWorker(executable: URL, arguments: [String], diagnostic: FileHandle) throws -> Int32? {
+    static func runWorker(
+        executable: URL, arguments: [String], diagnostic: FileHandle, timeout: TimeInterval = 25
+    ) throws -> Int32? {
         let process = Process(), finished = DispatchSemaphore(value: 0)
         process.executableURL = executable; process.arguments = arguments
         process.standardInput = FileHandle.nullDevice; process.standardOutput = FileHandle.nullDevice
@@ -42,7 +52,7 @@ enum NativeAXTree {
         // The worker creates its own process group before starting Apple helpers.
         // Kill the group, not just its leader, so timeout never leaves a netcat child.
         defer { kill(-process.processIdentifier, SIGKILL) }
-        guard finished.wait(timeout: .now() + 25) == .success else {
+        guard finished.wait(timeout: .now() + timeout) == .success else {
             kill(-process.processIdentifier, SIGTERM)
             if process.isRunning { process.terminate() }
             if finished.wait(timeout: .now() + 1) == .timedOut {
@@ -55,14 +65,15 @@ enum NativeAXTree {
         return process.terminationReason == .exit ? process.terminationStatus : nil
     }
 
-    static func write(device: String, output: URL, includeOffscreen: Bool) -> Int32 {
+    static func write(device: String, output: URL, includeOffscreen: Bool, foregroundOnly: Bool = false) -> Int32 {
         do {
             guard setpgid(0, 0) == 0 else { throw AXDTX.Failure("Cannot isolate AX worker process group") }
             signal(SIGPIPE, SIG_IGN)
             let transport = try AXRemoteTransport(device: device)
             let result = try transport.legacy
                 ? AXLegacyTree(send: transport.send, receive: transport.read).read(device: device, includeOffscreen: includeOffscreen)
-                : read(device: device, includeOffscreen: includeOffscreen, send: transport.send, receive: transport.read)
+                : read(device: device, includeOffscreen: includeOffscreen, foregroundOnly: foregroundOnly,
+                       send: transport.send, receive: transport.read)
             let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys, .prettyPrinted])
             guard data.count <= AXDTX.limit else { throw AXDTX.Failure("AX JSON exceeds limit") }
             try data.write(to: output, options: .atomic)
@@ -74,16 +85,16 @@ enum NativeAXTree {
         }
     }
 
-    static func read(device: String, includeOffscreen: Bool, send: (Data) throws -> Void,
+    static func read(device: String, includeOffscreen: Bool, foregroundOnly: Bool = false, send: (Data) throws -> Void,
                      receive: @escaping (Int) throws -> Data) throws -> [String: Any] {
         let reader = AXMessageReader { try AXDTX.receive(read: receive) }
-        return try collect(device: device, includeOffscreen: includeOffscreen, send: send,
+        return try collect(device: device, includeOffscreen: includeOffscreen, foregroundOnly: foregroundOnly, send: send,
                            next: { try reader.next(timeout: $0) })
     }
 
     /// The remote service has not supplied a proven snapshot-complete marker.
     /// Merge changes until a bounded quiet window, never label this a full tree.
-    static func collect(device: String, includeOffscreen: Bool, send: (Data) throws -> Void,
+    static func collect(device: String, includeOffscreen: Bool, foregroundOnly: Bool = false, send: (Data) throws -> Void,
                         next: (TimeInterval) throws -> AXDTX.Message?,
                         clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
                         quietWindow: TimeInterval = 0.6, maximumDuration: TimeInterval = 8) throws -> [String: Any] {
@@ -91,7 +102,7 @@ enum NativeAXTree {
                            argument: ["com.apple.private.DTXBlockCompression": 0, "com.apple.private.DTXConnection": 1]))
         try send(AXDTX.call(id: 2, selector: "clientNeedsAccessibility:", argument: true))
         defer { try? send(AXDTX.call(id: 3, selector: "clientNeedsAccessibility:", argument: false)) }
-        var tree = AXTree(includeOffscreen: includeOffscreen)
+        var tree = AXTree(includeOffscreen: includeOffscreen, foregroundOnly: foregroundOnly)
         let started = clock()
         var changed = started, messages = 0, reason = "message-limit"
         for _ in 0..<4096 {
@@ -113,6 +124,7 @@ enum NativeAXTree {
             for archive in try AXDTX.auxiliaryArchives(message.payload) { try tree.update(archive) }
             if previous != tree.revision { changed = clock() }
         }
+        if foregroundOnly { return tree.foregroundJSON(device: device) }
         guard tree.ready else { throw AXDTX.Failure("AX response ended before a usable hierarchy arrived") }
         var result = tree.json(device: device)
         result["capture"] = ["termination_reason": reason, "messages_received": messages,

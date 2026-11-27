@@ -40,6 +40,7 @@ Start a new Codex session to select a device, view its screen, and control it. F
 
 - [User guide](docs/user-guide.md) (Chinese): window controls, language switching, calibration, multiple devices, and recording.
 - [HTTP API](docs/user-guide.md#http-api) · [Native Accessibility Tree](docs/native-ax-tree.md#english-usage): request examples, device requirements, and compatibility limits.
+- [Native app management](docs/native-app-management.md): list installed apps, identify the foreground app, and launch or force-stop an app by bundle ID. A launch can optionally pass an HTTP(S) URL to the specified app.
 - [Development and validation](docs/user-guide.md#开发与验证) · [Architecture](docs/architecture.md) · [Releasing](docs/releasing.md) · [Changelog](CHANGELOG.md)
 
 Use this project only on devices you own or are authorized to control. Confirm sensitive actions such as sending messages, making payments, or deleting data, and review what device data is shared with third-party AI services. This project is independent of Apple and distributed under the [MIT License](LICENSE).

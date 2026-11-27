@@ -25,6 +25,16 @@ enum MCPToolCatalog {
                 ? "通过原生 Apple 设备服务读取 Accessibility 元素树；需要开发者服务，不以 OCR 替代。iOS 15/16 为局部 Inspector 树，无坐标、可能截短文字；读取会移动检查焦点并可能滚动页面。"
                 : "Read native Accessibility hierarchy via Apple device services, never OCR. Requires developer services. On iOS 15/16 returns a partial inspector tree without geometry; text may be truncated and reading moves inspector focus and may scroll the viewport.",
                 ["device": device, "include_offscreen": ["type": "boolean", "default": false]], readOnly: false),
+            appTool(.list, language == .zh ? "列出指定 USB iPhone 已安装的 App。不需要 Xcode。"
+                : "List installed apps on the selected USB iPhone. Does not require Xcode.", device: device),
+            appTool(.foreground, language == .zh ? "通过原生 Accessibility 读取前台 App，无法确认时返回未知。"
+                : "Read the foreground app via native Accessibility; may report unknown.", device: device),
+            appTool(.launch, language == .zh ? "按 Bundle ID 启动 USB iPhone 上的 App（iOS 17+）；可选把 HTTP(S) URL 交给该 App，不由 iOS 选择处理 App。回执不代表页面已打开；结果未知时不要自动重试。"
+                : "Launch an app by bundle ID on a USB iPhone (iOS 17+) and optionally pass it an HTTP(S) URL. Does not choose a handler or verify navigation; do not retry an unknown outcome.",
+                device: device, urlDescription: language == .zh ? "交给指定 App 的 HTTP(S) URL（不含账号凭据）"
+                    : "HTTP(S) URL without credentials, passed to the specified app"),
+            appTool(.terminate, language == .zh ? "按 Bundle ID 强制结束 USB iPhone 上的 App（iOS 17+），并核验进程退出。可能丢失未保存数据；结果未知时不要自动重试。"
+                : "Force-stop an app by bundle ID on a USB iPhone (iOS 17+) and verify its exit. Unsaved data may be lost; do not retry an unknown outcome.", device: device),
             tool("ocr_screen", table.toolOCRScreen, ["device": device, "maxEdge": maxEdge], readOnly: true),
             tool(
                 "tap_text", table.toolTapText,
@@ -168,6 +178,20 @@ enum MCPToolCatalog {
         ]
     }
 
+    private static func appTool(_ operation: NativeAppManagement.Operation, _ description: String,
+                                device: [String: Any], urlDescription: String? = nil) -> [String: Any] {
+        var properties = ["device": device, "device_id": device]
+        let requiresBundleID = operation.requiresBundleID
+        if requiresBundleID { properties["bundle_id"] = ["type": "string", "minLength": 1, "maxLength": 255] }
+        if let urlDescription {
+            properties["url"] = ["type": "string", "minLength": 1, "maxLength": NativeAppServices.launchURLByteLimit,
+                                 "description": urlDescription]
+        }
+        return ["name": operation.rawValue, "description": description,
+                "inputSchema": ["type": "object", "properties": properties, "required": requiresBundleID ? ["bundle_id"] : []],
+                "annotations": ["readOnlyHint": operation == .list]]
+    }
+
     private static func tool(
         _ name: String, _ description: String, _ properties: [String: Any],
         required: [String] = [], readOnly: Bool = false
@@ -208,6 +232,20 @@ struct MCPToolRequest {
         named name: String, arguments: [String: Any], longEdge: Int, language: AppLanguage = .en
     ) throws -> MCPToolRequest? {
         let device = (arguments["device"] as? String) ?? (arguments["device_id"] as? String)
+        if let operation = NativeAppManagement.Operation(rawValue: name) {
+            guard ["device", "device_id"].allSatisfy({ arguments[$0] == nil || arguments[$0] is String }) else {
+                throw DeviceError("Device must be a string")
+            }
+            var body: [String: Any] = [:]
+            if operation.requiresBundleID {
+                guard let bundleID = arguments["bundle_id"] as? String, NativeAppServices.validBundleID(bundleID) else {
+                    throw DeviceError("Valid bundle_id required")
+                }
+                body["bundle_id"] = bundleID
+            }
+            if let url = try operation.validatedURL(arguments["url"]) { body["url"] = url }
+            return MCPToolRequest(path: operation.path, body: withDevice(body, device))
+        }
         switch name {
         case "set_input_backend":
             guard let backend = arguments["backend"] as? String, InputBackendKind(rawValue: backend) != nil else {

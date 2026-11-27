@@ -78,10 +78,16 @@ struct AXTree {
     private var orientation: Any?
     private(set) var revision = 0
     let includeOffscreen: Bool
+    let foregroundOnly: Bool
 
-    init(includeOffscreen: Bool) { self.includeOffscreen = includeOffscreen }
+    init(includeOffscreen: Bool, foregroundOnly: Bool = false) {
+        self.includeOffscreen = includeOffscreen
+        self.foregroundOnly = foregroundOnly
+    }
 
-    var ready: Bool { nodes.count > 1 && roots.contains { nodes[$0.0] != nil } }
+    var ready: Bool {
+        foregroundOnly ? !roots.isEmpty : nodes.count > 1 && roots.contains { nodes[$0.0] != nil }
+    }
 
     mutating func update(_ data: Data) throws {
         let decoded = try AXArchive(data).decode()
@@ -98,7 +104,7 @@ struct AXTree {
             let kind = (response["associatedRequestType"] as? NSNumber)?.intValue
             if kind == 4, let data = response["resultData"] as? [String: Any], let id = uint(data["objectID"]) {
                 if !roots.contains(where: { $0.0 == id }) { roots.append((id, uint(data["pid"]))); revision += 1 }
-            } else if kind == 2, (response["attribute"] as? NSNumber)?.intValue == 129 {
+            } else if !foregroundOnly, kind == 2, (response["attribute"] as? NSNumber)?.intValue == 129 {
                 let value = response["resultData"]
                 if !NSDictionary(dictionary: ["value": orientation ?? NSNull()]).isEqual(to: ["value": value ?? NSNull()]) { revision += 1 }
                 orientation = value
@@ -106,6 +112,19 @@ struct AXTree {
                       let object = response["associatedTranslationObject"] as? [String: Any], let id = uint(object["objectID"]),
                       let attributes = response["resultData"] as? [String: Any] {
                 var node = nodes[id] ?? Node()
+                if foregroundOnly {
+                    // Ignore unrelated UI values/geometry, including non-finite values.
+                    guard roots.contains(where: { $0.0 == id }) else { continue }
+                    for key in ["3", "33", "6"] {
+                        guard let text = attributes[key] as? String, node.raw[key] as? String != text else { continue }
+                        node.raw[key] = text
+                        revision += 1
+                    }
+                    node.fields["label"] = node.raw["33"] ?? node.raw["3"]
+                    node.fields["bundle_id"] = node.raw["6"]
+                    nodes[id] = node
+                    continue
+                }
                 for (key, value) in attributes {
                     let raw = try AXValues.json(value)
                     if !NSDictionary(dictionary: ["value": node.raw[key] ?? NSNull()]).isEqual(to: ["value": raw]) || node.raw[key] == nil { revision += 1 }
@@ -143,6 +162,21 @@ struct AXTree {
         }
     }
 
+    func foregroundJSON(device: String) -> [String: Any] {
+        let apps = applications()
+        return ["device": device, "source": "accessibility", "foreground_app": apps.count == 1 ? apps[0] : NSNull()]
+    }
+
+    private func applications() -> [[String: Any]] {
+        roots.map { id, pid in
+            var app: [String: Any] = ["object_id": "o\(id)"]
+            if let pid { app["pid"] = pid }
+            if let label = nodes[id]?.fields["label"] { app["name"] = label }
+            if let bundle = nodes[id]?.fields["bundle_id"] { app["bundle_id"] = bundle }
+            return app
+        }
+    }
+
     func json(device: String) -> [String: Any] {
         var elements: [[String: Any]] = [], visited: Set<UInt64> = []
         var stack: [(UInt64, Int?, Int)] = roots.reversed().map { ($0.0, nil, 0) }
@@ -169,13 +203,7 @@ struct AXTree {
             fields["object_id"] = "o\(id)"; fields["raw_attributes"] = nodes[id]!.raw
             return fields
         }
-        let apps: [[String: Any]] = roots.map { id, pid in
-            var app: [String: Any] = ["object_id": "o\(id)"]
-            if let pid { app["pid"] = pid }
-            if let label = nodes[id]?.fields["label"] { app["name"] = label }
-            if let bundle = nodes[id]?.fields["bundle_id"] { app["bundle_id"] = bundle }
-            return app
-        }
+        let apps = applications()
         return ["source": "accessibility", "device": device, "elements": elements, "applications": apps,
                 "foreground_app": apps.count == 1 ? apps[0] : NSNull(), "orientation": orientation ?? NSNull(),
                 "coordinate_space": "ax_native", "include_offscreen": includeOffscreen,

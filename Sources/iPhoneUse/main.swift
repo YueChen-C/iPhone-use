@@ -56,9 +56,27 @@ if CommandLine.arguments.dropFirst().first == "--ax-server" {
 }
 
 if CommandLine.arguments.dropFirst().first == NativeAXTree.workerArgument {
-    guard CommandLine.arguments.count == 5, ["0", "1"].contains(CommandLine.arguments[4]) else { exit(64) }
-    exit(NativeAXTree.write(device: CommandLine.arguments[2],
-        output: URL(fileURLWithPath: CommandLine.arguments[3]), includeOffscreen: CommandLine.arguments[4] == "1"))
+    guard CommandLine.arguments.count == 5, ["0", "1", "foreground"].contains(CommandLine.arguments[4]) else { exit(64) }
+    let device = CommandLine.arguments[2]
+    let foregroundOnly = CommandLine.arguments[4] == "foreground"
+    let output = URL(fileURLWithPath: CommandLine.arguments[3])
+    if foregroundOnly {
+        do {
+            guard let ddiInputLease else { exit(78) }
+            let lease = try ddiInputLease.deviceService(physicalID: device, exclusive: false)
+            exit(withExtendedLifetime(lease) { NativeAXTree.write(device: device, output: output, includeOffscreen: false, foregroundOnly: true) })
+        } catch {
+            FileHandle.standardError.write(Data("\(error)\n".utf8))
+            exit(78)
+        }
+    }
+    exit(NativeAXTree.write(device: device, output: output, includeOffscreen: CommandLine.arguments[4] == "1"))
+}
+
+// App management runs on an isolated, exact-device Apple service.
+if CommandLine.arguments.dropFirst().first == NativeAppManagement.workerArgument {
+    guard let ddiInputLease else { exit(78) }
+    exit(NativeAppManagement.worker(Array(CommandLine.arguments.dropFirst(2)), lease: ddiInputLease))
 }
 
 // Keep potentially blocking system device calls outside the GUI/capture process.
