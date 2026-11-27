@@ -152,7 +152,8 @@ enum MCPServer {
                     device = try resolveDevice(query, data: fresh)
                 }
                 return try MCPAccess.withDevice(port: base.port ?? 7390, id: device, language: language) {
-                    if ["ocr_screen", "get_ax_tree"].contains(name), case .request(let action) = actions.first {
+                    if ["ocr_screen", "get_ax_tree"].contains(name) || NativeAppManagement.Operation(rawValue: name) != nil,
+                       case .request(let action) = actions.first {
                         var body = action.body
                         body["device"] = device
                         let data = try client.post(action.path, body)
@@ -376,6 +377,10 @@ enum MCPAPIError {
     static func error(_ data: Data, status: Int, language: AppLanguage) -> MCPServer.MCPError {
         let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         let message = body?["error"] as? String ?? "HTTP \(status)"
+        if body?["code"] as? String == "app_management_failed", let body,
+           let encoded = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) {
+            return MCPServer.MCPError(String(decoding: encoded, as: UTF8.self), details: body)
+        }
         let metadata = USBInputFailure.metadata(from: body ?? [:])
         var details = metadata
         details["error"] = message

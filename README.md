@@ -16,6 +16,7 @@ https://github.com/user-attachments/assets/e4aa9473-3236-4573-9841-bfbf83e248e1
 
 - **多设备 USB 投屏**：在同一个原生工作台查看多台 iPhone，并分别操控。
 - **Mac 鼠标和键盘操控**：支持点击、拖动、滚动和输入，可按设备选择蓝牙或实验性 USB 触控。
+- **App 管理**：在当前设备的「快捷控制」中打开「App 管理」，列表保留第三方和用户可见的系统 App，不显示隐藏的系统组件；支持按应用名称或包名检索、启动或强制结束 App。运行状态表示主进程是否存在，不代表在前台；打开、手动刷新或操作后会更新状态。运行状态和启动／结束需要 Apple 开发者服务。iOS 15/16 不需要安装 Xcode：设备未挂载且本地没有匹配开发者镜像时，会从 Gitee 下载已固定校验值的镜像并尝试挂载。服务不可用时显示「未知」。
 - **AI 与脚本自动化**：通过 MCP 或本地 HTTP API 指定设备、截图并执行操作。
 
 ## 快速开始
@@ -40,6 +41,7 @@ codex mcp add iphone-use -- /Applications/iPhoneUse.app/Contents/MacOS/iphone-us
 
 - [使用手册](docs/user-guide.md)：窗口操作、中英文切换、校准、多设备和录屏。
 - [HTTP API](docs/user-guide.md#http-api) · [原生 Accessibility 元素树](docs/native-ax-tree.md#中文使用说明)：调用示例、设备要求和兼容性限制。
+- [原生 App 管理](docs/native-app-management.md)：列出已安装 App、读取前台 App、按 Bundle ID 启动或强制结束 App，iOS 17+ 启动时可传入 HTTP(S) URL。
 - [开发与验证](docs/user-guide.md#开发与验证) · [架构](docs/architecture.md) · [发布](docs/releasing.md) · [更新日志](CHANGELOG.md)
 
 仅在你拥有或获授权的设备上使用。发送消息、支付、删除等敏感操作请人工确认；接入第三方 AI 前请留意截图及设备数据的隐私。本项目与 Apple 无关，按 [MIT 许可证](LICENSE) 提供。

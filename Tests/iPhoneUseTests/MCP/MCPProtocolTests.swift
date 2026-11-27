@@ -295,11 +295,24 @@ final class MCPOCRTests: XCTestCase {
 final class MCPKeyboardAliasTests: XCTestCase {
     func testEveryToolAdvertisesDeviceAliasAndOriginalWins() throws {
         let tools = MCPToolCatalog.tools(for: .en)
-        XCTAssertEqual(tools.count, 20)
+        XCTAssertEqual(tools.count, 24)
         for tool in tools {
             let schema = try XCTUnwrap(tool["inputSchema"] as? [String: Any])
             let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
             XCTAssertNotNil(properties["device_id"], "\(tool["name"]!)")
+            if NativeAppManagement.Operation(rawValue: tool["name"] as? String ?? "") != nil {
+                XCTAssertNil(properties["include_image"])
+                XCTAssertNil(properties["observe"])
+                if tool["name"] as? String == "launch_app" {
+                    let url = try XCTUnwrap(properties["url"] as? [String: Any])
+                    XCTAssertEqual(url["type"] as? String, "string")
+                    XCTAssertEqual(url["maxLength"] as? Int, NativeAppServices.launchURLByteLimit)
+                    XCTAssertEqual(schema["required"] as? [String], ["bundle_id"])
+                } else {
+                    XCTAssertNil(properties["url"])
+                }
+                continue
+            }
             let image = try XCTUnwrap(properties["include_image"] as? [String: Any])
             XCTAssertEqual(image["type"] as? String, "boolean")
             XCTAssertFalse((schema["required"] as? [String] ?? []).contains("include_image"))
@@ -310,6 +323,8 @@ final class MCPKeyboardAliasTests: XCTestCase {
             ("swipe", ["points": [["x": 0, "y": 0], ["x": 1, "y": 1]]]),
             ("type_text", ["text": "nihao"]), ("press_key", ["key": "enter"]), ("home", [:]), ("power", [:]), ("volume_up", [:]), ("volume_down", [:]),
             ("ocr_screen", [:]), ("tap_text", ["text": "Confirm"]),
+            ("list_apps", [:]), ("get_foreground_app", [:]), ("launch_app", ["bundle_id": "com.example.app"]),
+            ("terminate_app", ["bundle_id": "com.example.app"]),
         ]
         for (name, parameters) in cases {
             var arguments = parameters

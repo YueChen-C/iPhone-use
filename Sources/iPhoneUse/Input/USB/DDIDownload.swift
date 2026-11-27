@@ -222,9 +222,11 @@ final class DDIDownload {
 
 /// A single bounded, anonymous HTTPS transfer. Progress is throttled off the
 /// capture/input queues; an ephemeral session sends no shared cookies or tokens.
-private final class DDIDownloadTransfer: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+final class DDIDownloadTransfer: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let destination: URL
     private let limit: Int64
+    private let timeout: TimeInterval
+    private let allowedHosts: Set<String>?
     private let progress: (Int64, Int64) -> Void
     private let lock = NSLock()
     private var task: URLSessionDownloadTask?
@@ -233,27 +235,37 @@ private final class DDIDownloadTransfer: NSObject, URLSessionDownloadDelegate, @
     private var copied = false
     private var lastProgress: TimeInterval = -.infinity
     private let finished = DispatchSemaphore(value: 0)
-    init(destination: URL, limit: Int64, progress: @escaping (Int64, Int64) -> Void) {
+    init(destination: URL, limit: Int64, timeout: TimeInterval = 180, allowedHosts: Set<String>? = nil,
+         progress: @escaping (Int64, Int64) -> Void) {
         self.destination = destination; self.limit = limit; self.progress = progress
+        self.timeout = timeout; self.allowedHosts = allowedHosts
+    }
+    private func allows(_ url: URL?) -> Bool {
+        guard let url, url.scheme == "https" else { return false }
+        guard let allowedHosts else { return true }
+        return url.host.map(allowedHosts.contains) == true && url.user == nil && url.password == nil
+            && (url.port == nil || url.port == 443)
     }
     func cancel() { lock.withLock { cancelled = true; task?.cancel() } }
     func run(_ url: URL) throws {
-        guard url.scheme == "https" else { throw DDIManagementError("DDI downloads require HTTPS") }
+        guard allows(url) else { throw DDIManagementError("DDI download URL is not allowed") }
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieStorage = nil; config.urlCredentialStorage = nil; config.urlCache = nil
-        config.timeoutIntervalForRequest = 30; config.timeoutIntervalForResource = 180
+        config.timeoutIntervalForRequest = min(30, timeout); config.timeoutIntervalForResource = timeout
         let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         let task = session.downloadTask(with: url)
         lock.withLock { self.task = task; if cancelled { task.cancel() } else { task.resume() } }
-        guard finished.wait(timeout: .now() + 185) == .success else { throw URLError(.timedOut) }
+        guard finished.wait(timeout: .now() + timeout + 5) == .success else {
+            cancel(); throw URLError(.timedOut)
+        }
         if let error { throw error }
         guard copied else { throw DDIManagementError("DDI download incomplete") }
     }
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
-        completionHandler(request.url?.scheme == "https" ? request : nil)
+        completionHandler(allows(request.url) ? request : nil)
     }
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
                     totalBytesWritten received: Int64, totalBytesExpectedToWrite total: Int64) {
@@ -268,11 +280,14 @@ private final class DDIDownloadTransfer: NSObject, URLSessionDownloadDelegate, @
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         do {
             guard let response = downloadTask.response as? HTTPURLResponse, response.statusCode == 200,
-                  response.url?.scheme == "https",
+                  allows(response.url),
                   (try location.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? Int.max) <= limit else {
                 throw DDIManagementError("DDI download did not return a complete bounded HTTP 200 response")
             }
-            try FileManager.default.moveItem(at: location, to: destination); copied = true
+            try lock.withLock {
+                guard !cancelled else { throw CancellationError() }
+                try FileManager.default.moveItem(at: location, to: destination); copied = true
+            }
         } catch { self.error = error }
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {

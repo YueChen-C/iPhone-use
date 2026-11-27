@@ -24,7 +24,19 @@ final class AXUSBProxy: AXByteStream {
 
     enum Unsupported: Error { case legacyDevice }
 
-    init(device id: String, requireCoreDevice: Bool = false) throws {
+    struct LegacyInstrumentsUnavailable: Error, CustomStringConvertible {
+        let version: String
+        var description: String { "Legacy Instruments service is unavailable (iOS \(version))" }
+    }
+
+    enum Service { case accessibility, coreDevice, installationProxy, legacyInstruments, legacyImageMounter }
+    private(set) var productVersion: String?
+
+    convenience init(device id: String, requireCoreDevice: Bool = false) throws {
+        try self.init(device: id, service: requireCoreDevice ? .coreDevice : .accessibility)
+    }
+
+    init(device id: String, service requestedService: Service) throws {
         let library = try AXMobileDeviceLibrary()
         self.library = library
         func symbol<T>(_ name: String, _: T.Type) throws -> T {
@@ -72,11 +84,31 @@ final class AXUSBProxy: AXByteStream {
                 guard paired(d) == 1 else { throw AXDTX.Failure("Selected iPhone is not trusted") }
                 try check(validate(d), "validate pairing")
                 try check(start(d), "start session"); session = true
+                if requestedService == .installationProxy {
+                    try check(service(d, "com.apple.mobile.installation_proxy" as CFString, nil, &connection),
+                              "Installation Proxy")
+                    break
+                }
                 guard let version = copyValue(d, nil, "ProductVersion" as CFString)?.takeRetainedValue() as? String else {
                     throw AXDTX.Failure("Selected iPhone did not report ProductVersion")
                 }
+                productVersion = version
                 legacy = try Self.usesLegacyService(version: version)
-                if requireCoreDevice && legacy { throw Unsupported.legacyDevice }
+                if requestedService == .legacyInstruments || requestedService == .legacyImageMounter {
+                    guard legacy else { throw AXDTX.Failure("Legacy service requires iOS 15 or 16") }
+                    let instruments = requestedService == .legacyInstruments
+                    let name = instruments ? "com.apple.instruments.remoteserver.DVTSecureSocketProxy"
+                                           : "com.apple.mobile.mobile_image_mounter"
+                    let code = service(d, name as CFString, nil, &connection)
+                    // kAMDInvalidServiceError only; do not turn lock, trust or transport errors into a mount attempt.
+                    if instruments, UInt32(bitPattern: code) == 0xe800_0022 {
+                        throw LegacyInstrumentsUnavailable(version: version)
+                    }
+                    // Unlike legacy AX Audit, the secure Instruments service retains TLS after startup.
+                    try check(code, instruments ? "Legacy Instruments" : "Legacy image mounter")
+                    break
+                }
+                if requestedService == .coreDevice && legacy { throw Unsupported.legacyDevice }
                 let name = legacy ? "com.apple.accessibility.axAuditDaemon.remoteserver"
                                   : "com.apple.internal.devicecompute.CoreDeviceProxy"
                 try check(service(d, name as CFString, nil, &connection),
@@ -93,7 +125,7 @@ final class AXUSBProxy: AXByteStream {
                 break
             }
             guard connection != nil else { throw AXDTX.Failure("Selected physical USB iPhone not found") }
-            if legacy { return }
+            if legacy || requestedService == .installationProxy { return }
             let body = try JSONSerialization.data(withJSONObject: ["type": "clientHandshakeRequest", "mtu": 16000])
             try send(Data("CDTunnel".utf8) + Self.big(UInt64(body.count), 2) + body)
             let header = try receive(10)
@@ -163,9 +195,9 @@ final class AXUSBProxy: AXByteStream {
     }
 }
 
-/// Small synchronous TCP endpoint carried by a reliable, ordered USB stream.
-/// Only one active connection is consumed at a time. Unexpected sequence/flags
-/// fail closed rather than silently corrupting an AX snapshot.
+/// Small synchronous TCP endpoint carried over USB. Only one active connection
+/// is consumed at a time. Retransmitted bytes are ACKed but not consumed twice;
+/// sequence gaps still fail closed.
 final class AXTunnelSocket: AXByteStream {
     private let tunnel: AXUSBProxy
     private let remote: UInt16
@@ -203,17 +235,20 @@ final class AXTunnelSocket: AXByteStream {
             let packet = try next()
             if packet.flags & 4 != 0 { throw AXDTX.Failure("Tunnel TCP reset") }
             if !packet.payload.isEmpty {
-                guard packet.seq == acknowledgement else { throw AXDTX.Failure("Tunnel TCP out-of-order data") }
-                guard pending.count <= AXDTX.limit - packet.payload.count else { throw AXDTX.Failure("Tunnel TCP buffer limit") }
-                pending += packet.payload
+                guard let skip = Self.retransmittedPrefix(
+                    sequence: packet.seq, expected: acknowledgement, count: packet.payload.count)
+                else { throw AXDTX.Failure("Tunnel TCP out-of-order data") }
+                let fresh = packet.payload.dropFirst(skip)
+                guard pending.count <= AXDTX.limit - fresh.count else { throw AXDTX.Failure("Tunnel TCP buffer limit") }
+                pending += fresh
                 // Serialize ACK/sequence state and USB writes with the caller's
                 // subscribe/unsubscribe/DTX replies while receive is pending.
                 stateLock.lock()
-                acknowledgement &+= UInt32(packet.payload.count)
+                acknowledgement &+= UInt32(fresh.count)
                 defer { stateLock.unlock() }
                 try segment(flags: 16)
             }
-            if packet.flags & 1 != 0 {
+            if packet.flags & 1 != 0, packet.seq &+ UInt32(packet.payload.count) == acknowledgement {
                 stateLock.lock()
                 defer { stateLock.unlock() }
                 acknowledgement &+= 1; closed = true; try segment(flags: 16)
@@ -252,6 +287,11 @@ final class AXTunnelSocket: AXByteStream {
         }
         throw AXDTX.Failure("Tunnel TCP packet limit exceeded")
     }
+    static func retransmittedPrefix(sequence: UInt32, expected: UInt32, count: Int) -> Int? {
+        let offset = Int32(bitPattern: expected &- sequence)
+        return offset >= 0 ? min(Int(offset), count) : nil
+    }
+
     static func checksum(_ bytes: Data) -> UInt16 {
         var sum: UInt32 = 0
         for i in stride(from: 0, to: bytes.count, by: 2) {
