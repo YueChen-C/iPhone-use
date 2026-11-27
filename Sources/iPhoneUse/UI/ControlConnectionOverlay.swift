@@ -7,7 +7,9 @@ enum ControlConnectionStatus {
     var showsOverlay: Bool { self != .connected && self != .verifyingScreen }
 
     /// An ignored event must not cancel the discovery needed to enable input.
-    var permitsBackgroundMotionPreemption: Bool { self == .connected }
+    func permitsBackgroundMotionPreemption(backend: InputBackendKind) -> Bool {
+        backend == .ble && self == .connected
+    }
 
     static func resolve(
         hasScreen: Bool, hasMatchedHost: Bool, bluetoothState: DeviceBluetoothState,
@@ -39,6 +41,10 @@ final class ControlConnectionOverlay: NSView {
     private var lastStatus: ControlConnectionStatus = .disconnected
     private var usbPresentation: ControlUSBPresentation?
     private var backendSelectionFailure: String?
+    var onRetryBluetoothMatch: ((@escaping (Result<Void, Error>) -> Void) -> Void)?
+    private var bluetoothRetryToken: UUID?
+    private var bluetoothMatchError: Error?
+    private var reconnectPending = false
     var onNoticeDismissed: (() -> Void)?
     private var instructionsField: NSTextField?
     private var helpField: NSTextField?
@@ -298,10 +304,29 @@ final class ControlConnectionOverlay: NSView {
     }
 
     @objc private func onReconnectClicked() {
+        if lastStatus == .unmatched {
+            guard bluetoothRetryToken == nil, let onRetryBluetoothMatch else { return }
+            let token = UUID()
+            bluetoothRetryToken = token
+            bluetoothMatchError = nil
+            update(lastStatus)
+            onRetryBluetoothMatch { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self, self.bluetoothRetryToken == token else { return }
+                    self.bluetoothRetryToken = nil
+                    if case .failure(let error) = result { self.bluetoothMatchError = error }
+                    self.update(self.lastStatus)
+                }
+            }
+            return
+        }
+        reconnectPending = true
         reconnectButton.isEnabled = false
         DeviceRegistry.shared.reconnectBluetooth(resetExhausted: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            self?.reconnectButton.isEnabled = true
+            guard let self else { return }
+            self.reconnectPending = false
+            self.update(self.lastStatus)
         }
     }
 
@@ -353,6 +378,10 @@ final class ControlConnectionOverlay: NSView {
     func update(_ status: ControlConnectionStatus) {
         defer { onLayoutChanged?() }
         lastStatus = status
+        if status != .unmatched {
+            bluetoothRetryToken = nil
+            bluetoothMatchError = nil
+        }
         if status == .waitingForDevice { backendSelectionFailure = nil }
         if let backendSelectionFailure {
             updateSelectionFailureCard(backendSelectionFailure)
@@ -386,6 +415,10 @@ final class ControlConnectionOverlay: NSView {
         let hasPhoneScreen = status != .waitingForDevice
         viewOnlyButton.isHidden = !hasPhoneScreen
         reconnectButton.isHidden = !hasPhoneScreen
+        let workbench = StringsWorkbench.current
+        reconnectButton.title = status == .unmatched ? workbench.bluetoothMatchRetry : table.overlayButtonReconnect
+        reconnectButton.isEnabled = status == .unmatched
+            ? bluetoothRetryToken == nil && onRetryBluetoothMatch != nil : !reconnectPending
 
         if status == .waitingForDevice {
             setDismissed(false)
@@ -410,7 +443,11 @@ final class ControlConnectionOverlay: NSView {
             message.stringValue = table.overlayConnectingMessage
         case .unmatched:
             title.stringValue = table.overlayUnmatchedTitle
-            message.stringValue = table.overlayUnmatchedMessage
+            if bluetoothRetryToken != nil {
+                message.stringValue = workbench.bluetoothMatching
+            } else {
+                message.stringValue = bluetoothMatchError.map { String(describing: $0) } ?? table.overlayUnmatchedMessage
+            }
         case .verifyingScreen, .connected:
             break
         }

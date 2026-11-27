@@ -46,6 +46,7 @@ final class DeviceRegistry {
         let screenID: String?
         let screenObject: ObjectIdentifier?
         let routeGeneration: UUID?
+        let provenAbsoluteSize: CGSize?
     }
     private enum ReplacementRecovery {
         case notApplicable
@@ -74,8 +75,6 @@ final class DeviceRegistry {
     /// Failed observations cannot immediately start the same trajectory again.
     private var probeEvidence: [UUID: ProbeEvidence] = [:]
     private var probingCancelled = false
-    private var backgroundMotionGeneration: UInt64 = 0
-    private var probingGeneration: UInt64 = 0
     private var calibrationJobs = PointerCalibrationJobs()
     private var calibrationRetryTimer: DispatchSourceTimer?
     /// Persisted identities are candidates until motion confirms the physical
@@ -118,9 +117,8 @@ final class DeviceRegistry {
             self?.scheduleMatch(usableScreenID: screenID)
             self?.matchQueue.async {
                 guard let self, let device = self.all().first(where: { $0.id == screenID }),
-                    device.host != nil, !self.isAutomaticallyCalibrating(screenID: screenID),
-                    let state = self.lock.withLock({ self.calibrationJobs.status(screenID: screenID) }),
-                    state["state"] as? String == "unavailable"
+                    device.host != nil,
+                    self.lock.withLock({ self.calibrationJobs.shouldRetryOnUsableFrame(screenID: screenID) })
                 else { return }
                 self.automaticallyCalibrate(device, retry: true)
             }
@@ -321,14 +319,23 @@ final class DeviceRegistry {
             let session = HIDPeripheral.shared.connectionSession(for: host)
             let screenID = screen?.id
             let routeGeneration = screenID.map { USBInputController.shared.generation($0) }
-            let orientation: RelativePointerScreenMatcher.Orientation? = lock.withLock {
-                guard let screen, let session else { return nil }
-                return pointerOrientations[
+            let screenSize = screen?.size
+            let (orientation, absoluteSize) = lock.withLock {
+                () -> (RelativePointerScreenMatcher.Orientation?, CGSize?) in
+                guard let screen, let session, let routeGeneration else { return (nil, nil) }
+                let orientation = pointerOrientations[
                     Association(screen: screen.associationIdentity, host: host, session: session)]
+                let absoluteSize = screenSize.flatMap { size in
+                    calibrationJobs.usesAbsolute(.init(
+                        identity: .init(screenID: screen.id, host: host, session: session),
+                        capture: screen.associationIdentity, routeGeneration: routeGeneration, size: size)) ? size : nil
+                }
+                return (orientation, absoluteSize)
             }
             if let cached = inputs[host], !cached.input.isRetired,
                 cached.input.session == session, cached.screenID == screenID,
                 cached.routeGeneration == routeGeneration,
+                cached.provenAbsoluteSize == absoluteSize,
                 cached.screenObject == screen.map(ObjectIdentifier.init),
                 orientation == nil || cached.input.pointerOrientation == orientation
             {
@@ -338,10 +345,10 @@ final class DeviceRegistry {
                old.routeGeneration != routeGeneration {
                 retiringInputs[id, default: []].append(old.input)
             }
-            let input = makeInput(host: host, session: session, screen: screen)
+            let input = makeInput(host: host, session: session, screen: screen, provenAbsoluteSize: absoluteSize)
             inputs[host] = CachedInput(
                 input: input, screenID: screenID, screenObject: screen.map(ObjectIdentifier.init),
-                routeGeneration: routeGeneration)
+                routeGeneration: routeGeneration, provenAbsoluteSize: absoluteSize)
             return input
         }
     }
@@ -361,24 +368,24 @@ final class DeviceRegistry {
     /// Called while inputLock is held. Resolve calibration and the live screen
     /// provider once for each cached session/screen pair.
     private func makeInput(
-        host: UUID, session: UUID?, screen: ScreenCaptureSession?
+        host: UUID, session: UUID?, screen: ScreenCaptureSession?, provenAbsoluteSize: CGSize?
     ) -> DeviceInput {
         let screenID = screen?.id
         let routeGeneration = screenID.map { USBInputController.shared.generation($0) }
-        let calibration = loadCalibration(host: host, screen: screen)
+        let calibration = provenAbsoluteSize == nil ? loadCalibration(host: host, screen: screen) : nil
         let rejected =
-            screenID.flatMap { id in
+            provenAbsoluteSize == nil && (screenID.flatMap { id in
                 session.map { session in
                     lock.withLock {
                         calibrationJobs.hasRejectedCalibration(.init(screenID: id, host: host, session: session))
                     }
                 }
-            } ?? false
+            } ?? false)
         let input = DeviceInput(
             host: host, session: session, calibration: calibration,
-            calibrationRequired: RelativePointerCalibration.requiresCalibration(
+            calibrationRequired: provenAbsoluteSize == nil && RelativePointerCalibration.requiresCalibration(
                 host: host, screenID: screenID),
-            calibrationFilePresent: FileManager.default.fileExists(
+            calibrationFilePresent: provenAbsoluteSize == nil && FileManager.default.fileExists(
                 atPath: RelativePointerCalibration.fileURL(host: host).path),
             calibrationRejected: rejected,
             calibrationIsVerified: { [weak self] in
@@ -403,6 +410,7 @@ final class DeviceRegistry {
                 guard let screen else { return screenID == nil && manager.permitsPointerAssociation }
                 return USBInputController.shared.permitsBLE(screen.id, generation: routeGeneration)
                     && manager.permitsPointerAssociation(for: screen)
+                    && (provenAbsoluteSize == nil || screen.size == provenAbsoluteSize)
             })
         return input
     }
@@ -425,11 +433,9 @@ final class DeviceRegistry {
     /// Cancels measurement or discovery without waiting behind its input queue
     /// or trying to rematch the phone. The actual user action can then proceed.
     func cancelBackgroundMotion(for device: Device) {
-        // A proven phone has its own input queue and cancellation sequence.
-        // Its foreground activity must not cancel discovery of another phone.
-        if device.host == nil {
-            lock.withLock { backgroundMotionGeneration &+= 1 }
-        }
+        // A USB route being prepared at startup also has no Bluetooth host.
+        // Cancel only this screen's input, never a different phone's discovery.
+        // Unowned probes check capture and route generations before each send.
         let input = inputLock.withLock {
             inputs.values.first { $0.screenID == device.id }?.input
         }
@@ -453,87 +459,198 @@ final class DeviceRegistry {
     /// Verify saved curves per Bluetooth session with bounded retries. Only repeatable observed
     /// mismatches may trigger replacement; observation failure preserves files.
     func automaticallyCalibrate(_ device: Device, retry: Bool = false, verifyOnly: Bool = false) {
-        guard USBInputController.shared.permitsBLE(device.id, generation: nil),
+        _ = startPointerCalibration(device, retry: retry, mode: verifyOnly ? .verifyOnly : .automatic)
+    }
+
+    /// Choose the coordinate mode from observed landings on the exact capture
+    /// selected when the button was pressed, not the iOS version or saved curve.
+    func recalibrate(_ device: Device, completion: @escaping (Result<PointerRecalibrationResult, Error>) -> Void) {
+        let route = USBInputController.shared.generation(device.id)
+        matchQueue.async {
+            do {
+                let current = try self.ensureBluetoothAssociation(for: device, route: route)
+                guard self.startPointerCalibration(
+                    current, retry: true, mode: .recalibrate, expectedRoute: route, completion: completion
+                ) else { throw DeviceError(StringsWorkbench.current.recalibrationUnavailable) }
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    func retryBluetoothAssociation(_ device: Device, completion: @escaping (Result<Void, Error>) -> Void) {
+        let route = USBInputController.shared.generation(device.id)
+        matchQueue.async {
+            do {
+                let current = try self.ensureBluetoothAssociation(for: device, route: route)
+                if USBInputController.shared.permitsBLE(current.id, generation: route) {
+                    self.automaticallyCalibrate(current)
+                }
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    /// A manual recovery works even if the automatic retry budget has run
+    /// out. It does not reset that budget or force a rematch on other phones.
+    private func ensureBluetoothAssociation(for device: Device, route: UUID) throws -> Device {
+        dispatchPrecondition(condition: .onQueue(matchQueue))
+        let manager = ScreenCaptureManager.shared
+        let devices = all()
+        guard let current = devices.first(where: { $0.screen === device.screen }),
+            USBInputController.shared.permitsBLE(current.id, generation: route),
+            current.lockState != .suspected, current.lockState != .paused,
+            manager.permitsPointerAssociation(for: current.screen), current.screen.size != nil,
+            device.host == nil || device.host == current.host
+        else { throw BluetoothMatchRetryError.unavailable }
+        if current.host != nil { return current }
+        guard current.bluetoothState == .unmatched else { throw BluetoothMatchRetryError.unavailable }
+        // A different phone using USB Touch can still own an unknown BLE
+        // connection. Count it for ambiguity even though we never probe it.
+        let unresolved = Set(devices.filter { $0.host == nil }.map(\.id))
+        let pairings = lock.withLock { self.pairings }
+        let sessions = currentHostSessions()
+        guard let host = BluetoothMatchRetry.candidate(
+            for: current.id, unresolvedScreenIDs: unresolved, pairings: pairings, connectedHosts: Set(sessions.keys)
+        ) else { throw BluetoothMatchRetryError.ambiguous }
+        guard let session = sessions[host],
+            !HIDPeripheral.shared.subscribedPointerReports(for: host, session: session).isEmpty
+        else { throw BluetoothMatchRetryError.unavailable }
+
+        beginProbeRound()
+        defer { probeActivities = nil }
+        log("manual Bluetooth matching started for \(current.screen.name)")
+        let isCurrent = {
+            USBInputController.shared.permitsBLE(current.id, generation: route)
+                && HIDPeripheral.shared.connectionSession(for: host) == session
+        }
+        guard probe(host, among: [current.screen], isCurrent: isCurrent) === current.screen else {
+            guard isCurrent() else { throw BluetoothMatchRetryError.unavailable }
+            log("manual Bluetooth matching found no unique pointer motion on \(current.screen.name)")
+            throw BluetoothMatchRetryError.notObserved
+        }
+        guard isCurrent(), store([current.id: host], expectingPairings: pairings),
+            let verified = all().first(where: { $0.screen === current.screen && $0.host == host })
+        else { throw BluetoothMatchRetryError.unavailable }
+        log("manual Bluetooth matching verified for \(current.screen.name)")
+        return verified
+    }
+
+    private func startPointerCalibration(
+        _ device: Device, retry: Bool, mode: PointerCalibrationMode,
+        expectedRoute: UUID? = nil,
+        completion: ((Result<PointerRecalibrationResult, Error>) -> Void)? = nil
+    ) -> Bool {
+        let routeGeneration = expectedRoute ?? USBInputController.shared.generation(device.id)
+        guard USBInputController.shared.permitsBLE(device.id, generation: routeGeneration),
             device.lockState != .suspected, device.lockState != .paused,
             RelativePointerCalibration.isDeviceUDID(device.id),
             ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen),
             let host = device.host, let size = device.screen.size,
             size.width <= 4096, size.height <= 4096
-        else { return }
+        else { return false }
         let input = input(for: host, screen: device.screen)
-        let routeGeneration = USBInputController.shared.generation(device.id)
         guard
-            verifyOnly || input.calibration?.matches(size) == true
+            !mode.reusesExisting || input.calibration?.matches(size) == true
                 || (input.calibration == nil && input.needsCalibration),
             input.isCurrentSession,
             let session = input.session,
             HIDPeripheral.shared.isReady(report: .relativeMouse, host: host, session: session)
-        else { return }
+                || (mode == .recalibrate && HIDPeripheral.shared.isReady(report: .absolutePointer, host: host, session: session))
+        else { return false }
         let identityConfirmed = {
             let manager = ScreenCaptureManager.shared
             return manager.identityState == .singleDevice || manager.identityVerified(for: device.screen)
         }
         // Restricted fallback matching proves motion ownership, but cannot
         // justify rewriting a template under an unconfirmed physical USB ID.
-        guard verifyOnly || identityConfirmed() else { return }
+        guard !mode.savesProfile || identityConfirmed() else { return false }
         let identity = PointerCalibrationJobs.Identity(screenID: device.id, host: host, session: session)
         let activity = input.inputActivitySequence
         guard
             lock.withLock({
-                pairings[device.id] == host && calibrationJobs.begin(identity, retry: retry)
+                pairings[device.id] == host && calibrationJobs.begin(identity, retry: retry, mode: mode)
             })
-        else { return }
+        else { return false }
         log("automatic pointer calibration started for \(device.screen.name)")
         DispatchQueue.global(qos: .userInitiated).async {
-            var failure: String?
+            var failure: Error?
             var verifiedProfile: RelativePointerCalibration?
             var saved = false
             var reused = false
+            var result: PointerRecalibrationResult = .relative
             defer {
                 self.lock.withLock {
                     self.calibrationJobs.finish(
-                        identity, failure: failure, profile: verifiedProfile, saved: saved, reused: reused,
+                        identity, failure: failure.map { String(describing: $0) },
+                        profile: verifiedProfile, saved: saved, reused: reused,
                         userInterrupted: failure != nil && input.inputActivitySequence != activity)
                 }
+                if let failure { completion?(.failure(failure)) }
+                else { completion?(.success(result)) }
             }
-            let isReady = {
+            let isReady = { (report: ReportID) in
                 USBInputController.shared.permitsBLE(device.id, generation: routeGeneration)
                     && ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen) && input.isCurrentSession
-                    && HIDPeripheral.shared.isReady(report: .relativeMouse, host: host, session: session)
+                    && HIDPeripheral.shared.isReady(report: report, host: host, session: session)
                     && self.lock.withLock { self.pairings[device.id] == host }
                     && ScreenCaptureManager.shared.all.contains { $0 === device.screen }
                     && device.screen.size == size
-                    && (verifyOnly || identityConfirmed())
+                    && (!mode.savesProfile || identityConfirmed())
             }
             do {
                 let originalFiles = try RelativePointerCalibration.storageSnapshot(host: host, screenID: device.id)
                 guard
-                    self.loadCalibration(host: host, screen: device.screen)
+                    !mode.reusesExisting || self.loadCalibration(host: host, screen: device.screen)
                         == input.calibration
                 else { throw DeviceError("pointer calibration changed before measurement; reload it first") }
-                let resolution = try input.measureRelativePointer(
-                    screenID: device.id, size: size, activity: activity, reuseExisting: !verifyOnly, isReady: isReady,
-                    capture: { device.screen.thumbnail(width: Int(size.width), height: Int(size.height)) },
-                    onMismatch: {
-                        self.lock.withLock { self.calibrationJobs.rejectExisting(identity) }
-                        log("saved pointer curve no longer matches \(device.screen.name); measuring replacement")
-                    },
-                    progress: { count in
-                        self.lock.withLock { self.calibrationJobs.progress(identity, count: count) }
-                    })
-                guard isReady() else { throw DeviceError("device changed during automatic pointer calibration") }
+                let measureRelative = {
+                    try input.measureRelativePointer(
+                        screenID: device.id, size: size, activity: activity, reuseExisting: mode.reusesExisting,
+                        isReady: { isReady(.relativeMouse) },
+                        capture: { device.screen.thumbnail(width: Int(size.width), height: Int(size.height)) },
+                        onMismatch: {
+                            self.lock.withLock { self.calibrationJobs.rejectExisting(identity) }
+                            log("saved pointer curve no longer matches \(device.screen.name); measuring replacement")
+                        },
+                        progress: { count in
+                            self.lock.withLock { self.calibrationJobs.progress(identity, count: count) }
+                        })
+                }
+                let resolution: AutomaticPointerCalibration.Resolution?
+                if mode == .recalibrate {
+                    let measurement = try PointerRecalibrationResult.choose(
+                        verifyAbsolute: {
+                            // Missing transport support is different from an interrupted probe.
+                            guard HIDPeripheral.shared.isReady(report: .absolutePointer, host: host, session: session)
+                            else { return false }
+                            return try input.verifyAbsolutePointer(
+                                activity: activity, isReady: { isReady(.absolutePointer) },
+                                capture: {
+                                    device.screen.thumbnail(width: PointerScreenMatcher.width, height: PointerScreenMatcher.height)
+                                })
+                        }, measureRelative: measureRelative)
+                    result = measurement.mode
+                    resolution = measurement.profile
+                } else {
+                    resolution = try measureRelative()
+                }
+                let report: ReportID = result == .absolute ? .absolutePointer : .relativeMouse
+                guard isReady(report) else { throw DeviceError("device changed during pointer calibration") }
                 guard try RelativePointerCalibration.storageSnapshot(host: host, screenID: device.id) == originalFiles
                 else {
                     throw DeviceError("pointer calibration files changed during measurement; existing files preserved")
                 }
-                let profile = resolution.profile
+                let profile = resolution?.profile
                 verifiedProfile = profile
-                reused = resolution.reused
+                reused = resolution?.reused == true
                 if reused {
                     log("saved pointer calibration verified for \(device.screen.name); reused unchanged")
                     return
                 }
-                if verifyOnly {
+                if !mode.savesProfile {
                     log("automatic pointer measurement verified for \(device.screen.name); saved profile unchanged")
                     return
                 }
@@ -542,9 +659,10 @@ final class DeviceRegistry {
                 // registry lock so waiting for that queue cannot block its
                 // readiness callback; recheck identity before publishing.
                 try input.retireForCalibrationReload(ifActivityUnchanged: activity)
-                guard ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen),
+                guard USBInputController.shared.permitsBLE(device.id, generation: routeGeneration),
+                    ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen),
                     HIDPeripheral.shared.connectionSession(for: host) == session,
-                    HIDPeripheral.shared.isReady(report: .relativeMouse, host: host, session: session),
+                    HIDPeripheral.shared.isReady(report: report, host: host, session: session),
                     ScreenCaptureManager.shared.all.contains(where: { $0 === device.screen }),
                     device.screen.size == size
                 else { throw DeviceError("device changed before saving pointer calibration") }
@@ -552,33 +670,45 @@ final class DeviceRegistry {
                 // need the registry lock, so acquire the cache lock first.
                 try self.inputLock.withLock {
                     try self.lock.withLock {
-                        guard ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen),
+                        guard USBInputController.shared.permitsBLE(device.id, generation: routeGeneration),
+                            ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen),
                             self.pairings[device.id] == host,
-                            ScreenCaptureManager.shared.all.contains(where: { $0 === device.screen })
+                            device.screen.size == size
                         else {
                             throw DeviceError("device pairing changed during automatic pointer calibration")
                         }
                         guard self.inputs[host]?.input === input, input.isRetired else {
                             throw DeviceError("pointer input changed during automatic pointer calibration")
                         }
-                        guard identityConfirmed(), profile.screenID == device.id else {
+                        guard identityConfirmed() else {
                             throw DeviceError("physical USB identity changed before saving pointer calibration")
                         }
-                        try profile.saveVerified(ifUnchanged: originalFiles)
-                        self.calibrationJobs.clearRejection(screenID: device.id)
+                        if let profile {
+                            guard profile.screenID == device.id else { throw DeviceInput.InputError.calibrationMismatch }
+                            try profile.saveVerified(ifUnchanged: originalFiles)
+                            self.calibrationJobs.clearRejection(screenID: device.id)
+                            self.calibrationJobs.clearAbsolute(screenID: device.id)
+                            saved = true
+                        } else {
+                            // This proof only applies to this live binding; keep the disk
+                            // curve usable for a later connection that does need it.
+                            self.calibrationJobs.recordAbsolute(.init(
+                                identity: identity, capture: device.screen.associationIdentity,
+                                routeGeneration: routeGeneration, size: size))
+                        }
                         self.inputs[host] = nil
-                        saved = true
                     }
                 }
-                log("automatic pointer calibration verified for \(device.screen.name); saved=\(saved)")
+                log("pointer calibration verified for \(device.screen.name); mode=\(result), saved=\(saved)")
             } catch {
-                if self.lock.withLock({ self.calibrationJobs.hasRejectedCalibration(identity) }) {
+                if mode != .recalibrate, self.lock.withLock({ self.calibrationJobs.hasRejectedCalibration(identity) }) {
                     input.rejectCalibration()
                 }
-                failure = String(describing: error)
+                failure = error
                 log("automatic pointer calibration stopped for \(device.screen.name): \(error)")
             }
         }
+        return true
     }
 
     private func scheduleAutomaticCalibrations() {
@@ -620,7 +750,9 @@ final class DeviceRegistry {
         matchQueue.async { [weak self] in
             guard let self else { return }
             self.reconnectSavedBluetoothHosts(for: ScreenCaptureManager.shared.all, retryDevice: retry ? id : nil)
-            if retry { self.scheduleMatch() }
+            // A route leaving BLE changes the set of captures a previous
+            // unowned probe was allowed to observe. Unchanged topology is a no-op.
+            self.scheduleMatch()
         }
     }
 
@@ -718,12 +850,7 @@ final class DeviceRegistry {
                 reconnectingHosts: reconnectingHosts)
             let changed = probeSchedule.update(topology, restart: restartProbing)
             guard !requireChangedTopology || changed else { return [:] }
-            probingCancelled = false
-            probeEvidence = [:]
-            probingGeneration = lock.withLock { backgroundMotionGeneration }
-            // observeProbeActivity enrolls only inputs actually used in this
-            // round; unrelated, already matched phones may remain in use.
-            probeActivities = [:]
+            beginProbeRound()
         }
         defer {
             if allowProbing {
@@ -856,12 +983,9 @@ final class DeviceRegistry {
 
         guard let token = probeSchedule.scheduleRetry(), let delay = probeSchedule.pendingRetryDelay else { return }
         let activity = probeActivities?.map { $0.value } ?? []
-        let generation = probingGeneration
         matchQueue.asyncAfter(deadline: .now() + delay) {
             guard self.probeSchedule.beginRetry(token) else { return }
-            guard self.lock.withLock({ self.backgroundMotionGeneration == generation }),
-                activity.allSatisfy({ $0.input.inputActivitySequence == $0.sequence })
-            else {
+            guard activity.allSatisfy({ $0.input.inputActivitySequence == $0.sequence }) else {
                 self.probeSchedule.cancel()
                 return
             }
@@ -878,16 +1002,21 @@ final class DeviceRegistry {
         return input.inputActivitySequence
     }
 
+    private func beginProbeRound() {
+        probingCancelled = false
+        probeEvidence = [:]
+        // Enroll only inputs this round actually probes.
+        probeActivities = [:]
+    }
+
     /// A cancelled per-host probe must not immediately restart as a relative
     /// fallback or move another host in the same matching round.
     private func probingMayContinue() -> Bool {
         guard !probingCancelled, ScreenCaptureManager.shared.permitsPointerAssociation else { return false }
-        guard lock.withLock({ backgroundMotionGeneration == probingGeneration }),
-            probeActivities?.values.allSatisfy({ $0.input.inputActivitySequence == $0.sequence }) ?? true
-        else {
+        guard probeActivities?.values.allSatisfy({ $0.input.inputActivitySequence == $0.sequence }) ?? true else {
             probingCancelled = true
             probeSchedule.cancel()
-            log("pointer discovery stopped for user input")
+            log("pointer discovery stopped because the probed input changed")
             return false
         }
         return true
@@ -1121,7 +1250,9 @@ final class DeviceRegistry {
 
     /// Scores only rank captures. A unique complete absolute trajectory or a
     /// relative rectangle must identify the screen before its binding is usable.
-    private func probe(_ host: UUID, among screens: [ScreenCaptureSession]) -> ScreenCaptureSession? {
+    private func probe(
+        _ host: UUID, among screens: [ScreenCaptureSession], isCurrent: () -> Bool = { true }
+    ) -> ScreenCaptureSession? {
         let knownID = lock.withLock { pairings.first { $0.value == host }?.key }
         let input: DeviceInput
         if let screen = bluetoothAssociationScreens.first(where: { $0.id == knownID }) {
@@ -1143,9 +1274,9 @@ final class DeviceRegistry {
                         && captureSnapshot.allSatisfy { manager.permitsPointerAssociation(for: $0) }
                 })
         }
-        let evidence = motionEvidence(input, verifyAbsolute: input.calibration == nil)
+        let evidence = motionEvidence(input, verifyAbsolute: input.calibration == nil, isCurrent: isCurrent)
         let hits = screens.filter { evidence.results[ObjectIdentifier($0)] == .hit }
-        guard hits.count == 1, let screen = hits.first,
+        guard isCurrent(), hits.count == 1, let screen = hits.first,
             finishProbe(input, on: screen, evidence: evidence)
         else { return nil }
         return screen
@@ -1154,9 +1285,11 @@ final class DeviceRegistry {
     /// All present screens are captured together. A unique absolute trajectory
     /// completes discovery directly; relative-only phones first try a local
     /// rectangle, then the edge-prepared path if that observation fails.
-    private func motionEvidence(_ input: DeviceInput, verifyAbsolute: Bool) -> ProbeEvidence {
+    private func motionEvidence(
+        _ input: DeviceInput, verifyAbsolute: Bool, isCurrent: () -> Bool = { true }
+    ) -> ProbeEvidence {
         let empty = ProbeEvidence(session: input.session)
-        guard let sequence = observeProbeActivity(input), input.session != nil,
+        guard isCurrent(), let sequence = observeProbeActivity(input), input.session != nil,
             HIDPeripheral.shared.connectionSession(for: input.host) == input.session
         else { return empty }
         if let cached = probeEvidence[input.host] {
@@ -1171,7 +1304,7 @@ final class DeviceRegistry {
         let host = input.host
         let session = input.session
         func isReady(_ report: ReportID) -> Bool {
-            ScreenCaptureManager.shared.permitsPointerAssociation && self.probingMayContinue()
+            isCurrent() && ScreenCaptureManager.shared.permitsPointerAssociation && self.probingMayContinue()
                 && input.inputActivitySequence == sequence && input.isCurrentSession
                 && HIDPeripheral.shared.isReady(report: report, host: host, session: session)
         }

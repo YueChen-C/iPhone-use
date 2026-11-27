@@ -612,6 +612,32 @@ extension DeviceInput {
         }
     }
 
+    /// Verify the native absolute pointer route before measuring a relative
+    /// curve. The caller remains responsible for checking the exact screen.
+    func verifyAbsolutePointer(
+        activity: UInt64, isReady: () -> Bool, capture: () -> [UInt8]?
+    ) throws -> Bool {
+        func run(_ targets: [PointerScreenMatcher.ProbeTarget]) throws -> [[UInt8]] {
+            let observation = try pairingProbe(
+                calibration: nil,
+                firstPoint: CGPoint(x: targets[0].x, y: targets[0].y),
+                secondPoint: CGPoint(x: targets[1].x, y: targets[1].y),
+                returnToStart: true,
+                thirdPoint: CGPoint(x: targets[2].x, y: targets[2].y),
+                isReady: { self.inputActivitySequence == activity && isReady() }, capture: capture)
+            guard let intermediate = observation.intermediate, let returned = observation.returned else {
+                throw InputError.pairingProbeUnavailable
+            }
+            return [observation.before, observation.after, intermediate, returned]
+        }
+        let primary = PointerScreenMatcher.gutterProbeTargets
+        let frames = try run(primary)
+        if PointerScreenMatcher.matchesAbsoluteRoundTrip(frames, targets: primary) { return true }
+        guard PointerScreenMatcher.hasReversibleTargetActivity(frames, targets: primary) else { return false }
+        let fallback = PointerScreenMatcher.fallbackProbeTargets
+        return PointerScreenMatcher.matchesAbsoluteRoundTrip(try run(fallback), targets: fallback)
+    }
+
     /// Serializes a two-position matching probe with normal input on this host.
     /// A supplied calibration is used only for these reports, so recovery can
     /// test a verified old host profile without binding it to the current USB ID.

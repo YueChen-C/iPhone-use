@@ -3,6 +3,59 @@ import XCTest
 @testable import iPhoneUse
 
 final class PointerCalibrationJobsTests: XCTestCase {
+    func testManualRecheckSelectsModeFromProofAndDoesNotFallbackAfterInterruption() throws {
+        var measurements = 0
+        func measure() -> String { measurements += 1; return "measured profile" }
+
+        let absolute = try PointerRecalibrationResult.choose(verifyAbsolute: { true }, measureRelative: measure)
+        XCTAssertEqual(absolute.mode, .absolute)
+        XCTAssertNil(absolute.profile)
+        XCTAssertEqual(measurements, 0)
+
+        let relative = try PointerRecalibrationResult.choose(verifyAbsolute: { false }, measureRelative: measure)
+        XCTAssertEqual(relative.mode, .relative)
+        XCTAssertEqual(relative.profile, "measured profile")
+        XCTAssertEqual(measurements, 1)
+
+        XCTAssertThrowsError(try PointerRecalibrationResult.choose(
+            verifyAbsolute: { throw DeviceInput.InputError.pairingProbeUnavailable }, measureRelative: measure))
+        XCTAssertEqual(measurements, 1)
+        XCTAssertFalse(PointerCalibrationMode.recalibrate.reusesExisting)
+    }
+
+    func testManualFailurePreservesExistingProofAndDoesNotMovePhoneAgainAutomatically() {
+        var jobs = PointerCalibrationJobs()
+        let id = PointerCalibrationJobs.Identity(screenID: "phone", host: UUID(), session: UUID())
+        XCTAssertTrue(jobs.begin(id, retry: false, now: 0))
+        jobs.finish(id, failure: nil, reused: true, now: 1)
+        XCTAssertTrue(jobs.isVerified(id))
+        XCTAssertTrue(jobs.begin(id, retry: true, mode: .recalibrate, now: 2))
+        XCTAssertFalse(jobs.begin(id, retry: true, mode: .recalibrate, now: 2))
+        jobs.finish(id, failure: "interrupted", now: 3)
+        XCTAssertTrue(jobs.isVerified(id))
+        XCTAssertFalse(jobs.shouldRetryOnUsableFrame(screenID: id.screenID))
+        XCTAssertEqual(jobs.status(screenID: id.screenID)?["automaticRetryPending"] as? Bool, false)
+        XCTAssertFalse(jobs.begin(id, retry: false, now: 100))
+        XCTAssertTrue(jobs.begin(id, retry: true, mode: .recalibrate, now: 101))
+    }
+
+    func testAbsoluteProofIsScopedToTheExactLiveBindingAndClearedOnReload() {
+        var jobs = PointerCalibrationJobs()
+        let id = PointerCalibrationJobs.Identity(screenID: "phone", host: UUID(), session: UUID())
+        let capture = UUID(), route = UUID(), size = CGSize(width: 750, height: 1334)
+        let proof = PointerCalibrationJobs.AbsoluteProof(identity: id, capture: capture, routeGeneration: route, size: size)
+        jobs.recordAbsolute(proof)
+        XCTAssertTrue(jobs.usesAbsolute(proof))
+        XCTAssertFalse(jobs.usesAbsolute(.init(identity: id, capture: UUID(), routeGeneration: route, size: size)))
+        XCTAssertFalse(jobs.usesAbsolute(.init(identity: id, capture: capture, routeGeneration: UUID(), size: size)))
+        XCTAssertFalse(jobs.usesAbsolute(.init(
+            identity: id, capture: capture, routeGeneration: route, size: CGSize(width: 1334, height: 750))))
+        let reconnected = PointerCalibrationJobs.Identity(screenID: id.screenID, host: id.host, session: UUID())
+        XCTAssertFalse(jobs.usesAbsolute(.init(identity: reconnected, capture: capture, routeGeneration: route, size: size)))
+        jobs.invalidate(screenID: id.screenID)
+        XCTAssertFalse(jobs.usesAbsolute(proof))
+    }
+
     func testForegroundTakeoverStopsAutomaticRetriesUntilExplicitRetryOrNewSession() {
         var jobs = PointerCalibrationJobs()
         let id = PointerCalibrationJobs.Identity(screenID: "phone", host: UUID(), session: UUID())

@@ -5,6 +5,8 @@ import Foundation
 enum DeviceBluetoothState: String {
     case connected, unmatched, disconnected
 
+    var canRecheckPointer: Bool { self != .disconnected }
+
     static func resolve(
         screenID: String, matchedHost: UUID?, pairings: [String: UUID], connectedHosts: Set<UUID>
     ) -> Self {
@@ -12,6 +14,36 @@ enum DeviceBluetoothState: String {
         if let savedHost = pairings[screenID], connectedHosts.contains(savedHost) { return .unmatched }
         let knownHosts = Set(pairings.values)
         return connectedHosts.subtracting(knownHosts).isEmpty ? .disconnected : .unmatched
+    }
+}
+
+/// Only move the saved host for the selected screen, or a single unclaimed
+/// host when there is exactly one unresolved screen. This selects a
+/// candidate to probe, never authorizes input without a live motion proof.
+enum BluetoothMatchRetry {
+    static func candidate(
+        for screenID: String, unresolvedScreenIDs: Set<String>, pairings: [String: UUID], connectedHosts: Set<UUID>
+    ) -> UUID? {
+        guard unresolvedScreenIDs.contains(screenID) else { return nil }
+        if let saved = pairings[screenID], connectedHosts.contains(saved) {
+            return pairings.contains(where: { $0.key != screenID && $0.value == saved }) ? nil : saved
+        }
+        guard unresolvedScreenIDs.count == 1 else { return nil }
+        let unclaimed = connectedHosts.subtracting(pairings.values)
+        return unclaimed.count == 1 ? unclaimed.first : nil
+    }
+}
+
+enum BluetoothMatchRetryError: Error, CustomStringConvertible {
+    case unavailable, ambiguous, notObserved
+
+    var description: String {
+        let t = StringsWorkbench.current
+        switch self {
+        case .unavailable: return t.recalibrationUnavailable
+        case .ambiguous: return t.bluetoothMatchAmbiguous
+        case .notObserved: return t.bluetoothMatchNotObserved
+        }
     }
 }
 

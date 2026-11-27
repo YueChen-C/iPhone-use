@@ -1,5 +1,26 @@
 import Foundation
 
+enum PointerCalibrationMode {
+    case automatic, verifyOnly, recalibrate
+
+    var reusesExisting: Bool { self == .automatic }
+    var savesProfile: Bool { self != .verifyOnly }
+    var allowsAutomaticRetry: Bool { self != .recalibrate }
+}
+
+enum PointerRecalibrationResult {
+    case absolute, relative
+
+    /// Lack of an absolute report or proof can fall back to relative. An
+    /// interrupted/failed observation must propagate instead of moving again.
+    static func choose<Profile>(
+        verifyAbsolute: () throws -> Bool, measureRelative: () throws -> Profile
+    ) throws -> (mode: Self, profile: Profile?) {
+        if try verifyAbsolute() { return (.absolute, nil) }
+        return (.relative, try measureRelative())
+    }
+}
+
 /// Registry-lock protected bookkeeping. Repeated status/matching refreshes must
 /// not launch concurrent measurements or continuously move a failing phone.
 struct PointerCalibrationJobs {
@@ -9,8 +30,16 @@ struct PointerCalibrationJobs {
         let session: UUID
     }
 
+    struct AbsoluteProof: Equatable {
+        let identity: Identity
+        let capture: UUID
+        let routeGeneration: UUID
+        let size: CGSize
+    }
+
     private struct Job {
         let identity: Identity
+        let allowsAutomaticRetry: Bool
         var running = true
         var measuredCounts = 0
         var failure: String?
@@ -26,15 +55,30 @@ struct PointerCalibrationJobs {
     private var jobs: [String: Job] = [:]
     private var attempted: Set<Identity> = []
     private var verified: Set<Identity> = []
+    private var absoluteProofs: [String: AbsoluteProof] = [:]
+
+    func usesAbsolute(_ proof: AbsoluteProof) -> Bool {
+        absoluteProofs[proof.identity.screenID] == proof
+    }
+
+    mutating func recordAbsolute(_ proof: AbsoluteProof) {
+        absoluteProofs[proof.identity.screenID] = proof
+    }
+
+    mutating func clearAbsolute(screenID: String) {
+        absoluteProofs[screenID] = nil
+    }
 
     mutating func begin(
-        _ identity: Identity, retry: Bool, now: TimeInterval = ProcessInfo.processInfo.systemUptime
+        _ identity: Identity, retry: Bool, mode: PointerCalibrationMode = .automatic,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> Bool {
         guard jobs[identity.screenID]?.running != true else { return false }
         let previous = jobs[identity.screenID]
         let sameSession = previous?.identity == identity
         if !retry, sameSession {
-            guard previous?.failure != nil, previous?.userInterrupted != true, (previous?.attempts ?? 0) < 3,
+            guard previous?.allowsAutomaticRetry == true, previous?.failure != nil,
+                previous?.userInterrupted != true, (previous?.attempts ?? 0) < 3,
                 now >= (previous?.nextAttemptAt ?? 0)
             else { return false }
         } else if !retry, attempted.contains(identity) {
@@ -43,7 +87,7 @@ struct PointerCalibrationJobs {
         attempted.insert(identity)
         let rejected = hasRejectedCalibration(identity)
         jobs[identity.screenID] = Job(
-            identity: identity, rejectedExisting: rejected,
+            identity: identity, allowsAutomaticRetry: mode.allowsAutomaticRetry, rejectedExisting: rejected,
             attempts: !retry && sameSession ? (previous?.attempts ?? 0) + 1 : 1)
         return true
     }
@@ -81,6 +125,7 @@ struct PointerCalibrationJobs {
         jobs[identity.screenID]?.saved = saved
         jobs[identity.screenID]?.reused = reused
         if failure == nil, saved || reused {
+            absoluteProofs[identity.screenID] = nil
             jobs[identity.screenID]?.rejectedExisting = false
             verified = verified.filter { $0.screenID != identity.screenID }
             verified.insert(identity)
@@ -90,6 +135,7 @@ struct PointerCalibrationJobs {
     mutating func invalidate(screenID: String) {
         // Explicit profile reload must not inherit proof for different file contents.
         jobs[screenID] = nil
+        absoluteProofs[screenID] = nil
         attempted = attempted.filter { $0.screenID != screenID }
         verified = verified.filter { $0.screenID != screenID }
     }
@@ -100,6 +146,11 @@ struct PointerCalibrationJobs {
 
     func isRunning(screenID: String) -> Bool { jobs[screenID]?.running == true }
 
+    func shouldRetryOnUsableFrame(screenID: String) -> Bool {
+        guard let job = jobs[screenID] else { return false }
+        return !job.running && job.failure != nil && job.allowsAutomaticRetry
+    }
+
     func status(screenID: String) -> [String: Any]? {
         guard let job = jobs[screenID] else { return nil }
         var result: [String: Any] = [
@@ -107,7 +158,8 @@ struct PointerCalibrationJobs {
             "measuredCounts": job.measuredCounts,
             "totalCounts": 32,
             "attempts": job.attempts,
-            "automaticRetryPending": !job.running && job.failure != nil && !job.userInterrupted && job.attempts < 3,
+            "automaticRetryPending": job.allowsAutomaticRetry && !job.running && job.failure != nil
+                && !job.userInterrupted && job.attempts < 3,
             "rejectedExisting": job.rejectedExisting,
         ]
         if let failure = job.failure { result["reason"] = failure }

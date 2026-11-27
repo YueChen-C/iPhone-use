@@ -337,6 +337,13 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         window?.contentMinSize = NSSize(width: 240 + ControlSidebar.width, height: 460)
         window?.center()
         super.init(window: window)
+        content.connectionOverlay.onRetryBluetoothMatch = { [weak self] completion in
+            guard let device = self?.lastKnownDevice else {
+                completion(.failure(BluetoothMatchRetryError.unavailable))
+                return
+            }
+            DeviceRegistry.shared.retryBluetoothAssociation(device, completion: completion)
+        }
         window?.delegate = self
         window?.initialFirstResponder = controlView
         window?.makeFirstResponder(controlView)

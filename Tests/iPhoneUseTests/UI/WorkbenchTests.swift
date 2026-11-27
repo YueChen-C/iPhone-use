@@ -4,6 +4,28 @@ import XCTest
 @testable import iPhoneUse
 
 final class WorkbenchStateTests: XCTestCase {
+    func testPointerRecheckFollowsSelectedBluetoothDeviceAndDoesNotDependOnIOSMetadata() {
+        var state = WorkbenchState()
+        var old = device("old")
+        old.detail = "iOS 15.4"
+        var new = device("new")
+        new.detail = "iOS 26.5"
+        let unknown = device("unknown")
+        var usb = device("usb")
+        usb.backend = .usb
+        state.reconcile([old, new, unknown, usb])
+
+        for id in [old.id, new.id, unknown.id] {
+            XCTAssertTrue(state.select(id))
+            XCTAssertEqual(state.selected?.offersPointerRecalibration, true)
+        }
+        XCTAssertTrue(state.select(usb.id))
+        XCTAssertEqual(state.selected?.offersPointerRecalibration, false)
+        XCTAssertTrue(state.select(old.id))
+        state.reconcile([new, unknown, usb])
+        XCTAssertEqual(state.selected?.offersPointerRecalibration, false)
+    }
+
     func testScreenshotExportRequiresIdentityBeforeAndAfterEncoding() throws {
         let bytes = Data([1, 2, 3])
         XCTAssertEqual(

@@ -1,8 +1,39 @@
+import AppKit
 import XCTest
 
 @testable import iPhoneUse
 
 final class ControlConnectionStatusTests: XCTestCase {
+    func testUnmatchedStillAllowsManualRecheckButDisconnectedDoesNot() {
+        XCTAssertTrue(DeviceBluetoothState.connected.canRecheckPointer)
+        XCTAssertTrue(DeviceBluetoothState.unmatched.canRecheckPointer)
+        XCTAssertFalse(DeviceBluetoothState.disconnected.canRecheckPointer)
+    }
+
+    func testUnmatchedOverlayDispatchesMatchingAndRestoresButtonWithFailure() throws {
+        let overlay = ControlConnectionOverlay(frame: NSRect(x: 0, y: 0, width: 400, height: 800))
+        var completion: ((Result<Void, Error>) -> Void)?
+        overlay.onRetryBluetoothMatch = { completion = $0 }
+        overlay.update(.unmatched)
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let views = descendants(overlay)
+        let strings = StringsWorkbench.current
+        let button = try XCTUnwrap(views.compactMap { $0 as? NSButton }.first { $0.title == strings.bluetoothMatchRetry })
+        XCTAssertTrue(button.isEnabled)
+        button.performClick(nil)
+        XCTAssertFalse(button.isEnabled)
+        XCTAssertTrue(views.compactMap { $0 as? NSTextField }.contains { $0.stringValue == strings.bluetoothMatching })
+
+        try XCTUnwrap(completion)(.failure(BluetoothMatchRetryError.notObserved))
+        let delivered = expectation(description: "matching completion rendered")
+        DispatchQueue.main.async { delivered.fulfill() }
+        wait(for: [delivered], timeout: 1)
+        XCTAssertTrue(button.isEnabled)
+        XCTAssertTrue(views.compactMap { $0 as? NSTextField }.contains { $0.stringValue == strings.bluetoothMatchNotObserved })
+        overlay.update(.disconnected)
+        XCTAssertEqual(button.title, StringsUI.current.overlayButtonReconnect)
+        XCTAssertTrue(button.isEnabled)
+    }
     func testDisabledWindowEventsPreservePendingDiscoveryRetry() {
         let capture = NSObject()
         let host = UUID()
@@ -14,9 +45,11 @@ final class ControlConnectionStatusTests: XCTestCase {
             _ = schedule.update(
                 .init(screens: ["phone": ObjectIdentifier(capture)], sessions: [host: UUID()]), restart: true)
             guard let token = schedule.scheduleRetry() else { return XCTFail("expected discovery retry") }
-            if state.permitsBackgroundMotionPreemption { schedule.cancel() }
-            XCTAssertEqual(state.permitsBackgroundMotionPreemption, state == .connected)
+            if state.permitsBackgroundMotionPreemption(backend: .ble) { schedule.cancel() }
+            XCTAssertEqual(state.permitsBackgroundMotionPreemption(backend: .ble), state == .connected)
             XCTAssertEqual(schedule.beginRetry(token), state != .connected)
+            XCTAssertFalse(state.permitsBackgroundMotionPreemption(backend: .usb),
+                           "USB foreground input must not interrupt Bluetooth discovery")
         }
     }
 

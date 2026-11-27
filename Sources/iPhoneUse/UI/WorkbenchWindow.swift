@@ -180,6 +180,11 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
     private var isUpdating = false
     private var message = ""
     private var textBusyIDs: Set<String> = []
+    private struct PointerCheck {
+        let token = UUID()
+        var result: Result<PointerRecalibrationResult, Error>?
+    }
+    private var pointerChecks: [String: PointerCheck] = [:]
     private let sidebar = WorkbenchSurface()
     private let inspector = WorkbenchSurface()
     private let inspectorScroll = NSScrollView()
@@ -222,6 +227,8 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
     private let inspectorRule = WorkbenchSurface()
     private let backendTitle = WorkbenchStyle.label(size: 12, weight: .semibold)
     private let controlsTitle = WorkbenchStyle.label(size: 12, weight: .semibold)
+    private let recalibrateButton = WorkbenchActionButton()
+    private let recalibrationStatus = WorkbenchStyle.label(size: 10, secondary: true)
     private let textTitle = WorkbenchStyle.label(size: 12, weight: .semibold)
     private let help = WorkbenchStyle.label(size: 10, secondary: true)
     private let backendHelp = WorkbenchStyle.label(size: 10, secondary: true)
@@ -277,7 +284,7 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         ].forEach(canvas.addSubview)
         [
             selectedTitle, targetHint, targetChip, deviceDetail, captureTitle, connection, status,
-            backendTitle, backend, backendHelp, controlsTitle, inputReady, controlHint,
+            backendTitle, backend, backendHelp, recalibrateButton, recalibrationStatus, controlsTitle, inputReady, controlHint,
             textTitle, textHint, textBackground, text, send, paste, help, aiCard, inspectorRule,
         ].forEach(inspector.addSubview)
         listScroll.documentView = listDocument
@@ -335,6 +342,13 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         backend.symbols = ["wave.3.right", "cable.connector"]
         backend.target = self
         backend.action = #selector(changeBackend)
+        recalibrateButton.appearanceStyle = .outline
+        recalibrateButton.symbolName = "arrow.clockwise"
+        recalibrateButton.alignment = .left
+        recalibrateButton.font = .systemFont(ofSize: 10)
+        recalibrateButton.setAccessibilityIdentifier("workbench-recalibrate-pointer")
+        recalibrateButton.invoke = { [weak self] in self?.recalibratePointer() }
+        recalibrationStatus.alignment = .right
         connect.appearanceStyle = .outline
         connect.symbolName = "plus"
         connect.font = .systemFont(ofSize: 11)
@@ -394,7 +408,13 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         guard !preview else { return }
         isUpdating = true
         defer { isUpdating = false }
-        liveDevices = Dictionary(uniqueKeysWithValues: devices.map { ($0.id, $0) })
+        let currentDevices = Dictionary(uniqueKeysWithValues: devices.map { ($0.id, $0) })
+        pointerChecks = pointerChecks.filter { id, _ in
+            guard let current = currentDevices[id], let previous = liveDevices[id] else { return false }
+            return current.screen === previous.screen && USBInputController.shared.selected(id) == .ble
+                && (previous.host == current.host || (previous.host == nil && current.host != nil))
+        }
+        liveDevices = currentDevices
         self.independentIDs = independentIDs
         for device in devices where controllers[device.id] == nil {
             let controller = ControlWindowController(deviceID: device.id, name: device.screen.name, embedded: true)
@@ -563,6 +583,7 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         inputReady.stringValue =
             state.selected?.shortcuts.isEmpty == false ? (zh ? "已就绪" : "Ready") : (zh ? "待配置" : "Not ready")
         inputReady.textColor = state.selected?.shortcuts.isEmpty == false ? WorkbenchTheme.faint : WorkbenchTheme.amber
+        renderPointerCheck()
         status.isHidden = true
         status.stringValue =
             state.selected.map { independentIDs.contains($0.id) ? t.independent : $0.status } ?? t.waitingInput
@@ -654,6 +675,57 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         guard let id = state.selectedID, let controller = controllers[id] else { return }
         controller.selectInputBackend(backend.selectedSegment == 1 ? .usb : .ble)
         backend.selectedSegment = controller.controlView.selectedBackend == .usb ? 1 : 0
+    }
+
+    private func renderPointerCheck() {
+        let visible = state.selected?.offersPointerRecalibration == true
+        let id = visible ? state.selectedID : nil
+        let check = id.flatMap { pointerChecks[$0] }
+        let device = id.flatMap { liveDevices[$0] }
+        let running = (check != nil && check?.result == nil) || (!preview && id.map {
+            DeviceRegistry.shared.isAutomaticallyCalibrating(screenID: $0)
+        } == true)
+        let t = StringsWorkbench.current
+        recalibrateButton.isHidden = !visible
+        recalibrateButton.isEnabled = !preview && device?.bluetoothState.canRecheckPointer == true && !running
+        recalibrateButton.drawsDisabledAsReady = preview && visible
+        recalibrationStatus.isHidden = !visible
+        recalibrationStatus.textColor = WorkbenchTheme.muted
+        recalibrationStatus.toolTip = nil
+        if running {
+            recalibrationStatus.stringValue = device?.host == nil ? t.bluetoothMatching : t.recalibrating
+        } else {
+            switch check?.result {
+            case .success(.absolute):
+                recalibrationStatus.stringValue = t.recalibrationAbsolute
+                recalibrationStatus.textColor = WorkbenchTheme.green
+            case .success(.relative):
+                recalibrationStatus.stringValue = t.recalibrationRelative
+                recalibrationStatus.textColor = WorkbenchTheme.green
+            case .failure(let error):
+                recalibrationStatus.stringValue = error is BluetoothMatchRetryError ? t.bluetoothMatchFailed : t.recalibrationFailed
+                recalibrationStatus.toolTip = "\(t.recalibrationHelp)\n\(error)"
+                recalibrationStatus.textColor = WorkbenchTheme.amber
+            case nil: recalibrationStatus.stringValue = ""
+            }
+        }
+    }
+
+    private func recalibratePointer() {
+        guard !preview, recalibrateButton.isEnabled, let id = state.selectedID, let device = liveDevices[id],
+            state.selected?.offersPointerRecalibration == true,
+            !DeviceRegistry.shared.isAutomaticallyCalibrating(screenID: id)
+        else { return }
+        let check = PointerCheck()
+        pointerChecks[id] = check
+        render()
+        DeviceRegistry.shared.recalibrate(device) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, !self.isStopped, self.pointerChecks[id]?.token == check.token else { return }
+                self.pointerChecks[id]?.result = result
+                self.render()
+            }
+        }
     }
 
     func controlTextDidChange(_ notification: Notification) {
@@ -866,6 +938,9 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
             zh
             ? "蓝牙 HID 负责鼠标与键盘输入。\nUSB Touch 需 iOS 17+ 与兼容的开发者服务；失败不自动回退。"
             : "Bluetooth HID handles mouse and keyboard.\nUSB Touch requires iOS 17+ and compatible services; no automatic fallback."
+        recalibrateButton.title = t.recalibrate
+        recalibrateButton.toolTip = t.recalibrationHelp
+        recalibrateButton.setAccessibilityLabel(t.recalibrate)
         controlsTitle.stringValue = AppLanguageStore.shared.language == .zh ? "快捷控制" : "Quick controls"
         textTitle.stringValue = t.textInput
         text.placeholderString = zh ? "输入要发送到 iPhone 的文字…" : "Enter text to send to iPhone…"
@@ -922,7 +997,9 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         inspectorScroll.frame = NSRect(x: w - 312, y: 64, width: 312, height: h - 94)
         let guidanceHeight = mountedGuidance?.preferredHeight(for: 268) ?? 0
         let guidanceOffset = guidanceHeight > 0 ? max(0, guidanceHeight - 42) + 12 : 0
-        inspector.frame = NSRect(x: 0, y: 0, width: 312, height: max(888 + guidanceOffset, inspectorScroll.bounds.height))
+        let calibrationOffset: CGFloat = recalibrateButton.isHidden ? 0 : 42
+        let controlsOffset = guidanceOffset + calibrationOffset
+        inspector.frame = NSRect(x: 0, y: 0, width: 312, height: max(888 + controlsOffset, inspectorScroll.bounds.height))
         canvas.frame = NSRect(x: 232, y: 64, width: w - 544, height: h - 94)
         footer.frame = NSRect(x: 17, y: h - 24, width: w - 34, height: 18)
         workspace.frame = NSRect(x: 15, y: 48, width: 202, height: 39)
@@ -992,20 +1069,24 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         backendTitle.frame = NSRect(x: 22, y: 184, width: 140, height: 21)
         inputReady.frame = NSRect(x: 192, y: 186, width: iw - 214, height: 18)
         backend.frame = NSRect(x: 22, y: 212, width: inner, height: 39)
+        let calibrationButtonWidth = max(100, recalibrateButton.requiredContentWidth)
+        recalibrateButton.frame = NSRect(x: 22, y: 308 + guidanceOffset, width: calibrationButtonWidth, height: 31)
+        recalibrationStatus.frame = NSRect(
+            x: 30 + calibrationButtonWidth, y: 316 + guidanceOffset, width: inner - calibrationButtonWidth - 8, height: 16)
         backendHelp.frame = NSRect(x: 22, y: 263, width: inner, height: 42)
         backendHelp.isHidden = guidanceHeight > 0
         mountedGuidance?.frame = NSRect(x: 22, y: 263, width: inner, height: guidanceHeight)
-        controlsTitle.frame = NSRect(x: 22, y: 316 + guidanceOffset, width: 140, height: 21)
-        controlHint.frame = NSRect(x: 192, y: 318 + guidanceOffset, width: iw - 214, height: 18)
+        controlsTitle.frame = NSRect(x: 22, y: 316 + controlsOffset, width: 140, height: 21)
+        controlHint.frame = NSRect(x: 192, y: 318 + controlsOffset, width: iw - 214, height: 18)
         let shortcuts: [ControlShortcut] = [.home, .search, .power, .volumeDown, .volumeUp, .enter]
         let buttonWidth = (inner - 14) / 3
         for (i, shortcut) in shortcuts.enumerated() {
             shortcutButtons[shortcut]?.frame = NSRect(
-                x: 22 + CGFloat(i % 3) * (buttonWidth + 7), y: 342 + guidanceOffset + CGFloat(i / 3) * 70,
+                x: 22 + CGFloat(i % 3) * (buttonWidth + 7), y: 342 + controlsOffset + CGFloat(i / 3) * 70,
                 width: buttonWidth, height: 63)
         }
-        shortcutButtons[.inputMethod]?.frame = NSRect(x: 22, y: 482 + guidanceOffset, width: inner, height: 34)
-        let textOffset = guidanceOffset + 44
+        shortcutButtons[.inputMethod]?.frame = NSRect(x: 22, y: 482 + controlsOffset, width: inner, height: 34)
+        let textOffset = controlsOffset + 44
         textTitle.frame = NSRect(x: 22, y: 498 + textOffset, width: 120, height: 20)
         textHint.frame = NSRect(x: 162, y: 500 + textOffset, width: iw - 184, height: 18)
         textBackground.frame = NSRect(x: 22, y: 525 + textOffset, width: inner, height: 65)

@@ -450,6 +450,39 @@ final class DeviceInputPointerTests: XCTestCase {
         XCTAssertFalse(input.isPointerReady, "a probe alone must not enable normal coordinate input")
     }
 
+    func testExplicitAbsoluteCheckRequiresObservedLandingsAndNeverClicks() throws {
+        var reportCount = 0
+        var followsReports = true
+        var x = 0, y = 0
+        let width = PointerScreenMatcher.width, height = PointerScreenMatcher.height
+        let input = DeviceInput(
+            host: UUID(), session: UUID(), calibrationRequired: true, sleep: { _ in },
+            reportSender: { report, bytes in
+                XCTAssertEqual(report, .absolutePointer)
+                XCTAssertEqual(bytes[0], 0)
+                reportCount += 1
+                guard followsReports else { return }
+                let maxValue = Double(HIDReportMap.absoluteMax)
+                x = Int((Double(Int(bytes[1]) + (Int(bytes[2]) << 8)) / maxValue * Double(width)).rounded())
+                y = Int((Double(Int(bytes[3]) + (Int(bytes[4]) << 8)) / maxValue * Double(height)).rounded())
+            })
+        func frame() -> [UInt8] {
+            var pixels = [UInt8](repeating: 20, count: width * height)
+            for py in (y - 1)...(y + 1) {
+                for px in (x - 1)...(x + 1) { pixels[py * width + px] = 200 }
+            }
+            return pixels
+        }
+        let activity = input.inputActivitySequence
+        XCTAssertTrue(try input.verifyAbsolutePointer(activity: activity, isReady: { true }, capture: frame))
+        XCTAssertEqual(reportCount, 5)
+        followsReports = false
+        XCTAssertFalse(try input.verifyAbsolutePointer(activity: activity, isReady: { true }, capture: frame))
+        XCTAssertEqual(reportCount, 10, "an unchanged cursor isn't proof and doesn't trigger another absolute probe")
+        XCTAssertThrowsError(try input.verifyAbsolutePointer(activity: activity, isReady: { true }, capture: { nil }))
+        XCTAssertFalse(input.isPointerReady, "measurement alone never publishes a new pointer route")
+    }
+
     func testLocalRelativeProbeUsesEighteenReportsWithoutSweepingEdges() throws {
         var position = CGPoint(x: 200, y: 400)
         var positions: [CGPoint] = []

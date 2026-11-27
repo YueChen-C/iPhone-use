@@ -11,6 +11,8 @@ struct WorkbenchDevice: Equatable {
     var detail: String = ""
     var screenSize: CGSize? = nil
     var productType: String? = nil
+    /// Pointer mode is decided from measured landings, never the iOS version.
+    var offersPointerRecalibration: Bool { connected && backend == .ble }
 }
 
 struct WorkbenchState {

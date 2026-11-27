@@ -15,6 +15,18 @@ struct StringsWorkbench: LocalizedTable {
     let guide: String
     let inputBackend: String
     let experimental: String
+    let recalibrate: String
+    let recalibrating: String
+    let bluetoothMatchRetry: String
+    let bluetoothMatching: String
+    let bluetoothMatchFailed: String
+    let bluetoothMatchAmbiguous: String
+    let bluetoothMatchNotObserved: String
+    let recalibrationHelp: String
+    let recalibrationUnavailable: String
+    let recalibrationAbsolute: String
+    let recalibrationRelative: String
+    let recalibrationFailed: String
     let screenshot: String
     let screenshotIdentityUnverified: String
     let screenshotNotReady: String
@@ -54,6 +66,13 @@ struct StringsWorkbench: LocalizedTable {
         grid: "平铺", focus: "聚焦", current: "当前控制设备", onlyCurrent: "操作仅作用于此设备", noDevice: "连接你的第一台 iPhone",
         waitingNativeCapture: "iPhone 已通过 USB 连接，正在等待画面",
         guide: "USB 连接并信任此 Mac，允许相机权限用于投屏。iOS 17.3 及以上默认 USB 触控；旧系统默认蓝牙，需完成配对与辅助触控设置。", inputBackend: "输入后端", experimental: "USB Touch · 实验性",
+        recalibrate: "重新校验", recalibrating: "校验中…",
+        bluetoothMatchRetry: "重新匹配蓝牙", bluetoothMatching: "正在匹配蓝牙…", bluetoothMatchFailed: "蓝牙匹配未通过",
+        bluetoothMatchAmbiguous: "无法唯一确定这台 iPhone 的蓝牙连接。请确认当前设备已连接后再试。",
+        bluetoothMatchNotObserved: "未在当前画面确认指针移动。请保持 iPhone 解锁、开启辅助触控，并在画面静止时重试。",
+        recalibrationHelp: "请解锁 iPhone 并保持画面静止。校验期间指针会移动，请勿操作手机。",
+        recalibrationUnavailable: "暂时无法校验。请确认投屏、蓝牙配对和辅助触控已就绪，且 iPhone 已解锁。",
+        recalibrationAbsolute: "绝对指针已验证", recalibrationRelative: "相对指针已校准", recalibrationFailed: "校验未通过",
         screenshot: "截图", screenshotIdentityUnverified: "画面与设备身份尚未确认，未保存截图；请先重新匹配原设备。",
         screenshotNotReady: "画面尚未就绪，未保存截图。",
         record: "录制", recordingStop: "结束录制", recordingSaving: "正在保存…", recordingSaved: "录制已保存", recordingFailed: "录制失败",
@@ -75,7 +94,16 @@ struct StringsWorkbench: LocalizedTable {
         waitingNativeCapture: "iPhone connected over USB. Waiting for its display.",
         guide:
             "Connect via USB, trust this Mac and allow camera access for capture. iOS 17.3+ defaults to USB Touch; older systems default to Bluetooth, which needs pairing and AssistiveTouch.",
-        inputBackend: "Input backend", experimental: "USB Touch · Experimental", screenshot: "Screenshot",
+        inputBackend: "Input backend", experimental: "USB Touch · Experimental",
+        recalibrate: "Recheck pointer", recalibrating: "Checking…",
+        bluetoothMatchRetry: "Retry Bluetooth match", bluetoothMatching: "Matching Bluetooth…",
+        bluetoothMatchFailed: "Bluetooth match failed",
+        bluetoothMatchAmbiguous: "Could not identify one Bluetooth connection for this iPhone. Check the connection and try again.",
+        bluetoothMatchNotObserved: "Pointer movement could not be confirmed on this display. Keep the iPhone unlocked, enable AssistiveTouch, and try again on a still screen.",
+        recalibrationHelp: "Keep the iPhone unlocked and its screen still. The pointer will move during the check.",
+        recalibrationUnavailable: "Check unavailable. Ensure the iPhone is unlocked, its display and Bluetooth pairing are ready, and AssistiveTouch is on.",
+        recalibrationAbsolute: "Absolute verified", recalibrationRelative: "Relative calibrated",
+        recalibrationFailed: "Check failed", screenshot: "Screenshot",
         screenshotIdentityUnverified: "Display identity is unverified. Screenshot not saved; rematch the original device first.",
         screenshotNotReady: "Display not ready. Screenshot not saved.",
         record: "Record", recordingStop: "Stop recording", recordingSaving: "Saving…",

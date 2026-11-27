@@ -705,7 +705,9 @@ final class PhoneControlView: NSView {
     private func preemptBackgroundPointerMotion() {
         // Mouse clicks, keys and shortcuts can arrive while the overlay blocks
         // input. Such ignored events must not cancel discovery or its retry.
-        guard connectionStatus?.permitsBackgroundMotionPreemption == true, let device else { return }
+        guard connectionStatus?.permitsBackgroundMotionPreemption(backend: selectedBackend) == true, let device else {
+            return
+        }
         DeviceRegistry.shared.cancelBackgroundMotion(for: device)
     }
 

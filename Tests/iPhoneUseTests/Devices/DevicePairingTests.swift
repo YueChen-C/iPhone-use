@@ -42,6 +42,32 @@ final class DevicePairingTests: XCTestCase {
         XCTAssertNil(store.load())
     }
 
+    func testManualMatchPrefersOnlyTheSelectedPhonesSavedHost() {
+        let saved = UUID(), peer = UUID(), unknown = UUID()
+        XCTAssertEqual(BluetoothMatchRetry.candidate(
+            for: "selected", unresolvedScreenIDs: ["selected", "other"],
+            pairings: ["selected": saved, "peer": peer], connectedHosts: [saved, peer, unknown]), saved)
+        XCTAssertNil(BluetoothMatchRetry.candidate(
+            for: "selected", unresolvedScreenIDs: ["selected"],
+            pairings: ["selected": saved, "peer": saved], connectedHosts: [saved]))
+        XCTAssertNil(BluetoothMatchRetry.candidate(
+            for: "selected", unresolvedScreenIDs: ["other"],
+            pairings: ["selected": saved], connectedHosts: [saved]))
+    }
+
+    func testManualMatchNeverBorrowsAPeersHostOrGuessesAmongUnknowns() {
+        let peer = UUID(), unknown = UUID()
+        let pairings = ["absent-peer": peer, "selected": UUID()]
+        func candidate(_ unresolved: Set<String>, _ hosts: Set<UUID>) -> UUID? {
+            BluetoothMatchRetry.candidate(
+                for: "selected", unresolvedScreenIDs: unresolved, pairings: pairings, connectedHosts: hosts)
+        }
+        XCTAssertEqual(candidate(["selected"], [peer, unknown]), unknown)
+        XCTAssertNil(candidate(["selected"], [peer]))
+        XCTAssertNil(candidate(["selected", "other"], [peer, unknown]))
+        XCTAssertNil(candidate(["selected"], [peer, unknown, UUID()]))
+    }
+
     func testVerifiedAssociationPromotesOnlyTheSamePhysicalScreenAndHost() {
         let identity = UUID()
         let host = UUID()
