@@ -24,7 +24,13 @@ final class AXUSBProxy: AXByteStream {
 
     enum Unsupported: Error { case legacyDevice }
 
-    enum Service { case accessibility, coreDevice, installationProxy }
+    struct LegacyInstrumentsUnavailable: Error, CustomStringConvertible {
+        let version: String
+        var description: String { "Legacy Instruments service is unavailable (iOS \(version))" }
+    }
+
+    enum Service { case accessibility, coreDevice, installationProxy, legacyInstruments, legacyImageMounter }
+    private(set) var productVersion: String?
 
     convenience init(device id: String, requireCoreDevice: Bool = false) throws {
         try self.init(device: id, service: requireCoreDevice ? .coreDevice : .accessibility)
@@ -86,7 +92,22 @@ final class AXUSBProxy: AXByteStream {
                 guard let version = copyValue(d, nil, "ProductVersion" as CFString)?.takeRetainedValue() as? String else {
                     throw AXDTX.Failure("Selected iPhone did not report ProductVersion")
                 }
+                productVersion = version
                 legacy = try Self.usesLegacyService(version: version)
+                if requestedService == .legacyInstruments || requestedService == .legacyImageMounter {
+                    guard legacy else { throw AXDTX.Failure("Legacy service requires iOS 15 or 16") }
+                    let instruments = requestedService == .legacyInstruments
+                    let name = instruments ? "com.apple.instruments.remoteserver.DVTSecureSocketProxy"
+                                           : "com.apple.mobile.mobile_image_mounter"
+                    let code = service(d, name as CFString, nil, &connection)
+                    // kAMDInvalidServiceError only; do not turn lock, trust or transport errors into a mount attempt.
+                    if instruments, UInt32(bitPattern: code) == 0xe800_0022 {
+                        throw LegacyInstrumentsUnavailable(version: version)
+                    }
+                    // Unlike legacy AX Audit, the secure Instruments service retains TLS after startup.
+                    try check(code, instruments ? "Legacy Instruments" : "Legacy image mounter")
+                    break
+                }
                 if requestedService == .coreDevice && legacy { throw Unsupported.legacyDevice }
                 let name = legacy ? "com.apple.accessibility.axAuditDaemon.remoteserver"
                                   : "com.apple.internal.devicecompute.CoreDeviceProxy"

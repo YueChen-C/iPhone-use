@@ -5,16 +5,33 @@ import Foundation
 /// A one-operation session over Apple's paired Installation Proxy service.
 /// Read-only browse and exact bundle lookup; no installation, removal or container access.
 enum NativeAppInventory {
+    struct Entry {
+        let attributes: [String: String]
+        let executablePath: String?
+    }
+
     static func browse(_ stream: AXByteStream) throws -> [[String: String]] {
-        let keys = [
+        try entries(stream, userFacingOnly: false).map(\.attributes)
+    }
+
+    static func manageableApps(_ stream: AXByteStream) throws -> [Entry] {
+        try entries(stream, userFacingOnly: true)
+    }
+
+    private static func entries(_ stream: AXByteStream, userFacingOnly: Bool) throws -> [Entry] {
+        var keys = [
             "CFBundleIdentifier", "CFBundleDisplayName", "CFBundleName", "CFBundleShortVersionString",
             "ApplicationType",
         ]
+        if userFacingOnly {
+            keys += ["Path", "CFBundleExecutable", "SBAppTags", "SBAppTags~iphone", "SBIconVisibilityDefaultVisible", "IsAppClip"]
+        }
         let request: [String: Any] = ["Command": "Browse", "ClientOptions": ["ReturnAttributes": keys]]
         let data = try PropertyListSerialization.data(fromPropertyList: request, format: .xml, options: 0)
         try stream.send(AXUSBProxy.big(UInt64(data.count), 4) + data)
-        var apps: [String: [String: String]] = [:]
+        var apps: [String: Entry] = [:]
         var bytes = 0
+        var entryCount = 0
         for _ in 0..<512 {
             let size = try stream.read(4).reduce(0) { ($0 << 8) | Int($1) }
             guard size > 0, size <= AXDTX.limit - bytes else { throw AXDTX.Failure("Invalid app inventory size") }
@@ -28,21 +45,22 @@ enum NativeAppInventory {
                 throw AXDTX.Failure("Installation Proxy rejected or returned an invalid app inventory")
             }
             if let list = reply["CurrentList"] {
-                guard let entries = list as? [[String: Any]], entries.count <= 10_000 - apps.count else {
+                guard let entries = list as? [[String: Any]], entries.count <= 10_000 - entryCount else {
                     throw AXDTX.Failure("Invalid app inventory entries")
                 }
+                entryCount += entries.count
                 for entry in entries {
                     guard let id = entry["CFBundleIdentifier"] as? String, NativeAppServices.validBundleID(id) else {
                         continue
                     }
-                    guard apps[id] == nil else { continue }
+                    guard apps[id] == nil, !userFacingOnly || isUserFacing(entry, bundleID: id) else { continue }
                     var app = [
                         "bundle_id": id,
                         "name": entry["CFBundleDisplayName"] as? String ?? entry["CFBundleName"] as? String ?? id,
                     ]
                     app["version"] = entry["CFBundleShortVersionString"] as? String
                     app["application_type"] = entry["ApplicationType"] as? String
-                    apps[id] = app
+                    apps[id] = Entry(attributes: app, executablePath: userFacingOnly ? mainExecutable(entry) : nil)
                 }
             } else if status != "Complete" {
                 throw AXDTX.Failure("Installation Proxy omitted app list")
@@ -50,6 +68,18 @@ enum NativeAppInventory {
             if status == "Complete" { return apps.keys.sorted().compactMap { apps[$0] } }
         }
         throw AXDTX.Failure("Installation Proxy app inventory did not finish")
+    }
+
+    /// Installation Proxy also inventories private .app bundles. Its metadata is not a live Home Screen snapshot.
+    private static func isUserFacing(_ entry: [String: Any], bundleID: String) -> Bool {
+        guard let type = entry["ApplicationType"] as? String, type == "System" || type == "User",
+            (entry["IsAppClip"] as? Bool) != true, (entry["SBIconVisibilityDefaultVisible"] as? Bool) != false
+        else { return false }
+        let hidden = ["SBAppTags", "SBAppTags~iphone"].contains { key in
+            (entry[key] as? [String])?.contains { $0 == "hidden" || $0 == "SBInternalAppTag" } == true
+        }
+        // These hosts are not standalone launcher apps; some iOS versions omit the hidden tag for them.
+        return !hidden && bundleID != "com.apple.FTMInternal" && bundleID != "com.apple.webapp"
     }
 
     static func executablePath(_ stream: AXByteStream, bundleID: String) throws -> String {
@@ -66,11 +96,16 @@ enum NativeAppInventory {
                 as? [String: Any], reply["Error"] == nil, reply["Status"] as? String == "Complete",
             let entries = reply["LookupResult"] as? [String: Any],
             let entry = entries[bundleID] as? [String: Any], entry["CFBundleIdentifier"] as? String == bundleID,
-            let bundlePath = entry["Path"] as? String, bundlePath.hasSuffix(".app"),
-            let executable = entry["CFBundleExecutable"] as? String, !executable.contains("/"),
-            let path = NativeAppServices.canonicalPath(bundlePath + "/" + executable)
+            let path = mainExecutable(entry)
         else { throw AXDTX.Failure("Installation Proxy did not identify the installed App's main executable") }
         return path
+    }
+
+    private static func mainExecutable(_ entry: [String: Any]) -> String? {
+        guard let bundlePath = entry["Path"] as? String, bundlePath.hasSuffix(".app"),
+            let executable = entry["CFBundleExecutable"] as? String, !executable.contains("/")
+        else { return nil }
+        return NativeAppServices.canonicalPath(bundlePath + "/" + executable)
     }
 }
 
@@ -183,9 +218,38 @@ enum NativeAppServices {
         return pid
     }
 
-    private struct RunningProcess {
+    struct RunningProcess {
         let pid: UInt32
         let path: String?
+    }
+
+    enum RunningState: Equatable {
+        case running, stopped, unknown
+    }
+
+    struct ProcessSnapshot {
+        let paths: Set<Data>
+        let complete: Bool
+
+        init(paths: [String], complete: Bool) {
+            // Compare device paths by bytes, with the same canonicalization as termination.
+            self.paths = Set(paths.map { Data($0.utf8) })
+            self.complete = complete
+        }
+
+        func state(for executablePath: String?) -> RunningState {
+            guard let executablePath else { return .unknown }
+            if paths.contains(Data(executablePath.utf8)) { return .running }
+            return complete ? .stopped : .unknown
+        }
+    }
+
+    static func processPaths(
+        exchange: ([String: USBXPCValue]) throws -> [String: Any]
+    ) throws -> (paths: [String], complete: Bool) {
+        let processes = try processes(exchange(request(processListFeature)))
+        let paths = processes.compactMap(\.path)
+        return (paths, paths.count == processes.count)
     }
 
     enum TerminationResult {
@@ -194,7 +258,7 @@ enum NativeAppServices {
     }
 
     // These paths refer to the iPhone, never resolve them on the Mac. Only fold the known /var alias.
-    fileprivate static func canonicalPath(_ path: String) -> String? {
+    static func canonicalPath(_ path: String) -> String? {
         guard path.hasPrefix("/"), !path.utf8.contains(0),
             path.dropFirst().split(separator: "/", omittingEmptySubsequences: false)
                 .allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." })
@@ -231,7 +295,29 @@ enum NativeAppServices {
         willSignal: () -> Void,
         wait: () -> Void = { Thread.sleep(forTimeInterval: 0.2) }
     ) throws -> TerminationResult {
-        func snapshot() throws -> [RunningProcess] { try processes(exchange(request(processListFeature))) }
+        try terminate(executablePath: executablePath,
+                      snapshot: { try processes(exchange(request(processListFeature))) },
+                      signal: { pid in
+                          let request = request(signalFeature, input: [
+                              "process": .dictionary(["processIdentifier": .int(Int64(pid))]),
+                              "signal": .int(Int64(SIGKILL)),
+                          ])
+                          willSignal()
+                          let reply = try exchange(request)
+                          guard reply["CoreDevice.error"] == nil, let output = reply["CoreDevice.output"] as? [String: Any],
+                              let process = output["process"] as? [String: Any],
+                              positivePID(process["processIdentifier"]) == pid,
+                              positivePID(output["signal"]) == UInt32(SIGKILL)
+                          else { throw AXDTX.Failure("AppService returned no matching termination receipt") }
+                      }, wait: wait)
+    }
+
+    static func terminate(
+        executablePath: String,
+        snapshot: () throws -> [RunningProcess],
+        signal: (UInt32) throws -> Void,
+        wait: () -> Void = { Thread.sleep(forTimeInterval: 0.2) }
+    ) throws -> TerminationResult {
         let before = try snapshot()
         func matchesApp(_ process: RunningProcess) -> Bool {
             process.path?.utf8.elementsEqual(executablePath.utf8) == true
@@ -245,16 +331,7 @@ enum NativeAppServices {
             return .alreadyStopped
         }
         guard target.pid > 1 else { throw AXDTX.Failure("Refusing to signal a reserved PID") }
-        let signal = request(signalFeature, input: [
-            "process": .dictionary(["processIdentifier": .int(Int64(target.pid))]),
-            "signal": .int(Int64(SIGKILL)),
-        ])
-        willSignal()
-        let reply = try exchange(signal)
-        guard reply["CoreDevice.error"] == nil, let output = reply["CoreDevice.output"] as? [String: Any],
-            let process = output["process"] as? [String: Any], positivePID(process["processIdentifier"]) == target.pid,
-            positivePID(output["signal"]) == UInt32(SIGKILL)
-        else { throw AXDTX.Failure("AppService returned no matching termination receipt") }
+        try signal(target.pid)
         for attempt in 0..<5 {
             if attempt > 0 { wait() }
             let after = try snapshot()

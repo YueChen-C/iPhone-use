@@ -36,6 +36,83 @@ final class AppManagementTests: XCTestCase {
         XCTAssertEqual(request?["Command"] as? String, "Browse")
     }
 
+    func testDesktopInventoryRequestsVisibilityAndMainPathWithoutChangingPublicBrowse() throws {
+        let entries = [
+            ["CFBundleIdentifier": "com.example.app", "CFBundleDisplayName": "Example", "ApplicationType": "User",
+             "Path": "/var/containers/A/Example App.app", "CFBundleExecutable": "Example"],
+            ["CFBundleIdentifier": "com.example.invalid", "ApplicationType": "User", "Path": "/Applications/Bad.app",
+             "CFBundleExecutable": "PlugIns/Other"],
+        ]
+        let stream = try PlistStream([["Status": "Complete", "CurrentList": entries]])
+        let apps = try NativeAppInventory.manageableApps(stream)
+        XCTAssertEqual(apps.map(\.executablePath), [executable, nil])
+        func attributesRequested(by stream: PlistStream) throws -> Set<String> {
+            let request = try XCTUnwrap(PropertyListSerialization.propertyList(from: stream.sent.dropFirst(4),
+                options: [], format: nil) as? [String: Any])
+            let options = try XCTUnwrap(request["ClientOptions"] as? [String: [String]])
+            return Set(try XCTUnwrap(options["ReturnAttributes"]))
+        }
+        let publicStream = try PlistStream([["Status": "Complete", "CurrentList": entries]])
+        XCTAssertEqual(try NativeAppInventory.browse(publicStream), apps.map(\.attributes))
+        XCTAssertEqual(try attributesRequested(by: publicStream), [
+            "CFBundleIdentifier", "CFBundleDisplayName", "CFBundleName", "CFBundleShortVersionString", "ApplicationType",
+        ])
+        XCTAssertEqual(try attributesRequested(by: stream).subtracting(attributesRequested(by: publicStream)), [
+            "Path", "CFBundleExecutable", "SBAppTags", "SBAppTags~iphone", "SBIconVisibilityDefaultVisible", "IsAppClip",
+        ])
+    }
+
+    func testDesktopInventoryKeepsThirdPartyAndVisibleSystemAppsButNotHiddenComponents() throws {
+        func entry(_ id: String, _ type: String = "System", _ metadata: [String: Any] = [:]) -> [String: Any] {
+            ["CFBundleIdentifier": id, "ApplicationType": type].merging(metadata) { _, new in new }
+        }
+        let entries = [
+            entry("com.apple.Passbook", "System", ["CFBundleDisplayName": "Wallet"]),
+            entry("com.apple.PassbookUISceneService", "System", ["CFBundleDisplayName": "Wallet", "SBAppTags": ["hidden"]]),
+            entry("com.apple.CredentialSharingService", "System", ["SBAppTags": ["hidden"]]),
+            entry("com.apple.siri", "System", ["SBAppTags": ["SBInternalAppTag"]]),
+            entry("com.apple.ScreenTimeWidgetApplication", "System", ["SBAppTags~iphone": ["hidden"]]),
+            entry("com.apple.PreviewShell", "System", ["SBIconVisibilityDefaultVisible": false]),
+            entry("com.apple.springboard", "Hidden"),
+            entry("com.apple.Passwords", "System", ["CFBundlePackageType": "XPC!"]),
+            entry("com.apple.mobilephone", "System", ["SBAppTags": ["any-telephony"]]),
+            entry("com.apple.FTMInternal"),
+            entry("com.apple.webapp"),
+            entry("org.example.app", "User"),
+            entry("org.example.app.Clip", "User", ["IsAppClip": true]),
+            ["CFBundleIdentifier": "org.example.unclassified"],
+        ]
+        let replies: [[String: Any]] = [["Status": "Complete", "CurrentList": entries]]
+        let desktop = try NativeAppInventory.manageableApps(PlistStream(replies)).compactMap { $0.attributes["bundle_id"] }
+        XCTAssertEqual(desktop, ["com.apple.Passbook", "com.apple.Passwords", "com.apple.mobilephone", "org.example.app"])
+        let publicList = try NativeAppInventory.browse(PlistStream(replies)).compactMap { $0["bundle_id"] }
+        XCTAssertEqual(publicList, entries.compactMap { $0["CFBundleIdentifier"] as? String }.sorted())
+    }
+
+    func testDesktopProcessSnapshotMatchesOnlyExactMainExecutableAndPreservesUnknown() throws {
+        var queries = 0
+        let paths = try NativeAppServices.processPaths { request in
+            queries += 1
+            XCTAssertEqual(try decode(request)["CoreDevice.featureIdentifier"] as? String, NativeAppServices.processListFeature)
+            return processes(process(21, "file:///var/containers/A/Example%20App.app/Example"),
+                             process(22, "file:///private/var/containers/App/App.app/Extensions/Other"), process(23, nil))
+        }
+        XCTAssertEqual(queries, 1)
+        let partial = NativeAppServices.ProcessSnapshot(paths: paths.paths, complete: paths.complete)
+        XCTAssertEqual(partial.state(for: executable), .running)
+        XCTAssertEqual(partial.state(for: nil), .unknown)
+        let appPath = "/private/var/containers/App/App.app/App"
+        XCTAssertEqual(partial.state(for: appPath), .unknown)
+        let complete = try NativeAppServices.processPaths { _ in
+            processes(process(23, "file:///private/var/containers/App/App.app/Extensions/Other"))
+        }
+        XCTAssertTrue(complete.complete)
+        let snapshot = NativeAppServices.ProcessSnapshot(paths: complete.paths, complete: complete.complete)
+        XCTAssertEqual(snapshot.state(for: appPath), .stopped)
+        XCTAssertEqual(snapshot.state(for: nil), .unknown)
+        XCTAssertThrowsError(try NativeAppServices.processPaths { _ in ["CoreDevice.error": "Unavailable"] })
+    }
+
     func testInventoryNeverReturnsPartialDataOnServiceFailure() throws {
         let stream = try PlistStream([
             ["Status": "BrowsingApplications", "CurrentList": [["CFBundleIdentifier": "com.example.app"]]],

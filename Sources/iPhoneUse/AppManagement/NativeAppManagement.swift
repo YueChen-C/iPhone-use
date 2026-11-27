@@ -25,6 +25,69 @@ enum NativeAppManagement {
         }
     }
 
+    // Separate desktop workers: unavailable or timed-out process inspection must not lose the inventory.
+    private enum WorkerCommand {
+        case operation(Operation), inventory, processes
+
+        init?(rawValue: String) {
+            switch rawValue {
+            case "manager-inventory": self = .inventory
+            case "manager-processes": self = .processes
+            default:
+                guard let operation = Operation(rawValue: rawValue) else { return nil }
+                self = .operation(operation)
+            }
+        }
+
+        var rawValue: String {
+            switch self {
+            case .inventory: return "manager-inventory"
+            case .processes: return "manager-processes"
+            case .operation(let operation): return operation.rawValue
+            }
+        }
+
+        var requiresBundleID: Bool {
+            if case .operation(let operation) = self { return operation.requiresBundleID }
+            return false
+        }
+
+        var allowsLegacySetup: Bool {
+            switch self {
+            case .processes, .operation(.launch), .operation(.terminate): return true
+            default: return false
+            }
+        }
+
+        func accepts(argumentCount: Int) -> Bool {
+            switch self {
+            case .operation(.foreground): return false
+            case .operation(.launch): return argumentCount == 4 || argumentCount == 5
+            default: return argumentCount == (requiresBundleID ? 4 : 3)
+            }
+        }
+    }
+
+    static func managerInventory(device: String) throws -> [NativeAppInventory.Entry] {
+        let reply = try run(.inventory, device: device)
+        guard let apps = reply["apps"] as? [[String: String]] else {
+            throw Failure(description: "App management worker returned no inventory")
+        }
+        return apps.map { app in
+            var attributes = app
+            let path = attributes.removeValue(forKey: "executable_path")
+            return NativeAppInventory.Entry(attributes: attributes, executablePath: path)
+        }
+    }
+
+    static func managerProcesses(device: String) throws -> NativeAppServices.ProcessSnapshot {
+        let reply = try run(.processes, device: device)
+        guard let paths = reply["paths"] as? [String], let complete = reply["complete"] as? Bool else {
+            throw Failure(description: "App management worker returned no process snapshot")
+        }
+        return .init(paths: paths, complete: complete)
+    }
+
     struct Failure: Error, CustomStringConvertible {
         let description: String
         var outcome = "not_sent"
@@ -44,7 +107,7 @@ enum NativeAppManagement {
                 throw Failure(description: "Invalid bundle_id")
             }
         }
-        var result = try run(operation, device: device, bundleID: bundleID, payloadURL: payloadURL)
+        var result = try run(.operation(operation), device: device, bundleID: bundleID, payloadURL: payloadURL)
         if operation == .launch, let bundleID {
             let observation = try? capture(device)
             result["foreground_verified"] = verifiesForeground(
@@ -78,8 +141,9 @@ enum NativeAppManagement {
     }
 
     private static func run(
-        _ operation: Operation, device: String, bundleID: String?, payloadURL: String?
+        _ command: WorkerCommand, device: String, bundleID: String? = nil, payloadURL: String? = nil
     ) throws -> [String: Any] {
+        try NativeDDIInspection.validateIdentity(device)
         guard let executable = Bundle.main.executableURL else {
             throw Failure(description: "App worker executable unavailable")
         }
@@ -88,7 +152,7 @@ enum NativeAppManagement {
             at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: directory) }
         let output = directory.appendingPathComponent("result.json")
-        var arguments = [workerArgument, operation.rawValue, device, output.path] + (bundleID.map { [$0] } ?? [])
+        var arguments = [workerArgument, command.rawValue, device, output.path] + (bundleID.map { [$0] } ?? [])
         if let payloadURL {
             // A URL can contain a share token. Don't put it on the worker's
             // command line, in logs, or in the response.
@@ -101,7 +165,8 @@ enum NativeAppManagement {
         let diagnostic = try FileHandle(forWritingTo: URL(fileURLWithPath: "/dev/null"))
         defer { try? diagnostic.close() }
         let status = try NativeAXTree.runWorker(
-            executable: executable, arguments: arguments, diagnostic: diagnostic, timeout: 14)
+            executable: executable, arguments: arguments, diagnostic: diagnostic,
+            timeout: command.allowsLegacySetup && payloadURL == nil ? 30 : 14)
         guard status == 0, let size = try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= AXDTX.limit,
             let bytes = try? Data(contentsOf: output),
             let result = (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any],
@@ -109,7 +174,7 @@ enum NativeAppManagement {
         else {
             throw Failure(
                 description: status == nil ? "App management worker timed out" : "App management worker failed",
-                outcome: operation.requiresBundleID ? "unknown" : "not_sent")
+                outcome: command.requiresBundleID ? "unknown" : "not_sent")
         }
         if let error = result["error"] as? String {
             throw Failure(
@@ -119,9 +184,8 @@ enum NativeAppManagement {
     }
 
     static func worker(_ args: [String], lease: DDIProcessLease) -> Int32 {
-        guard args.count >= 3, let operation = Operation(rawValue: args[0]),
-            (operation == .list && args.count == 3) || (operation.requiresBundleID && args.count == 4)
-                || (operation == .launch && args.count == 5)
+        guard args.count >= 3, let command = WorkerCommand(rawValue: args[0]),
+            command.accepts(argumentCount: args.count)
         else { return 64 }
         let device = args[1]
         let output = URL(fileURLWithPath: args[2])
@@ -129,33 +193,50 @@ enum NativeAppManagement {
         signal(SIGPIPE, SIG_IGN)
         var result: [String: Any] = ["device": device]
         var mutationAttempted = false
-        do {
+        func execute() throws {
             let serviceLease = try lease.deviceService(physicalID: device, exclusive: false)
             try withExtendedLifetime(serviceLease) {
-                switch operation {
-                case .list:
+                switch command {
+                case .inventory:
+                    let stream = try AXUSBProxy(device: device, service: .installationProxy)
+                    result["apps"] = try NativeAppInventory.manageableApps(stream).map { entry in
+                        var app = entry.attributes
+                        app["executable_path"] = entry.executablePath
+                        return app
+                    }
+                case .processes:
+                    let feature = NativeAppServices.processListFeature
+                    let backend = try appBackend(device: device, requiring: [feature])
+                    let snapshot = try backend.processPaths()
+                    result["paths"] = snapshot.paths
+                    result["complete"] = snapshot.complete
+                case .operation(.list):
                     let stream = try AXUSBProxy(device: device, service: .installationProxy)
                     result["apps"] = try NativeAppInventory.browse(stream)
                     result["source"] = "installation_proxy"
-                case .launch:
+                case .operation(.launch):
                     let payloadURL = try args.count == 5 ? readLaunchURL(from: args[4]) : nil
                     let request = try NativeAppServices.launchRequest(bundleID: args[3], payloadURL: payloadURL)
-                    let client = try appService(device: device, requiring: [NativeAppServices.launchFeature])
-                    mutationAttempted = true
-                    result["pid"] = try NativeAppServices.launchPID(client.request(request))
+                    let backend = try appBackend(device: device, requiring: [NativeAppServices.launchFeature],
+                                                 modernOnly: payloadURL != nil)
+                    switch backend {
+                    case .coreDevice(let client):
+                        mutationAttempted = true
+                        result["pid"] = try NativeAppServices.launchPID(client.request(request))
+                    case .legacy(let client):
+                        result["pid"] = try client.launch(bundleID: args[3], willLaunch: { mutationAttempted = true })
+                    }
                     result["bundle_id"] = args[3]
                     result["outcome"] = "acknowledged"
                     if payloadURL != nil { result["url_requested"] = true }
-                    result["source"] = "coredevice_appservice"
-                case .terminate:
+                    result["source"] = backend.source
+                case .operation(.terminate):
                     let bundleID = args[3]
-                    let client = try appService(
-                        device: device, requiring: [NativeAppServices.processListFeature, NativeAppServices.signalFeature])
                     let path = try NativeAppInventory.executablePath(
                         AXUSBProxy(device: device, service: .installationProxy), bundleID: bundleID)
-                    switch try NativeAppServices.terminate(
-                        executablePath: path, exchange: client.request, willSignal: { mutationAttempted = true })
-                    {
+                    let backend = try appBackend(
+                        device: device, requiring: [NativeAppServices.processListFeature, NativeAppServices.signalFeature])
+                    switch try backend.terminate(executablePath: path, willSignal: { mutationAttempted = true }) {
                     case .alreadyStopped:
                         result["outcome"] = "already_stopped"
                     case .terminated(let pid):
@@ -163,12 +244,17 @@ enum NativeAppManagement {
                         result["outcome"] = "terminated"
                     }
                     result["bundle_id"] = bundleID
-                    result["source"] = "coredevice_appservice"
-                case .foreground: break  // handled by the isolated AX worker
+                    result["source"] = backend.source
+                case .operation(.foreground): break  // handled by the isolated AX worker
                 }
             }
+        }
+        do {
+            try withLegacySetup(eligible: { command.allowsLegacySetup && !mutationAttempted }, prepare: { version in
+                try prepareLegacyImage(device: device, expectedVersion: version, lease: lease)
+            }, execute: execute)
         } catch {
-            result["error"] = error is AXUSBProxy.Unsupported ? "\(operation.rawValue) requires iOS 17 or later" : "\(error)"
+            result["error"] = "\(error)"
             result["outcome"] = mutationAttempted ? "unknown" : "not_sent"
             result["replayAllowed"] = false
         }
@@ -181,6 +267,29 @@ enum NativeAppManagement {
         } catch { return 69 }
     }
 
+    // The only retryable failure comes from opening the legacy service, before any App command.
+    static func withLegacySetup<T>(eligible: () -> Bool, prepare: (String) throws -> Void,
+                                   execute: () throws -> T) throws -> T {
+        do { return try execute() }
+        catch let unavailable as AXUSBProxy.LegacyInstrumentsUnavailable where eligible() {
+            try prepare(unavailable.version)
+            return try execute()
+        }
+    }
+
+    private static func prepareLegacyImage(device: String, expectedVersion: String, lease: DDIProcessLease) throws {
+        // The shared worker lease has unwound. Acquire a separate exclusive lease,
+        // recheck the exact handset and release this lease before retrying DVT.
+        let exclusive = try lease.deviceService(physicalID: device, exclusive: true)
+        try withExtendedLifetime(exclusive) {
+            let stream = try AXUSBProxy(device: device, service: .legacyImageMounter)
+            guard stream.productVersion == expectedVersion else {
+                throw Failure(description: "Selected iPhone OS changed during legacy App setup")
+            }
+            try LegacyDeveloperImage.ensureMounted(stream) { try LegacyDeveloperImage.imageForMount(version: expectedVersion) }
+        }
+    }
+
     private static func readLaunchURL(from path: String) throws -> String {
         let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
         defer { try? handle.close() }
@@ -189,6 +298,44 @@ enum NativeAppManagement {
             let url = String(data: data, encoding: .utf8)
         else { throw Failure(description: "Invalid launch URL payload") }
         return url
+    }
+
+    private enum AppBackend {
+        case coreDevice(USBRemoteXPC), legacy(LegacyAppService)
+
+        var source: String {
+            switch self {
+            case .coreDevice: return "coredevice_appservice"
+            case .legacy: return "legacy_instruments"
+            }
+        }
+
+        func processPaths() throws -> (paths: [String], complete: Bool) {
+            switch self {
+            case .coreDevice(let client): return try NativeAppServices.processPaths(exchange: client.request)
+            case .legacy(let client):
+                let processes = try client.processes()
+                let paths = processes.compactMap(\.path)
+                return (paths, paths.count == processes.count)
+            }
+        }
+
+        func terminate(executablePath: String, willSignal: () -> Void) throws -> NativeAppServices.TerminationResult {
+            switch self {
+            case .coreDevice(let client):
+                return try NativeAppServices.terminate(executablePath: executablePath, exchange: client.request,
+                                                       willSignal: willSignal)
+            case .legacy(let client): return try client.terminate(executablePath: executablePath, willSignal: willSignal)
+            }
+        }
+    }
+
+    private static func appBackend(device: String, requiring features: [String], modernOnly: Bool = false) throws -> AppBackend {
+        do { return .coreDevice(try appService(device: device, requiring: features)) }
+        catch AXUSBProxy.Unsupported.legacyDevice {
+            guard !modernOnly else { throw Failure(description: "Launching with a URL requires iOS 17 or later") }
+            return .legacy(try LegacyAppService(stream: AXUSBProxy(device: device, service: .legacyInstruments)))
+        }
     }
 
     private static func appService(device: String, requiring features: [String]) throws -> USBRemoteXPC {

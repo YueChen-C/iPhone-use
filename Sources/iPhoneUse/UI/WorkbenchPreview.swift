@@ -75,29 +75,53 @@ enum WorkbenchPreview {
             let page = Int(arguments[index + 1]), page > 1 {
             for _ in 1..<min(page, 31) { root.changePage(1) }
         }
-        let window = NSWindow(contentRect: root.frame, styleMask: [.borderless], backing: .buffered, defer: false)
-        window.contentView = root
+        var surface: NSView = root
+        var manager: WorkbenchAppManager?
+        if let index = arguments.firstIndex(of: "--dialog"), arguments.indices.contains(index + 1) {
+            let dialog = arguments[index + 1]
+            if dialog == "app-management" {
+                let fixture = [
+                    ("com.apple.calculator", language == .zh ? "计算器" : "Calculator", "/Applications/Calculator.app/Calculator"),
+                    ("com.apple.mobilesafari", "Safari", "/Applications/MobileSafari.app/MobileSafari"),
+                    ("com.apple.mobilenotes", language == .zh ? "备忘录" : "Notes", "/Applications/MobileNotes.app/MobileNotes"),
+                    ("com.apple.Preferences", language == .zh ? "设置" : "Settings", "/Applications/Preferences.app/Preferences"),
+                ]
+                let client = WorkbenchAppManager.Client(
+                    inventory: { _ in
+                        fixture.enumerated().map { i, app in
+                            .init(attributes: ["bundle_id": app.0, "name": app.1], executablePath: i == 3 ? nil : app.2)
+                        }
+                    }, processes: { _ in .init(paths: [fixture[0].2, fixture[1].2], complete: true) },
+                    perform: { _, _, _ in throw DeviceError("Offline preview") })
+                let view = WorkbenchAppManager(deviceID: "preview-phone", deviceName: "iPhone 16 Pro", language: language, client: client)
+                surface = view
+                manager = view
+            }
+        }
+        let window = NSWindow(contentRect: surface.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = surface
         if let index = arguments.firstIndex(of: "--dialog"), arguments.indices.contains(index + 1),
-           let kind = WorkbenchInfoKind(rawValue: arguments[index + 1]) {
+            let kind = WorkbenchInfoKind(rawValue: arguments[index + 1]) {
             root.showInfo(kind)
         }
+        manager?.refresh()
         window.appearance = NSAppearance(named: arguments.contains("--dark") ? .darkAqua : .aqua)
-        root.layoutSubtreeIfNeeded()
-        for view in root.subviews { view.layoutSubtreeIfNeeded() }
+        surface.layoutSubtreeIfNeeded()
+        for view in surface.subviews { view.layoutSubtreeIfNeeded() }
         window.setFrameOrigin(NSPoint(x: -20000, y: -20000))
         window.orderBack(nil)
         RunLoop.main.run(until: Date().addingTimeInterval(0.15))
-        root.layoutSubtreeIfNeeded()
+        surface.layoutSubtreeIfNeeded()
         func prepare(_ view: NSView) {
             view.needsDisplay = true
             view.layoutSubtreeIfNeeded()
             for child in view.subviews { prepare(child) }
             view.displayIfNeeded()
         }
-        prepare(root)
+        prepare(surface)
         window.displayIfNeeded()
-        guard let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) else { return 70 }
-        root.cacheDisplay(in: root.bounds, to: bitmap)
+        guard let bitmap = surface.bitmapImageRepForCachingDisplay(in: surface.bounds) else { return 70 }
+        surface.cacheDisplay(in: surface.bounds, to: bitmap)
         guard let data = bitmap.representation(using: .png, properties: [:]) else { return 70 }
         do {
             try data.write(to: output, options: .atomic)

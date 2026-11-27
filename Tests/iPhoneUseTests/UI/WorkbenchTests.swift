@@ -983,8 +983,12 @@ final class WorkbenchNativeViewTests: XCTestCase {
             let text = descendants(root).compactMap { $0 as? NSTextField }.first {
                 $0.accessibilityLabel() == StringsWorkbench.current.textInput
             }!
-            XCTAssertGreaterThan(text.frame.minY, button.frame.maxY)
-            XCTAssertLessThanOrEqual(button.frame.maxY, button.superview!.bounds.height)
+            let manager = buttons.first { $0.accessibilityIdentifier() == "workbench-app-management" }!
+            XCTAssertEqual(manager.title, WorkbenchAppManager.title(AppLanguageStore.shared.language))
+            XCTAssertFalse(manager.isEnabled, "offline preview must never call a real device")
+            XCTAssertGreaterThan(manager.frame.minY, button.frame.maxY)
+            XCTAssertGreaterThan(text.frame.minY, manager.frame.maxY)
+            XCTAssertLessThanOrEqual(manager.frame.maxY, manager.superview!.bounds.height)
         }
     }
 

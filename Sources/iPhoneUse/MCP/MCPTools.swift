@@ -29,12 +29,12 @@ enum MCPToolCatalog {
                 : "List installed apps on the selected USB iPhone. Does not require Xcode.", device: device),
             appTool(.foreground, language == .zh ? "通过原生 Accessibility 读取前台 App，无法确认时返回未知。"
                 : "Read the foreground app via native Accessibility; may report unknown.", device: device),
-            appTool(.launch, language == .zh ? "按 Bundle ID 启动 USB iPhone 上的 App（iOS 17+）；可选把 HTTP(S) URL 交给该 App，不由 iOS 选择处理 App。回执不代表页面已打开；结果未知时不要自动重试。"
-                : "Launch an app by bundle ID on a USB iPhone (iOS 17+) and optionally pass it an HTTP(S) URL. Does not choose a handler or verify navigation; do not retry an unknown outcome.",
+            appTool(.launch, language == .zh ? "按 Bundle ID 启动 USB iPhone 上的 App。iOS 15/16 需要开发者镜像；未挂载且本地缺失时可从 Gitee 自动获取。仅 iOS 17+ 可传 HTTP(S) URL。不选择 URL 处理 App、不验证导航；结果未知时不要自动重试。"
+                : "Launch an app by bundle ID on a USB iPhone. iOS 15/16 need a developer image; if not mounted or available locally, a matching image can be fetched from Gitee. HTTP(S) URL delivery requires iOS 17+. Does not choose a handler or verify navigation; do not retry an unknown outcome.",
                 device: device, urlDescription: language == .zh ? "交给指定 App 的 HTTP(S) URL（不含账号凭据）"
                     : "HTTP(S) URL without credentials, passed to the specified app"),
-            appTool(.terminate, language == .zh ? "按 Bundle ID 强制结束 USB iPhone 上的 App（iOS 17+），并核验进程退出。可能丢失未保存数据；结果未知时不要自动重试。"
-                : "Force-stop an app by bundle ID on a USB iPhone (iOS 17+) and verify its exit. Unsaved data may be lost; do not retry an unknown outcome.", device: device),
+            appTool(.terminate, language == .zh ? "按 Bundle ID 强制结束 USB iPhone 上的 App，并核验进程退出。iOS 15/16 需要开发者镜像；未挂载且本地缺失时可从 Gitee 自动获取。可能丢失未保存数据；结果未知时不要自动重试。"
+                : "Force-stop an app by bundle ID on a USB iPhone and verify its exit. iOS 15/16 need a developer image; if not mounted or available locally, a matching image can be fetched from Gitee. Unsaved data may be lost; do not retry an unknown outcome.", device: device),
             tool("ocr_screen", table.toolOCRScreen, ["device": device, "maxEdge": maxEdge], readOnly: true),
             tool(
                 "tap_text", table.toolTapText,

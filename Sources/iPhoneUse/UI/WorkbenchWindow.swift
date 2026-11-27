@@ -163,6 +163,8 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
     private var previewOrder: [String] = []
     private var previewGuidance: [String: ControlConnectionOverlay] = [:]
     private var mountedGuidance: ControlConnectionOverlay?
+    private var appManager: (panel: NSPanel, view: WorkbenchAppManager)?
+    private let manageApps = WorkbenchActionButton()
     private(set) var infoOverlay: WorkbenchInfoOverlay?
     private weak var infoPreviousResponder: NSResponder?
     private var presentationDevices: [WorkbenchDevice] {
@@ -277,7 +279,7 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         ].forEach(canvas.addSubview)
         [
             selectedTitle, targetHint, targetChip, deviceDetail, captureTitle, connection, status,
-            backendTitle, backend, backendHelp, controlsTitle, inputReady, controlHint,
+            backendTitle, backend, backendHelp, controlsTitle, inputReady, controlHint, manageApps,
             textTitle, textHint, textBackground, text, send, paste, help, aiCard, inspectorRule,
         ].forEach(inspector.addSubview)
         listScroll.documentView = listDocument
@@ -385,6 +387,10 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
             inspector.addSubview(button)
             shortcutButtons[shortcut] = button
         }
+        manageApps.appearanceStyle = .outline
+        manageApps.symbolName = "square.grid.2x2"
+        manageApps.setAccessibilityIdentifier("workbench-app-management")
+        manageApps.invoke = { [weak self] in self?.showAppManager() }
         refreshLocalization()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -604,6 +610,9 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
             button.isEnabled = available.contains(shortcut)
             button.drawsDisabledAsReady = preview && state.selected?.shortcuts.contains(shortcut) == true
         }
+        manageApps.isEnabled = appManagementTarget != nil
+        manageApps.drawsDisabledAsReady = preview && state.selected?.connected == true
+        if let manager = appManager?.view { manager.setConnected(liveDevices[manager.deviceID] != nil) }
         paste.isEnabled = available.contains(.paste)
         send.isEnabled =
             available.contains(.enter) && !text.stringValue.isEmpty && !textBusyIDs.contains(state.selectedID ?? "")
@@ -818,6 +827,7 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         isStopped = true
         recordings.values.forEach { $0.finish() }
         dismissInfo()
+        dismissAppManager()
         for controller in controllers.values { controller.stop() }
     }
 
@@ -867,6 +877,8 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
             ? "蓝牙 HID 负责鼠标与键盘输入。\nUSB Touch 需 iOS 17+ 与兼容的开发者服务；失败不自动回退。"
             : "Bluetooth HID handles mouse and keyboard.\nUSB Touch requires iOS 17+ and compatible services; no automatic fallback."
         controlsTitle.stringValue = AppLanguageStore.shared.language == .zh ? "快捷控制" : "Quick controls"
+        manageApps.title = WorkbenchAppManager.title(language)
+        manageApps.setAccessibilityLabel(manageApps.title)
         textTitle.stringValue = t.textInput
         text.placeholderString = zh ? "输入要发送到 iPhone 的文字…" : "Enter text to send to iPhone…"
         connect.title = t.connect
@@ -922,7 +934,7 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         inspectorScroll.frame = NSRect(x: w - 312, y: 64, width: 312, height: h - 94)
         let guidanceHeight = mountedGuidance?.preferredHeight(for: 268) ?? 0
         let guidanceOffset = guidanceHeight > 0 ? max(0, guidanceHeight - 42) + 12 : 0
-        inspector.frame = NSRect(x: 0, y: 0, width: 312, height: max(888 + guidanceOffset, inspectorScroll.bounds.height))
+        inspector.frame = NSRect(x: 0, y: 0, width: 312, height: max(930 + guidanceOffset, inspectorScroll.bounds.height))
         canvas.frame = NSRect(x: 232, y: 64, width: w - 544, height: h - 94)
         footer.frame = NSRect(x: 17, y: h - 24, width: w - 34, height: 18)
         workspace.frame = NSRect(x: 15, y: 48, width: 202, height: 39)
@@ -1005,7 +1017,8 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
                 width: buttonWidth, height: 63)
         }
         shortcutButtons[.inputMethod]?.frame = NSRect(x: 22, y: 482 + guidanceOffset, width: inner, height: 34)
-        let textOffset = guidanceOffset + 44
+        manageApps.frame = NSRect(x: 22, y: 524 + guidanceOffset, width: inner, height: 34)
+        let textOffset = guidanceOffset + 86
         textTitle.frame = NSRect(x: 22, y: 498 + textOffset, width: 120, height: 20)
         textHint.frame = NSRect(x: 162, y: 500 + textOffset, width: iw - 184, height: 18)
         textBackground.frame = NSRect(x: 22, y: 525 + textOffset, width: inner, height: 65)
@@ -1061,6 +1074,35 @@ final class WorkbenchRootView: WorkbenchSurface, NSSearchFieldDelegate, NSTextFi
         // The overlay owns keyboard input; Tab explicitly focuses the close button.
         window?.makeFirstResponder(overlay)
         NSAccessibility.post(element: overlay, notification: .created)
+    }
+
+    private var appManagementTarget: WorkbenchDevice? {
+        guard !preview, !isStopped, let target = state.selected, target.connected, liveDevices[target.id] != nil,
+            (try? NativeDDIInspection.validateIdentity(target.id)) != nil
+        else { return nil }
+        return target
+    }
+
+    private func showAppManager() {
+        guard let target = appManagementTarget, let window, window.attachedSheet == nil, appManager == nil else { return }
+        let view = WorkbenchAppManager(
+            deviceID: target.id, deviceName: target.name, language: AppLanguageStore.shared.language)
+        let panel = NSPanel(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        panel.title = WorkbenchAppManager.title(AppLanguageStore.shared.language)
+        panel.contentView = view
+        view.onClose = { [weak self] in self?.dismissAppManager() }
+        appManager = (panel, view)
+        window.beginSheet(panel) { [weak self, weak panel] _ in
+            if self?.appManager?.panel === panel { self?.appManager = nil }
+        }
+        view.focusSearch()
+        view.refresh()
+    }
+
+    private func dismissAppManager() {
+        guard let panel = appManager?.panel else { return }
+        appManager = nil
+        panel.sheetParent?.endSheet(panel)
     }
 
     func dismissInfo() {

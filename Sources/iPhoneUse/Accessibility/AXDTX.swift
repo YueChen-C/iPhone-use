@@ -40,17 +40,25 @@ enum AXDTX {
         try call(id: id, selector: selector, arguments: [argument])
     }
 
-    static func call(id: UInt32, selector: String, arguments: [Any] = [], reply: Bool = false) throws -> Data {
+    /// Channel negotiation uses a primitive UInt32, unlike archived selector arguments.
+    struct Scalar32 { let value: UInt32 }
+
+    static func call(id: UInt32, selector: String, arguments: [Any] = [], reply: Bool = false,
+                     channel: UInt32 = 0) throws -> Data {
         let selector = try NSKeyedArchiver.archivedData(withRootObject: selector, requiringSecureCoding: false)
         var entries = Data()
         for argument in arguments {
+            if let scalar = argument as? Scalar32 {
+                entries += number(10) + number(3) + number(UInt64(scalar.value))
+                continue
+            }
             let value = try NSKeyedArchiver.archivedData(withRootObject: argument, requiringSecureCoding: false)
             entries += number(10) + number(2) + number(UInt64(value.count)) + value
         }
         let aux = entries.isEmpty ? Data() : number(0x1f0, bytes: 8) + number(UInt64(entries.count), bytes: 8) + entries
         let payload = number(2) + number(UInt64(aux.count)) + number(UInt64(aux.count + selector.count), bytes: 8)
             + aux + selector
-        return packet(id: id, reply: reply, payload: payload)
+        return packet(id: id, channel: channel, reply: reply, payload: payload)
     }
 
     static func object(_ payload: Data) throws -> Any? {
